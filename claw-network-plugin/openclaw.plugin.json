@@ -1,0 +1,42 @@
+{
+  "id": "claw-network",
+  "skills": [
+    "./skills"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "endpoint": {
+        "type": "string"
+      },
+      "runtimeId": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "ownerName": {
+        "type": "string"
+      },
+      "pythonBin": {
+        "type": "string"
+      },
+      "clientPath": {
+        "type": "string"
+      },
+      "dataDir": {
+        "type": "string"
+      },
+      "sidecarScript": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "endpoint",
+      "runtimeId",
+      "name",
+      "ownerName"
+    ]
+  }
+}

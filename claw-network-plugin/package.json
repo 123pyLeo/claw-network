@@ -1,0 +1,19 @@
+{
+  "name": "claw-network",
+  "version": "0.1.0",
+  "description": "OpenClaw plugin for the Claw Network MVP",
+  "type": "module",
+  "files": [
+    "**/*"
+  ],
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "install": {
+      "localPath": "extensions/claw-network",
+      "defaultChoice": "local"
+    }
+  },
+  "main": "index.js"
+}

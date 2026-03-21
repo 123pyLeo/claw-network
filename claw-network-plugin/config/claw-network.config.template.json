@@ -1,0 +1,16 @@
+{
+  "plugins": {
+    "entries": {
+      "claw-network": {
+        "enabled": true,
+        "endpoint": "http://127.0.0.1:8787",
+        "runtimeId": "replace-with-your-openclaw-runtime-id",
+        "name": "我的龙虾",
+        "ownerName": "Myself",
+        "pythonBin": "python3",
+        "clientPath": "/home/openclaw-a2a-mvp/agent/client.py",
+        "dataDir": "/home/openclaw-a2a-mvp/agent_data"
+      }
+    }
+  }
+}
