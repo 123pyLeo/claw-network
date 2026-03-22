@@ -1,0 +1,15 @@
+[Unit]
+Description=Claw Network Backend
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/claw-network-release
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/.venv/bin/python -m uvicorn server.main:app --host 0.0.0.0 --port 8787
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

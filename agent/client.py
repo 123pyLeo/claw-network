@@ -46,6 +46,7 @@ class ClawNetworkClient:
                 CREATE TABLE IF NOT EXISTS lobster_profile (
                     runtime_id TEXT PRIMARY KEY,
                     claw_id TEXT NOT NULL,
+                    auth_token TEXT,
                     name TEXT NOT NULL,
                     owner_name TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -67,11 +68,28 @@ class ClawNetworkClient:
                 );
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(lobster_profile)").fetchall()}
+            if "auth_token" not in columns:
+                conn.execute("ALTER TABLE lobster_profile ADD COLUMN auth_token TEXT")
+
+    def _get_auth_token(self) -> str | None:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT auth_token FROM lobster_profile WHERE runtime_id = ?",
+                (self.runtime_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        token = str(row["auth_token"] or "").strip()
+        return token or None
 
     def _request(self, method: str, path: str, payload: dict | None = None) -> dict | list:
         url = f"{self.server_url}{path}"
         data = None
         headers = {}
+        auth_token = self._get_auth_token()
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -98,19 +116,20 @@ class ClawNetworkClient:
             raise RuntimeError("This lobster has not registered yet.")
         return str(row["claw_id"])
 
-    def _save_profile(self, claw_id: str) -> None:
+    def _save_profile(self, claw_id: str, auth_token: str | None = None) -> None:
         with self._get_conn() as conn:
             conn.execute(
                 """
-                INSERT INTO lobster_profile (runtime_id, claw_id, name, owner_name, updated_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO lobster_profile (runtime_id, claw_id, auth_token, name, owner_name, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(runtime_id) DO UPDATE SET
                     claw_id = excluded.claw_id,
+                    auth_token = COALESCE(excluded.auth_token, lobster_profile.auth_token),
                     name = excluded.name,
                     owner_name = excluded.owner_name,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (self.runtime_id, claw_id, self.name, self.owner_name),
+                (self.runtime_id, claw_id, auth_token, self.name, self.owner_name),
             )
 
     def _store_event(self, event: dict) -> None:
@@ -191,8 +210,14 @@ class ClawNetworkClient:
             raise RuntimeError(f"Unsupported server URL: {self.server_url}")
         after = self._get_sync_cursor()
         params = ""
+        token = self._get_auth_token()
+        query_params = {}
         if after:
-            params = "?" + urllib.parse.urlencode({"after": after})
+            query_params["after"] = after
+        if token:
+            query_params["token"] = token
+        if query_params:
+            params = "?" + urllib.parse.urlencode(query_params)
         return f"{base}/ws/{claw_id}{params}"
 
     def register(self) -> dict:
@@ -204,7 +229,7 @@ class ClawNetworkClient:
         if self.onboarding:
             payload["onboarding"] = self.onboarding
         result = self._request("POST", "/register", payload)
-        self._save_profile(result["lobster"]["claw_id"])
+        self._save_profile(result["lobster"]["claw_id"], result.get("auth_token"))
         return result
 
     def get_my_lobster_id(self) -> str:
@@ -518,7 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-id", required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--owner-name", required=True)
-    parser.add_argument("--server-url", default="http://127.0.0.1:8787")
+    parser.add_argument("--server-url", default="https://api.weclaw.icu")
     parser.add_argument("--data-dir", default=str(Path(__file__).resolve().parents[1] / "agent_data"))
     parser.add_argument("--connection-request-policy")
     parser.add_argument("--collaboration-policy")

@@ -54,6 +54,7 @@ class RegisterResponse(BaseModel):
     lobster: LobsterRow
     official_lobster: LobsterRow
     auto_friendship_created: bool
+    auth_token: str
 
 
 class FriendRequestCreate(BaseModel):

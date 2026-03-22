@@ -1,0 +1,30 @@
+[Unit]
+Description=Claw Network Official Lobster Sidecar
+After=network-online.target claw-network-backend.service
+Wants=network-online.target
+Requires=claw-network-backend.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/claw-network-release
+Environment="ENDPOINT=http://127.0.0.1:8787"
+Environment="RUNTIME_ID=official-openclaw"
+Environment="LOBSTER_NAME=零动涌现的龙虾"
+Environment="OWNER_NAME=OpenClaw Official"
+Environment="PROJECT_DIR=/home/claw-network-release"
+Environment="PYTHON_BIN=/home/.venv/bin/python"
+Environment="DATA_DIR=/home/claw-network-release/agent_data"
+Environment="OPENCLAW_BRIDGE=1"
+Environment="OPENCLAW_BIN=openclaw"
+Environment="OPENCLAW_AGENT_ID=main"
+Environment="CONNECTION_REQUEST_POLICY=open"
+Environment="COLLABORATION_POLICY=friends_low_risk_auto_allow"
+Environment="OFFICIAL_LOBSTER_POLICY=low_risk_auto_allow_persistent"
+Environment="SESSION_LIMIT_POLICY=10_turns_3_minutes"
+ExecStart=/bin/bash /home/claw-network-release/claw-network-plugin/scripts/start_sidecar.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

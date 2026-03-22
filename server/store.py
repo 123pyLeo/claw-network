@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import secrets
 import sqlite3
 import string
 import uuid
@@ -145,6 +146,8 @@ def init_db() -> None:
         _ensure_column(conn, "lobsters", "collaboration_policy", "TEXT NOT NULL DEFAULT 'confirm_every_time'")
         _ensure_column(conn, "lobsters", "official_lobster_policy", "TEXT NOT NULL DEFAULT 'low_risk_auto_allow'")
         _ensure_column(conn, "lobsters", "session_limit_policy", "TEXT NOT NULL DEFAULT '10_turns_3_minutes'")
+        _ensure_column(conn, "lobsters", "auth_token", "TEXT")
+        _ensure_column(conn, "lobsters", "token_updated_at", "TEXT")
     seed_official_lobster()
 
 
@@ -173,6 +176,7 @@ def _lobster_by_runtime_id(runtime_id: str) -> sqlite3.Row | None:
             """
             SELECT id, runtime_id, claw_id, name, owner_name, is_official,
                    connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy,
+                   auth_token, token_updated_at,
                    created_at, updated_at
             FROM lobsters
             WHERE runtime_id = ?
@@ -187,12 +191,63 @@ def get_lobster_by_claw_id(claw_id: str) -> sqlite3.Row | None:
             """
             SELECT id, runtime_id, claw_id, name, owner_name, is_official,
                    connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy,
+                   auth_token, token_updated_at,
                    created_at, updated_at
             FROM lobsters
             WHERE claw_id = ?
             """,
             (claw_id.strip().upper(),),
         ).fetchone()
+
+
+def _new_auth_token() -> str:
+    return f"claw_{secrets.token_urlsafe(32)}"
+
+
+def get_lobster_by_token(token: str) -> sqlite3.Row | None:
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT id, runtime_id, claw_id, name, owner_name, is_official,
+                   connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy,
+                   auth_token, token_updated_at,
+                   created_at, updated_at
+            FROM lobsters
+            WHERE auth_token = ?
+            """,
+            (token.strip(),),
+        ).fetchone()
+
+
+def ensure_auth_token(lobster_id: str) -> str:
+    with get_conn() as conn:
+        row = conn.execute("SELECT auth_token FROM lobsters WHERE id = ?", (lobster_id,)).fetchone()
+        if row is None:
+            raise ValueError("Lobster not found.")
+        existing = str(row["auth_token"] or "").strip()
+        if existing:
+            return existing
+        token = _new_auth_token()
+        conn.execute(
+            """
+            UPDATE lobsters
+            SET auth_token = ?, token_updated_at = ?
+            WHERE id = ?
+            """,
+            (token, utc_now(), lobster_id),
+        )
+        return token
+
+
+def require_auth_token(token: str | None, claw_id: str) -> sqlite3.Row:
+    if not token:
+        raise ValueError("Missing auth token.")
+    lobster = get_lobster_by_token(token)
+    if lobster is None:
+        raise ValueError("Invalid auth token.")
+    if str(lobster["claw_id"]).strip().upper() != claw_id.strip().upper():
+        raise ValueError("Auth token does not match the requested lobster.")
+    return lobster
 
 
 def get_official_lobster() -> sqlite3.Row:
@@ -227,6 +282,8 @@ def seed_official_lobster() -> sqlite3.Row:
                     OFFICIAL_RUNTIME_ID,
                 ),
             )
+        official = get_official_lobster()
+        ensure_auth_token(str(official["id"]))
         return get_official_lobster()
 
     lobster_id = new_uuid()
@@ -236,9 +293,9 @@ def seed_official_lobster() -> sqlite3.Row:
             INSERT INTO lobsters (
                 id, runtime_id, claw_id, name, owner_name, is_official,
                 connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy,
-                created_at, updated_at
+                auth_token, token_updated_at, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 lobster_id,
@@ -250,6 +307,8 @@ def seed_official_lobster() -> sqlite3.Row:
                 "friends_low_risk_auto_allow",
                 "low_risk_auto_allow_persistent",
                 DEFAULT_SESSION_LIMIT_POLICY,
+                _new_auth_token(),
+                now,
                 now,
                 now,
             ),
@@ -266,7 +325,8 @@ def register_lobster(
     collaboration_policy: str = DEFAULT_COLLABORATION_POLICY,
     official_lobster_policy: str = DEFAULT_OFFICIAL_LOBSTER_POLICY,
     session_limit_policy: str = DEFAULT_SESSION_LIMIT_POLICY,
-) -> tuple[sqlite3.Row, bool]:
+    auth_token: str | None = None,
+) -> tuple[sqlite3.Row, bool, str]:
     existing = _lobster_by_runtime_id(runtime_id)
     now = utc_now()
     connection_request_policy = _normalize_connection_request_policy(connection_request_policy)
@@ -300,14 +360,15 @@ def register_lobster(
         with get_conn() as conn:
             claw_id = _generate_claw_id(conn)
             lobster_id = new_uuid()
+            issued_token = _new_auth_token()
             conn.execute(
                 """
                 INSERT INTO lobsters (
                     id, runtime_id, claw_id, name, owner_name, is_official,
                     connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy,
-                    created_at, updated_at
+                    auth_token, token_updated_at, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lobster_id,
@@ -319,6 +380,8 @@ def register_lobster(
                     collaboration_policy,
                     official_lobster_policy,
                     session_limit_policy,
+                    issued_token,
+                    now,
                     now,
                     now,
                 ),
@@ -326,9 +389,10 @@ def register_lobster(
         lobster = _lobster_by_runtime_id(runtime_id)
 
     assert lobster is not None
+    issued_auth_token = ensure_auth_token(str(lobster["id"]))
     official = get_official_lobster()
     auto_created = ensure_friendship(lobster["id"], official["id"])
-    return lobster, auto_created
+    return lobster, auto_created, issued_auth_token
 
 
 def search_lobsters(query: str | None = None, limit: int = 100) -> list[sqlite3.Row]:

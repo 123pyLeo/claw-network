@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
 from . import store
 from .models import (
@@ -23,6 +24,13 @@ from .models import (
 from .realtime import manager
 
 app = FastAPI(title="Claw Network MVP", version="0.2.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://www.weclaw.icu"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _message_payload(row: dict) -> dict:
@@ -33,6 +41,21 @@ def _message_payload(row: dict) -> dict:
 
 def _http_error(exc: ValueError) -> HTTPException:
     return HTTPException(status_code=400, detail=str(exc))
+
+
+def _bearer_token_from_request(request: Request) -> str | None:
+    header = str(request.headers.get("authorization") or "").strip()
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return None
+
+
+def _require_http_auth(request: Request, claw_id: str):
+    token = _bearer_token_from_request(request)
+    try:
+        return store.require_auth_token(token, claw_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
 @app.on_event("startup")
@@ -58,9 +81,9 @@ async def stats_overview() -> StatsOverview:
 
 
 @app.post("/register", response_model=RegisterResponse)
-def register(payload: RegisterRequest) -> RegisterResponse:
+def register(payload: RegisterRequest, request: Request) -> RegisterResponse:
     onboarding = payload.onboarding
-    lobster, auto_created = store.register_lobster(
+    lobster, auto_created, auth_token = store.register_lobster(
         runtime_id=payload.runtime_id.strip(),
         name=payload.name.strip(),
         owner_name=payload.owner_name.strip(),
@@ -68,11 +91,13 @@ def register(payload: RegisterRequest) -> RegisterResponse:
         collaboration_policy=(onboarding.collaborationPolicy if onboarding else store.DEFAULT_COLLABORATION_POLICY),
         official_lobster_policy=(onboarding.officialLobsterPolicy if onboarding else store.DEFAULT_OFFICIAL_LOBSTER_POLICY),
         session_limit_policy=(onboarding.sessionLimitPolicy if onboarding else store.DEFAULT_SESSION_LIMIT_POLICY),
+        auth_token=_bearer_token_from_request(request),
     )
     return RegisterResponse(
         lobster=LobsterRow(**dict(lobster)),
         official_lobster=LobsterRow(**dict(store.get_official_lobster())),
         auto_friendship_created=auto_created,
+        auth_token=auth_token,
     )
 
 
@@ -89,7 +114,8 @@ async def lobsters_with_presence(query: str | None = None, limit: int = 100) -> 
 
 
 @app.get("/friends/{claw_id}", response_model=list[FriendshipRow])
-def friends(claw_id: str) -> list[FriendshipRow]:
+def friends(claw_id: str, request: Request) -> list[FriendshipRow]:
+    _require_http_auth(request, claw_id)
     try:
         return [FriendshipRow(**dict(row)) for row in store.list_friends(claw_id)]
     except ValueError as exc:
@@ -97,7 +123,8 @@ def friends(claw_id: str) -> list[FriendshipRow]:
 
 
 @app.get("/friend_requests/{claw_id}", response_model=list[FriendRequestRow])
-def friend_requests(claw_id: str, direction: str = "incoming", status: str = "pending") -> list[FriendRequestRow]:
+def friend_requests(claw_id: str, request: Request, direction: str = "incoming", status: str = "pending") -> list[FriendRequestRow]:
+    _require_http_auth(request, claw_id)
     try:
         return [
             FriendRequestRow(**dict(row))
@@ -122,7 +149,8 @@ async def _deliver_event(event: dict) -> dict:
 
 
 @app.post("/friend_requests", response_model=FriendRequestRow)
-async def create_friend_request(payload: FriendRequestCreate) -> FriendRequestRow:
+async def create_friend_request(payload: FriendRequestCreate, request: Request) -> FriendRequestRow:
+    _require_http_auth(request, payload.from_claw_id.strip().upper())
     try:
         row = store.create_friend_request(
             from_claw_id=payload.from_claw_id.strip().upper(),
@@ -145,7 +173,8 @@ async def create_friend_request(payload: FriendRequestCreate) -> FriendRequestRo
 
 
 @app.get("/collaboration_requests/{claw_id}", response_model=list[CollaborationRequestRow])
-def collaboration_requests(claw_id: str, direction: str = "incoming", status: str = "pending") -> list[CollaborationRequestRow]:
+def collaboration_requests(claw_id: str, request: Request, direction: str = "incoming", status: str = "pending") -> list[CollaborationRequestRow]:
+    _require_http_auth(request, claw_id)
     try:
         return [
             CollaborationRequestRow(**dict(row))
@@ -156,7 +185,8 @@ def collaboration_requests(claw_id: str, direction: str = "incoming", status: st
 
 
 @app.post("/collaboration_requests/{request_id}/respond", response_model=CollaborationRequestRow)
-async def respond_collaboration_request(request_id: str, payload: CollaborationRequestRespond) -> CollaborationRequestRow:
+async def respond_collaboration_request(request_id: str, payload: CollaborationRequestRespond, request: Request) -> CollaborationRequestRow:
+    _require_http_auth(request, payload.responder_claw_id.strip().upper())
     try:
         row, delivered = store.respond_collaboration_request(
             request_id=request_id,
@@ -183,7 +213,8 @@ async def respond_collaboration_request(request_id: str, payload: CollaborationR
 
 
 @app.post("/friend_requests/{request_id}/respond", response_model=FriendRequestRow)
-async def respond_friend_request(request_id: str, payload: FriendRequestRespond) -> FriendRequestRow:
+async def respond_friend_request(request_id: str, payload: FriendRequestRespond, request: Request) -> FriendRequestRow:
+    _require_http_auth(request, payload.responder_claw_id.strip().upper())
     try:
         row = store.respond_friend_request(
             request_id=request_id,
@@ -207,7 +238,8 @@ async def respond_friend_request(request_id: str, payload: FriendRequestRespond)
 
 
 @app.post("/messages", response_model=SendMessageResponse)
-async def send_message(payload: SendMessageRequest) -> SendMessageResponse:
+async def send_message(payload: SendMessageRequest, request: Request) -> SendMessageResponse:
+    _require_http_auth(request, payload.from_claw_id.strip().upper())
     try:
         row = store.create_message(
             from_claw_id=payload.from_claw_id.strip().upper(),
@@ -247,7 +279,8 @@ async def send_message(payload: SendMessageRequest) -> SendMessageResponse:
 
 
 @app.get("/events/{claw_id}", response_model=list[MessageEventRow])
-def events(claw_id: str, after: str | None = None, limit: int = 100) -> list[MessageEventRow]:
+def events(claw_id: str, request: Request, after: str | None = None, limit: int = 100) -> list[MessageEventRow]:
+    _require_http_auth(request, claw_id)
     try:
         rows = []
         for row in store.get_inbox(claw_id=claw_id, after=after, limit=limit):
@@ -261,7 +294,8 @@ def events(claw_id: str, after: str | None = None, limit: int = 100) -> list[Mes
 
 
 @app.post("/events/{event_id}/ack", response_model=MessageEventRow)
-def acknowledge_event(event_id: str, payload: EventAckRequest) -> MessageEventRow:
+def acknowledge_event(event_id: str, payload: EventAckRequest, request: Request) -> MessageEventRow:
+    _require_http_auth(request, payload.claw_id.strip().upper())
     try:
         row = store.acknowledge_event(event_id=event_id, claw_id=payload.claw_id.strip().upper(), status=payload.status)
     except ValueError as exc:
@@ -274,6 +308,12 @@ async def websocket_connect(websocket: WebSocket, claw_id: str) -> None:
     registered = store.get_lobster_by_claw_id(claw_id.strip().upper())
     if registered is None:
         await websocket.close(code=4404, reason="Lobster is not registered.")
+        return
+    token = websocket.query_params.get("token")
+    try:
+        store.require_auth_token(token, claw_id.strip().upper())
+    except ValueError as exc:
+        await websocket.close(code=4401, reason=str(exc))
         return
 
     claw_id = claw_id.strip().upper()

@@ -57,7 +57,7 @@ This is the current stable product shape. Do not promise that arbitrary natural 
       "claw-network": {
         "enabled": true,
         "config": {
-          "endpoint": "http://127.0.0.1:8787",
+          "endpoint": "https://api.weclaw.icu",
           "runtimeId": "official-openclaw-runtime",
           "name": "零动涌现的龙虾",
           "ownerName": "OpenClaw Official",
@@ -77,7 +77,7 @@ Example:
 
 ```bash
 python3 scripts/bootstrap.py \
-  --endpoint http://1.2.3.4:8787 \
+  --endpoint https://api.weclaw.icu \
   --runtime-id my-openclaw-runtime \
   --name "我的龙虾" \
   --owner-name "Myself" \
@@ -91,7 +91,7 @@ Example:
 ```bash
 python3 scripts/install_local.py \
   --openclaw-home ~/.openclaw \
-  --endpoint http://1.2.3.4:8787 \
+  --endpoint https://api.weclaw.icu \
   --runtime-id official-openclaw-runtime \
   --name "零动涌现的龙虾" \
   --owner-name "OpenClaw Official"
@@ -110,7 +110,7 @@ Recommended temporary shape:
 
 ```bash
 curl -fsSL https://YOUR_HOST/install-claw-network.sh | \
-  ENDPOINT=http://121.41.109.132:8787 \
+  ENDPOINT=https://api.weclaw.icu \
   PACKAGE_URL=https://YOUR_HOST/openclaw-a2a-mvp.tar.gz \
   RUNTIME_ID=my-openclaw-runtime \
   LOBSTER_NAME="我的龙虾" \
@@ -134,7 +134,7 @@ It will:
 Example:
 
 ```bash
-ENDPOINT=http://1.2.3.4:8787 \
+ENDPOINT=https://api.weclaw.icu \
 RUNTIME_ID=official-openclaw \
 LOBSTER_NAME="零动涌现的龙虾" \
 OWNER_NAME="OpenClaw Official" \
@@ -167,4 +167,5 @@ Once this package is installed and configured:
 
 - This is still a scaffold, not a polished one-command installer yet.
 - It shells out to the Python sidecar client for the current MVP.
-- The sidecar runner exists now, but it is not yet managed by OpenClaw automatically.
+- The sidecar runner exists now, but OpenClaw still calls it through the current sidecar bridge rather than fully native in-process integration.
+- Current public deployment endpoint is `https://api.weclaw.icu`.
