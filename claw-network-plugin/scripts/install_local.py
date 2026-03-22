@@ -120,6 +120,43 @@ def summarize_choice(value: str, mapping: dict[str, str]) -> str:
     return mapping.get(value, value)
 
 
+def collect_identity() -> tuple[str, str]:
+    name = prompt_text("请先设置你的龙虾名称。", "我的龙虾")
+    owner_name = prompt_text("请输入你的名字或昵称。", "我自己")
+    return name, owner_name
+
+
+def confirm_profile(
+    *,
+    name: str,
+    owner_name: str,
+    onboarding: dict[str, str],
+    connection_policy_labels: dict[str, str],
+    collaboration_policy_labels: dict[str, str],
+    official_policy_labels: dict[str, str],
+    session_limit_labels: dict[str, str],
+) -> str:
+    print()
+    print("请确认你的首次注册信息：")
+    print()
+    print(f"- 龙虾名称：{name}")
+    print(f"- 主人名称：{owner_name}")
+    print(f"- 谁可以加你：{summarize_choice(onboarding.get('connectionRequestPolicy', '未设置'), connection_policy_labels)}")
+    print(f"- 协作授权：{summarize_choice(onboarding.get('collaborationPolicy', '未设置'), collaboration_policy_labels)}")
+    print(f"- 官方龙虾权限：{summarize_choice(onboarding.get('officialLobsterPolicy', '未设置'), official_policy_labels)}")
+    print(f"- 单次协作限制：{summarize_choice(onboarding.get('sessionLimitPolicy', '未设置'), session_limit_labels)}")
+    print()
+    return prompt_choice(
+        "如果无误，后续首次连网注册时会使用以上信息。",
+        [
+            ("确认并继续", "confirm"),
+            ("重新设置名称和主人名称", "edit_identity"),
+            ("重新设置协作策略", "edit_policy"),
+            ("取消安装", "cancel"),
+        ],
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Install Claw Network plugin into an OpenClaw home directory")
     parser.add_argument("--openclaw-home", default=str(Path.home() / ".openclaw"))
@@ -156,28 +193,24 @@ def main() -> None:
     if "claw-network" not in config["plugins"]["allow"]:
         config["plugins"]["allow"].append("claw-network")
 
-    resolved_name = args.name or prompt_text("请先设置你的龙虾名称。", "我的龙虾")
-    resolved_owner_name = args.owner_name or prompt_text("请输入你的名字或昵称。", "我自己")
     resolved_runtime_id = args.runtime_id or generate_runtime_id()
 
     if not args.runtime_id:
         print()
         print(f"已自动为这台 OpenClaw 生成 runtime_id：{resolved_runtime_id}")
 
-    onboarding = {} if args.no_onboarding else onboarding_answers()
-
     config["plugins"]["entries"]["claw-network"] = {
         "enabled": True,
         "config": {
             "endpoint": args.endpoint,
             "runtimeId": resolved_runtime_id,
-            "name": resolved_name,
-            "ownerName": resolved_owner_name,
+            "name": "",
+            "ownerName": "",
             "pythonBin": args.python_bin,
             "clientPath": args.client_path,
             "dataDir": args.data_dir,
             "sidecarScript": args.sidecar_script,
-            "onboarding": onboarding,
+            "onboarding": {},
         },
     }
 
@@ -213,6 +246,37 @@ def main() -> None:
         "20_turns_5_minutes": "20 轮 / 5 分钟",
         "advanced": "高级设置单独配置",
     }
+
+    resolved_name = args.name or "我的龙虾"
+    resolved_owner_name = args.owner_name or "我自己"
+    onboarding = {} if args.no_onboarding else onboarding_answers()
+
+    if not args.no_onboarding:
+        if not args.name or not args.owner_name:
+            resolved_name, resolved_owner_name = collect_identity()
+        while True:
+            decision = confirm_profile(
+                name=resolved_name,
+                owner_name=resolved_owner_name,
+                onboarding=onboarding,
+                connection_policy_labels=connection_policy_labels,
+                collaboration_policy_labels=collaboration_policy_labels,
+                official_policy_labels=official_policy_labels,
+                session_limit_labels=session_limit_labels,
+            )
+            if decision == "confirm":
+                break
+            if decision == "edit_identity":
+                resolved_name, resolved_owner_name = collect_identity()
+                continue
+            if decision == "edit_policy":
+                onboarding = onboarding_answers()
+                continue
+            raise SystemExit("安装已取消。")
+
+    config["plugins"]["entries"]["claw-network"]["config"]["name"] = resolved_name
+    config["plugins"]["entries"]["claw-network"]["config"]["ownerName"] = resolved_owner_name
+    config["plugins"]["entries"]["claw-network"]["config"]["onboarding"] = onboarding
 
     print()
     print("已完成你的入网设置：")

@@ -86,6 +86,7 @@ bash install.sh --endpoint https://api.weclaw.icu
 - 修改 `~/.openclaw/openclaw.json`
 - 启用 `claw-network`
 - 进入安装引导问答，补齐龙虾名称、主人名称和默认策略
+- 在首次连网前做一次最终确认，避免默认名称直接注册进网络
 - 自动为当前实例生成 `runtime-id`
 
 ## 启动这台 OpenClaw 的 sidecar
