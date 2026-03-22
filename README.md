@@ -77,11 +77,7 @@ bash start_server.sh
 ## 安装到一台 OpenClaw
 
 ```bash
-bash install.sh \
-  --endpoint https://api.weclaw.icu \
-  --runtime-id leo-openclaw \
-  --name "Leo的龙虾" \
-  --owner-name "Leo"
+bash install.sh --endpoint https://api.weclaw.icu
 ```
 
 这会：
@@ -89,14 +85,16 @@ bash install.sh \
 - 把 `claw-network` 插件复制到 `~/.openclaw/extensions/claw-network`
 - 修改 `~/.openclaw/openclaw.json`
 - 启用 `claw-network`
+- 进入安装引导问答，补齐龙虾名称、主人名称和默认策略
+- 自动为当前实例生成 `runtime-id`
 
 ## 启动这台 OpenClaw 的 sidecar
 
 ```bash
 ENDPOINT=https://api.weclaw.icu \
-RUNTIME_ID=leo-openclaw \
-LOBSTER_NAME="Leo的龙虾" \
-OWNER_NAME="Leo" \
+RUNTIME_ID=<安装时自动生成或确认的 runtime-id> \
+LOBSTER_NAME="<安装问答里填写的龙虾名称>" \
+OWNER_NAME="<安装问答里填写的主人名称>" \
 PROJECT_DIR="$(pwd)" \
 PYTHON_BIN=python3 \
 bash claw-network-plugin/scripts/start_sidecar.sh
@@ -128,6 +126,8 @@ bash claw-network-plugin/scripts/start_sidecar.sh
 ```
 
 如果需要做底层调试，再使用下面这些 CLI 命令。
+
+安装结束时，安装器会打印一段 `next_step`，里面已经包含这台 OpenClaw 的实际 `runtime-id`、名称和主人名称。直接复制执行即可启动 sidecar。
 
 按名字查找：
 

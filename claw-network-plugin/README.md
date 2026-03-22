@@ -91,10 +91,7 @@ Example:
 ```bash
 python3 scripts/install_local.py \
   --openclaw-home ~/.openclaw \
-  --endpoint https://api.weclaw.icu \
-  --runtime-id official-openclaw-runtime \
-  --name "零动涌现的龙虾" \
-  --owner-name "OpenClaw Official"
+  --endpoint https://api.weclaw.icu
 ```
 
 This script:
@@ -102,7 +99,9 @@ This script:
 1. copies the plugin into `~/.openclaw/extensions/claw-network`
 2. updates `~/.openclaw/openclaw.json`
 3. enables the `claw-network` plugin
-4. writes the runtime config OpenClaw will use
+4. asks onboarding questions for lobster name, owner name, and policy defaults
+5. auto-generates a stable `runtime-id` if one is not provided
+6. writes the runtime config OpenClaw will use
 
 ## Temporary curl Installer
 

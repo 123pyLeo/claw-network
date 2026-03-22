@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,6 +45,24 @@ def prompt_choice(title: str, options: list[tuple[str, str]]) -> str:
         if answer in valid:
             return valid[answer]
         print("输入无效，请重新输入数字。")
+
+
+def prompt_text(title: str, default: str | None = None) -> str:
+    print()
+    print(title)
+    if default:
+        print(f"直接回车可使用默认值：{default}")
+    while True:
+        answer = input("> ").strip()
+        if answer:
+            return answer
+        if default:
+            return default
+        print("输入不能为空，请重新输入。")
+
+
+def generate_runtime_id() -> str:
+    return f"claw-{uuid.uuid4().hex[:12]}"
 
 
 def onboarding_answers() -> dict[str, str]:
@@ -106,9 +125,9 @@ def main() -> None:
     parser.add_argument("--openclaw-home", default=str(Path.home() / ".openclaw"))
     parser.add_argument("--source-dir", default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument("--endpoint", required=True)
-    parser.add_argument("--runtime-id", required=True)
-    parser.add_argument("--name", required=True)
-    parser.add_argument("--owner-name", required=True)
+    parser.add_argument("--runtime-id")
+    parser.add_argument("--name")
+    parser.add_argument("--owner-name")
     parser.add_argument("--python-bin", default="python3")
     parser.add_argument("--client-path", default="/home/openclaw-a2a-mvp/agent/client.py")
     parser.add_argument("--data-dir", default="/home/openclaw-a2a-mvp/agent_data")
@@ -137,15 +156,23 @@ def main() -> None:
     if "claw-network" not in config["plugins"]["allow"]:
         config["plugins"]["allow"].append("claw-network")
 
+    resolved_name = args.name or prompt_text("请先设置你的龙虾名称。", "我的龙虾")
+    resolved_owner_name = args.owner_name or prompt_text("请输入你的名字或昵称。", "我自己")
+    resolved_runtime_id = args.runtime_id or generate_runtime_id()
+
+    if not args.runtime_id:
+        print()
+        print(f"已自动为这台 OpenClaw 生成 runtime_id：{resolved_runtime_id}")
+
     onboarding = {} if args.no_onboarding else onboarding_answers()
 
     config["plugins"]["entries"]["claw-network"] = {
         "enabled": True,
         "config": {
             "endpoint": args.endpoint,
-            "runtimeId": args.runtime_id,
-            "name": args.name,
-            "ownerName": args.owner_name,
+            "runtimeId": resolved_runtime_id,
+            "name": resolved_name,
+            "ownerName": resolved_owner_name,
             "pythonBin": args.python_bin,
             "clientPath": args.client_path,
             "dataDir": args.data_dir,
@@ -220,11 +247,14 @@ def main() -> None:
             {
                 "installed_plugin_dir": str(plugin_dir),
                 "updated_config": str(config_path),
+                "runtime_id": resolved_runtime_id,
+                "name": resolved_name,
+                "owner_name": resolved_owner_name,
                 "onboarding": onboarding,
                 "next_step": (
                     f"{args.python_bin} {args.sidecar_script} --endpoint {args.endpoint}"
-                    f" --runtime-id {args.runtime_id} --name {args.name}"
-                    f" --owner-name {args.owner_name} --data-dir {args.data_dir}"
+                    f" --runtime-id {resolved_runtime_id} --name {resolved_name}"
+                    f" --owner-name {resolved_owner_name} --data-dir {args.data_dir}"
                     f" --connection-request-policy {onboarding.get('connectionRequestPolicy', 'known_name_or_id_only')}"
                     f" --collaboration-policy {onboarding.get('collaborationPolicy', 'confirm_every_time')}"
                     f" --official-lobster-policy {onboarding.get('officialLobsterPolicy', 'low_risk_auto_allow')}"
