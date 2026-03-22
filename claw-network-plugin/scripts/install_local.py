@@ -31,6 +31,76 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def prompt_choice(title: str, options: list[tuple[str, str]]) -> str:
+    print()
+    print(title)
+    print()
+    for index, (label, _) in enumerate(options, start=1):
+        print(f"{index}. {label}")
+    print()
+    valid = {str(index): value for index, (_, value) in enumerate(options, start=1)}
+    while True:
+        answer = input(f"请回复数字：{' / '.join(valid.keys())}\n> ").strip()
+        if answer in valid:
+            return valid[answer]
+        print("输入无效，请重新输入数字。")
+
+
+def onboarding_answers() -> dict[str, str]:
+    print("欢迎加入加龙虾网络。")
+    print("在开始之前，请先完成 4 个基础设置。")
+    print("你只需要回复数字即可。")
+
+    connection_request_policy = prompt_choice(
+        "问题 1/4：谁可以向我发起连接？",
+        [
+            ("所有人都可以发起申请", "open"),
+            ("只有知道我名称或 ID 的人可以申请", "known_name_or_id_only"),
+            ("仅允许我主动邀请的人", "invite_only"),
+            ("暂时不接受新的连接申请", "closed"),
+        ],
+    )
+
+    collaboration_policy = prompt_choice(
+        "问题 2/4：其他龙虾请求调用你时，默认怎么处理？",
+        [
+            ("每次都需要我确认", "confirm_every_time"),
+            ("已连接好友可默认发起低风险协作", "friends_low_risk_auto_allow"),
+            ("官方龙虾默认允许，其他人仍需确认", "official_auto_allow_others_confirm"),
+        ],
+    )
+
+    official_lobster_policy = prompt_choice(
+        "问题 3/4：对于官方龙虾「零动涌现的龙虾」，你希望默认如何处理？",
+        [
+            ("每次确认", "confirm_every_time"),
+            ("默认允许低风险协作", "low_risk_auto_allow"),
+            ("默认允许低风险协作，并可长期保持", "low_risk_auto_allow_persistent"),
+        ],
+    )
+
+    session_limit_policy = prompt_choice(
+        "问题 4/4：单次协作默认限制是什么？",
+        [
+            ("10 轮 / 3 分钟（推荐）", "10_turns_3_minutes"),
+            ("5 轮 / 2 分钟", "5_turns_2_minutes"),
+            ("20 轮 / 5 分钟", "20_turns_5_minutes"),
+            ("使用高级设置单独配置", "advanced"),
+        ],
+    )
+
+    return {
+        "connectionRequestPolicy": connection_request_policy,
+        "collaborationPolicy": collaboration_policy,
+        "officialLobsterPolicy": official_lobster_policy,
+        "sessionLimitPolicy": session_limit_policy,
+    }
+
+
+def summarize_choice(value: str, mapping: dict[str, str]) -> str:
+    return mapping.get(value, value)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Install Claw Network plugin into an OpenClaw home directory")
     parser.add_argument("--openclaw-home", default=str(Path.home() / ".openclaw"))
@@ -42,6 +112,7 @@ def main() -> None:
     parser.add_argument("--python-bin", default="python3")
     parser.add_argument("--client-path", default="/home/openclaw-a2a-mvp/agent/client.py")
     parser.add_argument("--data-dir", default="/home/openclaw-a2a-mvp/agent_data")
+    parser.add_argument("--no-onboarding", action="store_true")
     parser.add_argument(
         "--sidecar-script",
         default="/home/openclaw-a2a-mvp/claw-network-plugin/scripts/sidecar_runner.py",
@@ -66,20 +137,25 @@ def main() -> None:
     if "claw-network" not in config["plugins"]["allow"]:
         config["plugins"]["allow"].append("claw-network")
 
+    onboarding = {} if args.no_onboarding else onboarding_answers()
+
     config["plugins"]["entries"]["claw-network"] = {
         "enabled": True,
-        "endpoint": args.endpoint,
-        "runtimeId": args.runtime_id,
-        "name": args.name,
-        "ownerName": args.owner_name,
-        "pythonBin": args.python_bin,
-        "clientPath": args.client_path,
-        "dataDir": args.data_dir,
-        "sidecarScript": args.sidecar_script,
+        "config": {
+            "endpoint": args.endpoint,
+            "runtimeId": args.runtime_id,
+            "name": args.name,
+            "ownerName": args.owner_name,
+            "pythonBin": args.python_bin,
+            "clientPath": args.client_path,
+            "dataDir": args.data_dir,
+            "sidecarScript": args.sidecar_script,
+            "onboarding": onboarding,
+        },
     }
 
     config["plugins"]["installs"]["claw-network"] = {
-        "source": "local",
+        "source": "path",
         "spec": str(source_dir),
         "installPath": str(plugin_dir),
         "version": "0.1.0",
@@ -88,15 +164,71 @@ def main() -> None:
 
     write_json(config_path, config)
 
+    connection_policy_labels = {
+        "open": "所有人都可以发起申请",
+        "known_name_or_id_only": "只有知道我名称或 ID 的人可以申请",
+        "invite_only": "仅允许我主动邀请的人",
+        "closed": "暂时不接受新的连接申请",
+    }
+    collaboration_policy_labels = {
+        "confirm_every_time": "每次都需要我确认",
+        "friends_low_risk_auto_allow": "已连接好友可默认发起低风险协作",
+        "official_auto_allow_others_confirm": "官方龙虾默认允许，其他人仍需确认",
+    }
+    official_policy_labels = {
+        "confirm_every_time": "每次确认",
+        "low_risk_auto_allow": "默认允许低风险协作",
+        "low_risk_auto_allow_persistent": "默认允许低风险协作，并可长期保持",
+    }
+    session_limit_labels = {
+        "10_turns_3_minutes": "10 轮 / 3 分钟",
+        "5_turns_2_minutes": "5 轮 / 2 分钟",
+        "20_turns_5_minutes": "20 轮 / 5 分钟",
+        "advanced": "高级设置单独配置",
+    }
+
+    print()
+    print("已完成你的入网设置：")
+    print()
+    print(f"- 谁可以加你：{summarize_choice(onboarding.get('connectionRequestPolicy', '未设置'), connection_policy_labels)}")
+    print(f"- 协作授权：{summarize_choice(onboarding.get('collaborationPolicy', '未设置'), collaboration_policy_labels)}")
+    print(f"- 官方龙虾权限：{summarize_choice(onboarding.get('officialLobsterPolicy', '未设置'), official_policy_labels)}")
+    print(f"- 单次协作限制：{summarize_choice(onboarding.get('sessionLimitPolicy', '未设置'), session_limit_labels)}")
+    print()
+    print("默认安全规则已启用：")
+    print("- 高风险能力默认禁止")
+    print("- 敏感请求自动拦截")
+    print("- 最小数据原则默认开启")
+    print("- 异常会话自动中止")
+    print()
+    print(f"你的龙虾 ID：安装完成并首次连网后生成")
+    print("你已连接官方龙虾：零动涌现的龙虾")
+    print()
+    print("推荐固定触发词：")
+    print("- 我的龙虾ID")
+    print("- 加龙虾 XXX")
+    print("- 问龙虾 XXX：YYY")
+    print("- 审批时直接回复 1 / 2 / 3")
+    print()
+    print("数字审批说明：")
+    print("- 1 = 本次允许")
+    print("- 2 = 长期允许")
+    print("- 3 = 拒绝")
+    print()
     print(
         json.dumps(
             {
                 "installed_plugin_dir": str(plugin_dir),
                 "updated_config": str(config_path),
+                "onboarding": onboarding,
                 "next_step": (
                     f"{args.python_bin} {args.sidecar_script} --endpoint {args.endpoint}"
                     f" --runtime-id {args.runtime_id} --name {args.name}"
                     f" --owner-name {args.owner_name} --data-dir {args.data_dir}"
+                    f" --connection-request-policy {onboarding.get('connectionRequestPolicy', 'known_name_or_id_only')}"
+                    f" --collaboration-policy {onboarding.get('collaborationPolicy', 'confirm_every_time')}"
+                    f" --official-lobster-policy {onboarding.get('officialLobsterPolicy', 'low_risk_auto_allow')}"
+                    f" --session-limit-policy {onboarding.get('sessionLimitPolicy', '10_turns_3_minutes')}"
                 ),
             },
             ensure_ascii=False,

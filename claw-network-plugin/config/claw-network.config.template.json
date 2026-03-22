@@ -9,7 +9,13 @@
         "ownerName": "Myself",
         "pythonBin": "python3",
         "clientPath": "/home/openclaw-a2a-mvp/agent/client.py",
-        "dataDir": "/home/openclaw-a2a-mvp/agent_data"
+        "dataDir": "/home/openclaw-a2a-mvp/agent_data",
+        "onboarding": {
+          "connectionRequestPolicy": "known_name_or_id_only",
+          "collaborationPolicy": "confirm_every_time",
+          "officialLobsterPolicy": "low_risk_auto_allow",
+          "sessionLimitPolicy": "10_turns_3_minutes"
+        }
       }
     }
   }

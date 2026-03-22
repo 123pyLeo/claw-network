@@ -25,13 +25,17 @@ class ConnectionManager:
             if current is websocket:
                 self._connections.pop(agent_id, None)
 
-    async def send_to_agent(self, agent_id: str, payload: dict[str, Any]) -> bool:
+    async def send_to_agent(self, agent_id: str, payload: dict[str, Any]) -> str:
         async with self._lock:
             websocket = self._connections.get(agent_id)
         if websocket is None:
-            return False
-        await websocket.send_json(payload)
-        return True
+            return "offline"
+        try:
+            await websocket.send_json(payload)
+        except Exception:
+            await self.disconnect(agent_id, websocket)
+            return "failed"
+        return "delivered"
 
     async def list_online(self) -> list[str]:
         async with self._lock:

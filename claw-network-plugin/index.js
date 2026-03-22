@@ -17,7 +17,13 @@ function jsonResult(data) {
 }
 
 function getPluginConfig(api) {
-  const cfg = api.config?.plugins?.entries?.['claw-network'] ?? api.config?.plugins?.entries?.clawNetwork ?? api.config?.clawNetwork;
+  const cfg =
+    api.pluginConfig ??
+    api.config?.plugins?.entries?.['claw-network']?.config ??
+    api.config?.plugins?.entries?.['claw-network'] ??
+    api.config?.plugins?.entries?.clawNetwork?.config ??
+    api.config?.plugins?.entries?.clawNetwork ??
+    api.config?.clawNetwork;
   return cfg ?? {};
 }
 
@@ -35,6 +41,19 @@ function buildBaseArgs(config) {
   ];
   if (config.dataDir) {
     args.push('--data-dir', config.dataDir);
+  }
+  const onboarding = config.onboarding ?? {};
+  if (onboarding.connectionRequestPolicy) {
+    args.push('--connection-request-policy', onboarding.connectionRequestPolicy);
+  }
+  if (onboarding.collaborationPolicy) {
+    args.push('--collaboration-policy', onboarding.collaborationPolicy);
+  }
+  if (onboarding.officialLobsterPolicy) {
+    args.push('--official-lobster-policy', onboarding.officialLobsterPolicy);
+  }
+  if (onboarding.sessionLimitPolicy) {
+    args.push('--session-limit-policy', onboarding.sessionLimitPolicy);
   }
   return args;
 }
@@ -68,6 +87,31 @@ async function runClient(api, extraArgs) {
   }
 }
 
+function latestPendingRequest(requests) {
+  if (!Array.isArray(requests) || requests.length === 0) {
+    return null;
+  }
+  return [...requests].sort((a, b) => {
+    const aTime = String(a.created_at ?? '');
+    const bTime = String(b.created_at ?? '');
+    return bTime.localeCompare(aTime);
+  })[0];
+}
+
+function decisionFromNumericChoice(choice) {
+  const normalized = String(choice ?? '').trim();
+  if (normalized === '1') {
+    return 'approved_once';
+  }
+  if (normalized === '2') {
+    return 'approved_persistent';
+  }
+  if (normalized === '3') {
+    return 'rejected';
+  }
+  throw new Error('审批数字只能是 1、2、3。');
+}
+
 const plugin = {
   id: 'claw-network',
   name: 'Claw Network',
@@ -99,21 +143,49 @@ const plugin = {
     });
 
     api.registerTool({
-      name: 'add_lobster_friend',
-      label: 'Add Lobster Friend',
-      description: 'Send a friend request to another lobster by CLAW-XXXXXX.',
+      name: 'find_lobster',
+      label: 'Find Lobster',
+      description: 'Find a lobster by name, nickname-like query, owner name, or CLAW-XXXXXX.',
       parameters: {
         type: 'object',
         additionalProperties: false,
-        required: ['claw_id'],
+        required: ['query'],
         properties: {
-          claw_id: { type: 'string' }
+          query: { type: 'string' },
+          limit: { type: 'number' }
         }
       },
       async execute(_toolCallId, params) {
         try {
           await runClient(api, ['register']);
-          const result = await runClient(api, ['add-friend', params.claw_id]);
+          const extraArgs = ['find-lobster', params.query];
+          if (params.limit) {
+            extraArgs.push('--limit', String(params.limit));
+          }
+          const result = await runClient(api, extraArgs);
+          return jsonResult({ success: true, result });
+        } catch (error) {
+          return jsonResult({ success: false, error: String(error) });
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'add_lobster_friend',
+      label: 'Add Lobster Friend',
+      description: 'Send a friend request to another lobster by name or CLAW-XXXXXX.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['target'],
+        properties: {
+          target: { type: 'string' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['add-lobster', params.target]);
           return jsonResult({ success: true, result });
         } catch (error) {
           return jsonResult({ success: false, error: String(error) });
@@ -142,6 +214,107 @@ const plugin = {
     });
 
     api.registerTool({
+      name: 'list_collaboration_requests',
+      label: 'List Collaboration Requests',
+      description: 'List pending collaboration approval requests for this lobster.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          direction: { type: 'string', enum: ['incoming', 'outgoing'] }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const extraArgs = ['list-collaboration-requests'];
+          if (params.direction) {
+            extraArgs.push('--direction', params.direction);
+          }
+          const result = await runClient(api, extraArgs);
+          return jsonResult({ success: true, requests: result });
+        } catch (error) {
+          return jsonResult({ success: false, error: String(error) });
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'respond_collaboration_request',
+      label: 'Respond Collaboration Request',
+      description: 'Approve once, approve persistently, or reject a pending collaboration request.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['request_id', 'decision'],
+        properties: {
+          request_id: { type: 'string' },
+          decision: { type: 'string', enum: ['approved_once', 'approved_persistent', 'rejected'] }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['respond-collaboration', params.request_id, params.decision]);
+          return jsonResult({ success: true, result });
+        } catch (error) {
+          return jsonResult({ success: false, error: String(error) });
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'handle_collaboration_approval',
+      label: 'Handle Collaboration Approval',
+      description: 'Use numeric choices 1/2/3 to approve once, approve persistently, or reject the latest pending collaboration request.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['choice'],
+        properties: {
+          choice: { type: 'string', enum: ['1', '2', '3'] },
+          request_id: { type: 'string' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          let requestId = params.request_id;
+          let pending = [];
+          if (!requestId) {
+            pending = await runClient(api, ['list-collaboration-requests', '--direction', 'incoming']);
+            if (!Array.isArray(pending) || pending.length === 0) {
+              return jsonResult({
+                success: false,
+                error: '当前没有待处理的协作审批请求。',
+              });
+            }
+            if (pending.length > 1) {
+              return jsonResult({
+                success: false,
+                error: '当前有多条待处理协作请求，请先确认具体请求。',
+                pending_requests: pending,
+              });
+            }
+            requestId = latestPendingRequest(pending)?.id;
+          }
+
+          const decision = decisionFromNumericChoice(params.choice);
+          const result = await runClient(api, ['respond-collaboration', requestId, decision]);
+          return jsonResult({
+            success: true,
+            choice: params.choice,
+            decision,
+            request_id: requestId,
+            result,
+          });
+        } catch (error) {
+          return jsonResult({ success: false, error: String(error) });
+        }
+      }
+    });
+
+    api.registerTool({
       name: 'send_lobster_message',
       label: 'Send Lobster Message',
       description: 'Send a direct message to a friend lobster by CLAW-XXXXXX.',
@@ -158,6 +331,35 @@ const plugin = {
         try {
           await runClient(api, ['register']);
           const result = await runClient(api, ['send-message', params.to, params.message]);
+          return jsonResult({ success: true, result });
+        } catch (error) {
+          return jsonResult({ success: false, error: String(error) });
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'ask_lobster',
+      label: 'Ask Lobster',
+      description: 'Ask a lobster by name or CLAW-XXXXXX and wait for the first reply in the current command.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['target', 'message'],
+        properties: {
+          target: { type: 'string' },
+          message: { type: 'string' },
+          timeout: { type: 'number' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const extraArgs = ['ask-lobster', params.target, params.message];
+          if (params.timeout) {
+            extraArgs.push('--timeout', String(params.timeout));
+          }
+          const result = await runClient(api, extraArgs);
           return jsonResult({ success: true, result });
         } catch (error) {
           return jsonResult({ success: false, error: String(error) });

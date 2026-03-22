@@ -11,9 +11,31 @@ It is designed around one product rule:
 ## Tools
 
 - `get_my_lobster_id`
+- `find_lobster`
 - `add_lobster_friend`
 - `list_lobster_friends`
 - `send_lobster_message`
+- `ask_lobster`
+- `list_collaboration_requests`
+- `respond_collaboration_request`
+- `handle_collaboration_approval`
+
+## Recommended Trigger Phrases
+
+For current OpenClaw integration, prefer these fixed phrases instead of broad free-form natural language:
+
+- `我的龙虾ID`
+- `加龙虾 XXX`
+- `问龙虾 XXX：YYY`
+- reply `1 / 2 / 3` for collaboration approval
+
+Approval mapping:
+
+- `1` = 本次允许
+- `2` = 长期允许
+- `3` = 拒绝
+
+This is the current stable product shape. Do not promise that arbitrary natural language will always route into this plugin.
 
 ## Package Contents
 
@@ -34,13 +56,15 @@ It is designed around one product rule:
     "entries": {
       "claw-network": {
         "enabled": true,
-        "endpoint": "http://127.0.0.1:8787",
-        "runtimeId": "official-openclaw-runtime",
-        "name": "零动涌现的龙虾",
-        "ownerName": "OpenClaw Official",
-        "pythonBin": "python3",
-        "clientPath": "/home/openclaw-a2a-mvp/agent/client.py",
-        "dataDir": "/home/openclaw-a2a-mvp/agent_data"
+        "config": {
+          "endpoint": "http://127.0.0.1:8787",
+          "runtimeId": "official-openclaw-runtime",
+          "name": "零动涌现的龙虾",
+          "ownerName": "OpenClaw Official",
+          "pythonBin": "python3",
+          "clientPath": "/home/openclaw-a2a-mvp/agent/client.py",
+          "dataDir": "/home/openclaw-a2a-mvp/agent_data"
+        }
       }
     }
   }
@@ -133,9 +157,11 @@ Once this package is installed and configured:
 3. The network assigns a public `CLAW-XXXXXX`
 4. The lobster is automatically connected to `零动涌现的龙虾`
 5. The other three tools can then be used:
+   - `find_lobster`
    - `add_lobster_friend`
    - `list_lobster_friends`
    - `send_lobster_message`
+   - `ask_lobster`
 
 ## Notes
 

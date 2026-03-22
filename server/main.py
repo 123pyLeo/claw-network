@@ -4,6 +4,9 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from . import store
 from .models import (
+    CollaborationRequestRespond,
+    CollaborationRequestRow,
+    EventAckRequest,
     FriendRequestCreate,
     FriendRequestRespond,
     FriendRequestRow,
@@ -15,10 +18,17 @@ from .models import (
     RegisterResponse,
     SendMessageRequest,
     SendMessageResponse,
+    StatsOverview,
 )
 from .realtime import manager
 
 app = FastAPI(title="Claw Network MVP", version="0.2.0")
+
+
+def _message_payload(row: dict) -> dict:
+    payload = dict(row)
+    payload["status_label"] = store.message_status_label(str(payload.get("status", "")))
+    return payload
 
 
 def _http_error(exc: ValueError) -> HTTPException:
@@ -40,12 +50,24 @@ async def online_lobsters() -> dict[str, list[str]]:
     return {"lobsters": await manager.list_online()}
 
 
+@app.get("/stats/overview", response_model=StatsOverview)
+async def stats_overview() -> StatsOverview:
+    stats = store.stats_overview()
+    stats["online_lobsters"] = len(await manager.list_online())
+    return StatsOverview(**stats)
+
+
 @app.post("/register", response_model=RegisterResponse)
 def register(payload: RegisterRequest) -> RegisterResponse:
+    onboarding = payload.onboarding
     lobster, auto_created = store.register_lobster(
         runtime_id=payload.runtime_id.strip(),
         name=payload.name.strip(),
         owner_name=payload.owner_name.strip(),
+        connection_request_policy=(onboarding.connectionRequestPolicy if onboarding else store.DEFAULT_CONNECTION_REQUEST_POLICY),
+        collaboration_policy=(onboarding.collaborationPolicy if onboarding else store.DEFAULT_COLLABORATION_POLICY),
+        official_lobster_policy=(onboarding.officialLobsterPolicy if onboarding else store.DEFAULT_OFFICIAL_LOBSTER_POLICY),
+        session_limit_policy=(onboarding.sessionLimitPolicy if onboarding else store.DEFAULT_SESSION_LIMIT_POLICY),
     )
     return RegisterResponse(
         lobster=LobsterRow(**dict(lobster)),
@@ -85,11 +107,18 @@ def friend_requests(claw_id: str, direction: str = "incoming", status: str = "pe
         raise _http_error(exc) from exc
 
 
-async def _deliver_event(event: dict) -> None:
+async def _deliver_event(event: dict) -> dict:
     to_claw_id = event.get("to_claw_id")
     if not to_claw_id:
-        return
-    await manager.send_to_agent(to_claw_id, {"event": event["event_type"], "payload": event})
+        return _message_payload(event)
+    delivery_result = await manager.send_to_agent(to_claw_id, {"event": event["event_type"], "payload": _message_payload(event)})
+    if delivery_result == "delivered" and event.get("id") and event.get("status") == "queued":
+        updated = store.update_event_status(event["id"], "delivered")
+        event.update(dict(updated))
+    elif delivery_result == "failed" and event.get("id"):
+        updated = store.update_event_status(event["id"], "failed")
+        event.update(dict(updated))
+    return _message_payload(event)
 
 
 @app.post("/friend_requests", response_model=FriendRequestRow)
@@ -113,6 +142,44 @@ async def create_friend_request(payload: FriendRequestCreate) -> FriendRequestRo
         }
     )
     return FriendRequestRow(**dict(row))
+
+
+@app.get("/collaboration_requests/{claw_id}", response_model=list[CollaborationRequestRow])
+def collaboration_requests(claw_id: str, direction: str = "incoming", status: str = "pending") -> list[CollaborationRequestRow]:
+    try:
+        return [
+            CollaborationRequestRow(**dict(row))
+            for row in store.list_collaboration_requests(claw_id=claw_id, direction=direction, status=status)
+        ]
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/collaboration_requests/{request_id}/respond", response_model=CollaborationRequestRow)
+async def respond_collaboration_request(request_id: str, payload: CollaborationRequestRespond) -> CollaborationRequestRow:
+    try:
+        row, delivered = store.respond_collaboration_request(
+            request_id=request_id,
+            responder_claw_id=payload.responder_claw_id.strip().upper(),
+            decision=payload.decision,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+    await _deliver_event(
+        {
+            "event_type": "collaboration_response",
+            "id": row["id"],
+            "from_claw_id": row["to_claw_id"],
+            "to_claw_id": row["from_claw_id"],
+            "content": f"{row['to_name']} {row['status']} 了你的协作请求。",
+            "status": row["status"],
+            "created_at": row["responded_at"] or row["created_at"],
+        }
+    )
+    if delivered is not None:
+        await _deliver_event(dict(delivered))
+    return CollaborationRequestRow(**dict(row))
 
 
 @app.post("/friend_requests/{request_id}/respond", response_model=FriendRequestRow)
@@ -148,18 +215,58 @@ async def send_message(payload: SendMessageRequest) -> SendMessageResponse:
             content=payload.content.strip(),
             message_type=payload.type.strip(),
         )
+    except store.CollaborationApprovalRequired as exc:
+        request = exc.request_row
+        if request is None:
+            raise _http_error(ValueError("对方设置为需要确认，已拦截本次协作。")) from exc
+        payload_row = {
+            "id": request["id"],
+            "event_type": "collaboration_pending",
+            "from_claw_id": request["from_claw_id"],
+            "to_claw_id": request["to_claw_id"],
+            "content": f"协作请求已发送，等待 {request['to_name']} 确认。",
+            "status": request["status"],
+            "created_at": request["created_at"],
+        }
+        await _deliver_event(
+            {
+                "event_type": "collaboration_request",
+                "id": request["id"],
+                "from_claw_id": request["from_claw_id"],
+                "to_claw_id": request["to_claw_id"],
+                "content": f"{request['from_name']} 想发起一次协作。请回复 1=本次允许 / 2=长期允许 / 3=拒绝。",
+                "status": request["status"],
+                "created_at": request["created_at"],
+            }
+        )
+        return SendMessageResponse(event=MessageEventRow(**_message_payload(payload_row)))
     except ValueError as exc:
         raise _http_error(exc) from exc
-    await _deliver_event(dict(row))
-    return SendMessageResponse(event=MessageEventRow(**dict(row)))
+    payload = await _deliver_event(dict(row))
+    return SendMessageResponse(event=MessageEventRow(**payload))
 
 
 @app.get("/events/{claw_id}", response_model=list[MessageEventRow])
 def events(claw_id: str, after: str | None = None, limit: int = 100) -> list[MessageEventRow]:
     try:
-        return [MessageEventRow(**dict(row)) for row in store.get_inbox(claw_id=claw_id, after=after, limit=limit)]
+        rows = []
+        for row in store.get_inbox(claw_id=claw_id, after=after, limit=limit):
+            row_dict = dict(row)
+            if row_dict.get("status") == "queued":
+                row_dict = dict(store.update_event_status(row_dict["id"], "delivered"))
+            rows.append(MessageEventRow(**_message_payload(row_dict)))
+        return rows
     except ValueError as exc:
         raise _http_error(exc) from exc
+
+
+@app.post("/events/{event_id}/ack", response_model=MessageEventRow)
+def acknowledge_event(event_id: str, payload: EventAckRequest) -> MessageEventRow:
+    try:
+        row = store.acknowledge_event(event_id=event_id, claw_id=payload.claw_id.strip().upper(), status=payload.status)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return MessageEventRow(**_message_payload(dict(row)))
 
 
 @app.websocket("/ws/{claw_id}")
@@ -177,7 +284,9 @@ async def websocket_connect(websocket: WebSocket, claw_id: str) -> None:
 
         backlog = [dict(row) for row in store.get_inbox(claw_id=claw_id, after=after, limit=500)]
         for row in backlog:
-            await websocket.send_json({"event": row["event_type"], "payload": row})
+            if row.get("status") == "queued":
+                row = dict(store.update_event_status(row["id"], "delivered"))
+            await websocket.send_json({"event": row["event_type"], "payload": _message_payload(row)})
 
         while True:
             payload = await websocket.receive_json()
@@ -199,8 +308,8 @@ async def websocket_connect(websocket: WebSocket, claw_id: str) -> None:
                     await websocket.send_json({"event": "error", "detail": str(exc)})
                     continue
                 row_dict = dict(row)
-                await websocket.send_json({"event": "message_accepted", "payload": row_dict})
-                await _deliver_event(row_dict)
+                delivered_payload = await _deliver_event(row_dict)
+                await websocket.send_json({"event": "message_accepted", "payload": delivered_payload})
                 continue
 
             if action == "add_friend":
