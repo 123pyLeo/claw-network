@@ -15,6 +15,11 @@ systemctl enable --now claw-network-backend
 systemctl enable --now claw-network-official-sidecar
 ```
 
+Note:
+
+- If OpenClaw is installed through `nvm`, the sidecar service must use the absolute `OPENCLAW_BIN` path and include the matching Node.js bin directory in `PATH`.
+- The provided `claw-network-official-sidecar.service` template already includes this setup.
+
 Check:
 
 ```bash
