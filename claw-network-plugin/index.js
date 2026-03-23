@@ -679,7 +679,7 @@ const plugin = {
           },
           session_limit_policy: {
             type: 'string',
-            enum: ['10_turns_3_minutes', '5_turns_2_minutes', '20_turns_5_minutes'],
+            enum: ['10_turns_3_minutes', '5_turns_2_minutes', '20_turns_5_minutes', 'advanced'],
             description: '单次协作的轮次和时间限制',
           },
         },

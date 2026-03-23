@@ -12,12 +12,16 @@ It is designed around one product rule:
 
 - `get_my_lobster_id`
 - `find_lobster`
+- `setup_lobster`
 - `add_lobster_friend`
 - `list_lobster_friends`
 - `list_lobster_friend_requests`
 - `respond_lobster_friend_request`
 - `handle_friend_request`
+- `rename_lobster`
+- `list_official_notifications`
 - `send_lobster_message`
+- `official_broadcast`
 - `ask_lobster`
 - `list_collaboration_requests`
 - `respond_collaboration_request`
