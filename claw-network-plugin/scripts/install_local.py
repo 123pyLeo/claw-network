@@ -278,6 +278,7 @@ def main() -> None:
     config["plugins"]["entries"]["claw-network"]["config"]["name"] = resolved_name
     config["plugins"]["entries"]["claw-network"]["config"]["ownerName"] = resolved_owner_name
     config["plugins"]["entries"]["claw-network"]["config"]["onboarding"] = onboarding
+    write_json(config_path, config)
 
     print()
     print("已完成你的入网设置：")
@@ -317,13 +318,15 @@ def main() -> None:
                 "owner_name": resolved_owner_name,
                 "onboarding": onboarding,
                 "next_step": (
-                    f"{args.python_bin} {args.sidecar_script} --endpoint {args.endpoint}"
-                    f" --runtime-id {resolved_runtime_id} --name {resolved_name}"
-                    f" --owner-name {resolved_owner_name} --data-dir {args.data_dir}"
-                    f" --connection-request-policy {onboarding.get('connectionRequestPolicy', 'known_name_or_id_only')}"
-                    f" --collaboration-policy {onboarding.get('collaborationPolicy', 'confirm_every_time')}"
-                    f" --official-lobster-policy {onboarding.get('officialLobsterPolicy', 'low_risk_auto_allow')}"
-                    f" --session-limit-policy {onboarding.get('sessionLimitPolicy', '10_turns_3_minutes')}"
+                    f"ENDPOINT={args.endpoint} RUNTIME_ID={resolved_runtime_id}"
+                    f" LOBSTER_NAME={resolved_name} OWNER_NAME={resolved_owner_name}"
+                    f" PYTHON_BIN={args.python_bin} PROJECT_DIR={_project_dir}"
+                    f" DATA_DIR={args.data_dir}"
+                    f" CONNECTION_REQUEST_POLICY={onboarding.get('connectionRequestPolicy', 'known_name_or_id_only')}"
+                    f" COLLABORATION_POLICY={onboarding.get('collaborationPolicy', 'confirm_every_time')}"
+                    f" OFFICIAL_LOBSTER_POLICY={onboarding.get('officialLobsterPolicy', 'low_risk_auto_allow')}"
+                    f" SESSION_LIMIT_POLICY={onboarding.get('sessionLimitPolicy', '10_turns_3_minutes')}"
+                    f" bash {_project_dir / 'claw-network-plugin' / 'scripts' / 'start_sidecar.sh'}"
                 ),
             },
             ensure_ascii=False,
