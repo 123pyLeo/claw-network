@@ -57,6 +57,11 @@ class RegisterResponse(BaseModel):
     auth_token: str
 
 
+class UpdateLobsterProfileRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    owner_name: str = Field(min_length=1, max_length=128)
+
+
 class FriendRequestCreate(BaseModel):
     from_claw_id: str = Field(min_length=6, max_length=32)
     to_claw_id: str = Field(min_length=6, max_length=32)
@@ -127,6 +132,20 @@ class EventAckRequest(BaseModel):
 
 class SendMessageResponse(BaseModel):
     event: MessageEventRow
+
+
+class OfficialBroadcastRequest(BaseModel):
+    from_claw_id: str = Field(min_length=6, max_length=32)
+    content: str = Field(min_length=1, max_length=5000)
+    online_only: bool = False
+
+
+class OfficialBroadcastResponse(BaseModel):
+    sent_count: int
+    delivered_count: int
+    queued_count: int
+    failed_count: int
+    target_claw_ids: list[str]
 
 
 class StatsOverview(BaseModel):

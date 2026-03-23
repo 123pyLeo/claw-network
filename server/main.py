@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import time
+from collections import defaultdict
+from threading import Lock
+
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -15,11 +19,14 @@ from .models import (
     LobsterPresenceRow,
     LobsterRow,
     MessageEventRow,
+    OfficialBroadcastRequest,
+    OfficialBroadcastResponse,
     RegisterRequest,
     RegisterResponse,
     SendMessageRequest,
     SendMessageResponse,
     StatsOverview,
+    UpdateLobsterProfileRequest,
 )
 from .realtime import manager
 
@@ -31,6 +38,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# 简单的滑动窗口速率限制（针对公开接口，按 IP 限速）
+# 窗口 60 秒内最多 30 次请求
+# ---------------------------------------------------------------------------
+_RATE_LIMIT_WINDOW = 60   # 秒
+_RATE_LIMIT_MAX    = 30   # 每个 IP 每窗口最多请求次数
+_rate_lock = Lock()
+_rate_buckets: dict[str, list[float]] = defaultdict(list)
+
+
+def _check_rate_limit(request: Request) -> None:
+    ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - _RATE_LIMIT_WINDOW
+    with _rate_lock:
+        timestamps = _rate_buckets[ip]
+        # 清掉窗口外的旧记录
+        _rate_buckets[ip] = [t for t in timestamps if t > cutoff]
+        if len(_rate_buckets[ip]) >= _RATE_LIMIT_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests. Please slow down.",
+                headers={"Retry-After": str(_RATE_LIMIT_WINDOW)},
+            )
+        _rate_buckets[ip].append(now)
 
 
 def _message_payload(row: dict) -> dict:
@@ -69,7 +102,8 @@ def health() -> dict[str, str]:
 
 
 @app.get("/online_lobsters")
-async def online_lobsters() -> dict[str, list[str]]:
+async def online_lobsters(request: Request) -> dict[str, list[str]]:
+    _check_rate_limit(request)
     return {"lobsters": await manager.list_online()}
 
 
@@ -102,15 +136,33 @@ def register(payload: RegisterRequest, request: Request) -> RegisterResponse:
 
 
 @app.get("/lobsters", response_model=list[LobsterRow])
-def lobsters(query: str | None = None, limit: int = 100) -> list[LobsterRow]:
+def lobsters(request: Request, query: str | None = None, limit: int = 20) -> list[LobsterRow]:
+    _check_rate_limit(request)
+    limit = min(limit, 50)
     return [LobsterRow(**dict(row)) for row in store.search_lobsters(query=query, limit=limit)]
 
 
 @app.get("/lobsters_with_presence", response_model=list[LobsterPresenceRow])
-async def lobsters_with_presence(query: str | None = None, limit: int = 100) -> list[LobsterPresenceRow]:
+async def lobsters_with_presence(request: Request, query: str | None = None, limit: int = 20) -> list[LobsterPresenceRow]:
+    _check_rate_limit(request)
+    limit = min(limit, 50)
     online = set(await manager.list_online())
     rows = store.search_lobsters(query=query, limit=limit)
     return [LobsterPresenceRow(**dict(row), online=row["claw_id"] in online) for row in rows]
+
+
+@app.patch("/lobsters/{claw_id}", response_model=LobsterRow)
+def update_lobster_profile(claw_id: str, payload: UpdateLobsterProfileRequest, request: Request) -> LobsterRow:
+    _require_http_auth(request, claw_id)
+    try:
+        row = store.update_lobster_profile(
+            claw_id=claw_id,
+            name=payload.name,
+            owner_name=payload.owner_name,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return LobsterRow(**dict(row))
 
 
 @app.get("/friends/{claw_id}", response_model=list[FriendshipRow])
@@ -276,6 +328,47 @@ async def send_message(payload: SendMessageRequest, request: Request) -> SendMes
         raise _http_error(exc) from exc
     payload = await _deliver_event(dict(row))
     return SendMessageResponse(event=MessageEventRow(**payload))
+
+
+@app.post("/broadcasts/official", response_model=OfficialBroadcastResponse)
+async def official_broadcast(payload: OfficialBroadcastRequest, request: Request) -> OfficialBroadcastResponse:
+    sender_claw_id = payload.from_claw_id.strip().upper()
+    _require_http_auth(request, sender_claw_id)
+    online = set(await manager.list_online())
+    try:
+        rows = store.create_official_broadcast(
+            from_claw_id=sender_claw_id,
+            content=payload.content,
+            online_claw_ids=online,
+            online_only=payload.online_only,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+    delivered_count = 0
+    queued_count = 0
+    failed_count = 0
+    target_claw_ids: list[str] = []
+    for row in rows:
+        delivered = await _deliver_event(dict(row))
+        target = str(delivered.get("to_claw_id") or "").strip().upper()
+        if target:
+            target_claw_ids.append(target)
+        status = str(delivered.get("status") or "")
+        if status == "delivered":
+            delivered_count += 1
+        elif status == "failed":
+            failed_count += 1
+        else:
+            queued_count += 1
+
+    return OfficialBroadcastResponse(
+        sent_count=len(rows),
+        delivered_count=delivered_count,
+        queued_count=queued_count,
+        failed_count=failed_count,
+        target_claw_ids=target_claw_ids,
+    )
 
 
 @app.get("/events/{claw_id}", response_model=list[MessageEventRow])

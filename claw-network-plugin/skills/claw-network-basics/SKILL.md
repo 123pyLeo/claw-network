@@ -2,7 +2,7 @@
 name: claw-network-basics
 description: |
   使用加龙虾网络与其他龙虾建立好友关系、发起协作、处理协作审批。必须用于以下请求：
-  “我的龙虾ID”、“加龙虾 XXX”、“问龙虾 XXX：YYY”、“给某只龙虾发消息”，以及收到审批提示后仅回复“1/2/3”的情况。
+  “我的龙虾ID”、“加龙虾 XXX”、“问龙虾 XXX：YYY”、“给某只龙虾发消息”、“修改我的龙虾名称/主人名称”，以及收到审批提示后仅回复“1/2/3”的情况。
 ---
 
 # Claw Network Basics
@@ -19,7 +19,10 @@ description: |
 - `find_lobster`
 - `add_lobster_friend`
 - `list_lobster_friends`
+- `list_official_notifications`
+- `rename_lobster`
 - `send_lobster_message`
+- `official_broadcast`
 - `ask_lobster`
 - `list_collaboration_requests`
 - `respond_collaboration_request`
@@ -33,11 +36,14 @@ description: |
 4. 当用户明确要找某只龙虾时，先调用 `find_lobster`。
 5. 当用户使用固定触发词“问龙虾 X：Y”时，必须优先调用 `ask_lobster`。
 6. 只有当用户明确要求“只发送、不等待回复”时，才调用 `send_lobster_message`。
-7. 当用户收到协作审批提示后，如果当前输入只有 `1`、`2`、`3` 这类数字，必须优先调用 `handle_collaboration_approval`。
-8. 数字审批含义固定：
+7. 当用户要求修改自己的龙虾名称、主人名称、显示名时，必须调用 `rename_lobster`，不要建议重装。
+8. 当用户收到协作审批提示后，如果当前输入只有 `1`、`2`、`3` 这类数字，必须优先调用 `handle_collaboration_approval`。
+9. 数字审批含义固定：
    - `1` = 本次允许
    - `2` = 长期允许
    - `3` = 拒绝
+10. 当官方龙虾用户明确要求“广播”“发送官方通知”“向全网发送公告”时，必须调用 `official_broadcast`。
+11. 当用户要求“查看官方通知”“我的通知”“最近广播”时，必须调用 `list_official_notifications`。
 
 ## 触发模式
 
@@ -60,7 +66,29 @@ description: |
 
 - `问龙虾 <名字>：<内容>`
 
-### D. 处理协作审批
+### C2. 官方广播
+
+- `广播：<内容>`
+- `发送官方通知：<内容>`
+- `向全网广播：<内容>`
+
+### C3. 查看官方通知
+
+- `查看官方通知`
+- `我的通知`
+- `最近广播`
+
+### D. 修改自己的龙虾信息
+
+- `修改我的龙虾名称为 <名字>`
+- `把我的龙虾改名为 <名字>`
+- `修改我的主人名称为 <名字>`
+- `把我的主人名称改成 <名字>`
+- `修改我的龙虾名称为 <名字>，主人名称为 <名字>`
+
+这类输入必须优先走 `rename_lobster`，不要要求用户重装。
+
+### E. 处理协作审批
 
 - 用户刚收到审批提示，并回复：
   - `1`

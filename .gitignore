@@ -7,3 +7,5 @@ dist/
 public/
 .fake-openclaw/
 claw-network-plugin/claw-network.local.json
+server.log
+*.log

@@ -200,6 +200,32 @@ def get_lobster_by_claw_id(claw_id: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def update_lobster_profile(claw_id: str, *, name: str, owner_name: str) -> sqlite3.Row:
+    claw_id = claw_id.strip().upper()
+    cleaned_name = name.strip()
+    cleaned_owner_name = owner_name.strip()
+    if not cleaned_name:
+        raise ValueError("Lobster name cannot be empty.")
+    if not cleaned_owner_name:
+        raise ValueError("Owner name cannot be empty.")
+    with get_conn() as conn:
+        existing = conn.execute("SELECT id FROM lobsters WHERE claw_id = ?", (claw_id,)).fetchone()
+        if existing is None:
+            raise ValueError("Lobster not found.")
+        conn.execute(
+            """
+            UPDATE lobsters
+            SET name = ?, owner_name = ?, updated_at = ?
+            WHERE claw_id = ?
+            """,
+            (cleaned_name, cleaned_owner_name, utc_now(), claw_id),
+        )
+    row = get_lobster_by_claw_id(claw_id)
+    if row is None:
+        raise ValueError("Lobster not found.")
+    return row
+
+
 def _new_auth_token() -> str:
     return f"claw_{secrets.token_urlsafe(32)}"
 
@@ -891,6 +917,51 @@ def update_event_status(event_id: str, status: str) -> sqlite3.Row:
     if row is None:
         raise ValueError("Message event not found.")
     return row
+
+
+def list_official_broadcast_targets(*, online_claw_ids: set[str] | None = None, online_only: bool = False) -> list[sqlite3.Row]:
+    official = get_official_lobster()
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, runtime_id, claw_id, name, owner_name, is_official,
+                   connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy,
+                   auth_token, token_updated_at, created_at, updated_at
+            FROM lobsters
+            WHERE id != ?
+            ORDER BY created_at ASC
+            """,
+            (official["id"],),
+        ).fetchall()
+    if not online_only:
+        return rows
+    online = online_claw_ids or set()
+    return [row for row in rows if str(row["claw_id"]) in online]
+
+
+def create_official_broadcast(from_claw_id: str, content: str, *, online_claw_ids: set[str] | None = None, online_only: bool = False) -> list[sqlite3.Row]:
+    sender = get_lobster_by_claw_id(from_claw_id)
+    if sender is None:
+        raise ValueError("Sender lobster not found.")
+    if not bool(sender["is_official"]):
+        raise ValueError("Only the official lobster can send broadcasts.")
+    cleaned_content = content.strip()
+    if not cleaned_content:
+        raise ValueError("Broadcast content cannot be empty.")
+
+    targets = list_official_broadcast_targets(online_claw_ids=online_claw_ids, online_only=online_only)
+    events: list[sqlite3.Row] = []
+    for target in targets:
+        events.append(
+            record_event(
+                event_type="official_broadcast",
+                from_lobster_id=str(sender["id"]),
+                to_lobster_id=str(target["id"]),
+                content=cleaned_content,
+                status="queued",
+            )
+        )
+    return events
 
 
 def acknowledge_event(event_id: str, claw_id: str, status: str) -> sqlite3.Row:

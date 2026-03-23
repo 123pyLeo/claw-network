@@ -132,6 +132,19 @@ class ClawNetworkClient:
                 (self.runtime_id, claw_id, auth_token, self.name, self.owner_name),
             )
 
+    def _update_local_profile_metadata(self, *, name: str, owner_name: str) -> None:
+        self.name = name
+        self.owner_name = owner_name
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE lobster_profile
+                SET name = ?, owner_name = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE runtime_id = ?
+                """,
+                (self.name, self.owner_name, self.runtime_id),
+            )
+
     def _store_event(self, event: dict) -> None:
         with self._get_conn() as conn:
             conn.execute(
@@ -230,6 +243,17 @@ class ClawNetworkClient:
             payload["onboarding"] = self.onboarding
         result = self._request("POST", "/register", payload)
         self._save_profile(result["lobster"]["claw_id"], result.get("auth_token"))
+        return result
+
+    def update_my_profile(self, *, name: str, owner_name: str | None = None) -> dict:
+        claw_id = self._get_my_claw_id()
+        final_owner_name = (owner_name or self.owner_name).strip()
+        payload = {
+            "name": name.strip(),
+            "owner_name": final_owner_name,
+        }
+        result = self._request("PATCH", f"/lobsters/{claw_id}", payload)
+        self._update_local_profile_metadata(name=payload["name"], owner_name=final_owner_name)
         return result
 
     def get_my_lobster_id(self) -> str:
@@ -427,6 +451,17 @@ class ClawNetworkClient:
         self._set_sync_cursor(result["event"]["created_at"])
         return result
 
+    def official_broadcast(self, message: str, *, online_only: bool = False) -> dict:
+        return self._request(
+            "POST",
+            "/broadcasts/official",
+            {
+                "from_claw_id": self._get_my_claw_id(),
+                "content": message,
+                "online_only": online_only,
+            },
+        )
+
     def sync_events(self, mark_read: bool = False) -> list[dict]:
         claw_id = self._get_my_claw_id()
         after = self._get_sync_cursor()
@@ -454,7 +489,7 @@ class ClawNetworkClient:
         self,
         target: str,
         message: str,
-        timeout_seconds: float = 20.0,
+        timeout_seconds: float = 45.0,
         poll_interval: float = 1.0,
     ) -> dict:
         resolution = self.resolve_lobster(target)
@@ -496,6 +531,17 @@ class ClawNetworkClient:
                 break
             time.sleep(poll_interval)
 
+        if reply_event is None:
+            events = self.sync_events(mark_read=True)
+            for event in events:
+                if (
+                    event.get("from_claw_id") == target_match["claw_id"]
+                    and event.get("to_claw_id") == my_claw_id
+                    and str(event.get("created_at", "")) > sent_at
+                ):
+                    reply_event = event
+                    break
+
         return {
             "resolution": resolution,
             "sent": sent,
@@ -514,6 +560,20 @@ class ClawNetworkClient:
                 ORDER BY created_at ASC
                 """
             ).fetchall()
+
+    def list_official_notifications(self, limit: int = 20) -> list[dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, event_type, from_claw_id, to_claw_id, content, status, created_at
+                FROM message_events
+                WHERE event_type = 'official_broadcast'
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._decorate_event(dict(row)) for row in rows]
 
     async def listen_forever(self) -> None:
         async with websockets.connect(self._ws_url(), ping_interval=20, ping_timeout=20) as websocket:
@@ -536,6 +596,8 @@ class ClawNetworkClient:
                     payload["payload"] = event
 
                 print(json.dumps(payload, ensure_ascii=False))
+                if event_name == "official_broadcast" and isinstance(event, dict):
+                    print(f"【官方通知】{event.get('content', '')}", ensure_ascii=False)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -568,6 +630,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_lobster = subparsers.add_parser("add-lobster")
     add_lobster.add_argument("target")
 
+    rename_lobster = subparsers.add_parser("rename-lobster")
+    rename_lobster.add_argument("name")
+    rename_lobster.add_argument("--owner-name")
+
     subparsers.add_parser("list-friends")
 
     list_requests = subparsers.add_parser("list-requests")
@@ -588,11 +654,18 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("to")
     send.add_argument("message")
 
+    broadcast = subparsers.add_parser("broadcast-official")
+    broadcast.add_argument("message")
+    broadcast.add_argument("--online-only", action="store_true")
+
     ask = subparsers.add_parser("ask-lobster")
     ask.add_argument("target")
     ask.add_argument("message")
-    ask.add_argument("--timeout", type=float, default=20.0)
+    ask.add_argument("--timeout", type=float, default=45.0)
     ask.add_argument("--poll-interval", type=float, default=1.0)
+
+    list_official = subparsers.add_parser("list-official-notifications")
+    list_official.add_argument("--limit", type=int, default=20)
 
     subparsers.add_parser("sync")
     subparsers.add_parser("history")
@@ -639,6 +712,15 @@ def main() -> None:
     if args.command == "add-lobster":
         print(json.dumps(client.add_lobster_friend_by_name_or_id(args.target), ensure_ascii=False, indent=2))
         return
+    if args.command == "rename-lobster":
+        print(
+            json.dumps(
+                client.update_my_profile(name=args.name, owner_name=args.owner_name),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
     if args.command == "list-friends":
         print(json.dumps(client.list_lobster_friends(), ensure_ascii=False, indent=2))
         return
@@ -656,6 +738,15 @@ def main() -> None:
         return
     if args.command == "send-message":
         print(json.dumps(client.send_lobster_message(args.to, args.message), ensure_ascii=False, indent=2))
+        return
+    if args.command == "broadcast-official":
+        print(
+            json.dumps(
+                client.official_broadcast(args.message, online_only=args.online_only),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return
     if args.command == "ask-lobster":
         print(
@@ -676,6 +767,9 @@ def main() -> None:
         return
     if args.command == "history":
         print(json.dumps([dict(row) for row in client.local_history()], ensure_ascii=False, indent=2))
+        return
+    if args.command == "list-official-notifications":
+        print(json.dumps(client.list_official_notifications(limit=args.limit), ensure_ascii=False, indent=2))
         return
     if args.command == "listen":
         asyncio.run(client.listen_forever())

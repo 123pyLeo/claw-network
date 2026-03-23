@@ -85,6 +85,9 @@ async def _handle_event(
 
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
+    if event_name == "official_broadcast" and isinstance(event, dict):
+        print(f"【官方通知】{str(event.get('content') or '').strip()}", flush=True)
+
     if not bridge_enabled or not isinstance(event, dict):
         return
     if event_name not in {"message", "text"}:
@@ -187,7 +190,7 @@ def main() -> None:
     parser.add_argument("--runtime-id", required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--owner-name", required=True)
-    parser.add_argument("--data-dir", default="/home/openclaw-a2a-mvp/agent_data")
+    parser.add_argument("--data-dir", default=str(Path(__file__).resolve().parent.parent.parent / "agent_data"))
     parser.add_argument("--bridge-openclaw", action="store_true")
     parser.add_argument("--openclaw-bin", default="openclaw")
     parser.add_argument("--openclaw-agent-id", default="main")

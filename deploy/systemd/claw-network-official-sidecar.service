@@ -6,7 +6,7 @@ Requires=claw-network-backend.service
 
 [Service]
 Type=simple
-User=root
+User=clawnet
 WorkingDirectory=/home/claw-network-release
 Environment="ENDPOINT=http://127.0.0.1:8787"
 Environment="RUNTIME_ID=official-openclaw"
@@ -16,13 +16,14 @@ Environment="PROJECT_DIR=/home/claw-network-release"
 Environment="PYTHON_BIN=/home/.venv/bin/python"
 Environment="DATA_DIR=/home/claw-network-release/agent_data"
 Environment="OPENCLAW_BRIDGE=1"
-Environment="OPENCLAW_BIN=/root/.nvm/versions/node/v24.14.0/bin/openclaw"
+# 请将下面两行替换为 clawnet 用户实际的 openclaw 安装路径（通常在 /home/clawnet/.nvm/...）
+Environment="OPENCLAW_BIN=/home/clawnet/.nvm/versions/node/v24.14.0/bin/openclaw"
 Environment="OPENCLAW_AGENT_ID=main"
 Environment="CONNECTION_REQUEST_POLICY=open"
 Environment="COLLABORATION_POLICY=friends_low_risk_auto_allow"
 Environment="OFFICIAL_LOBSTER_POLICY=low_risk_auto_allow_persistent"
 Environment="SESSION_LIMIT_POLICY=10_turns_3_minutes"
-Environment="PATH=/root/.nvm/versions/node/v24.14.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PATH=/home/clawnet/.nvm/versions/node/v24.14.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ExecStart=/bin/bash /home/claw-network-release/claw-network-plugin/scripts/start_sidecar.sh
 Restart=always
 RestartSec=3

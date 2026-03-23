@@ -1,6 +1,13 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { emptyPluginConfigSchema } from 'openclaw/plugin-sdk';
+
+// 插件根目录（claw-network-plugin/）的上一级，即项目根目录
+const __filename = fileURLToPath(import.meta.url);
+const __pluginDir = path.dirname(__filename);
+const __projectDir = path.resolve(__pluginDir, '..');
 
 const execFileAsync = promisify(execFile);
 
@@ -13,6 +20,18 @@ function jsonResult(data) {
       },
     ],
     details: data,
+  };
+}
+
+function toolTextResult(text, details) {
+  return {
+    content: [
+      {
+        type: 'text',
+        text,
+      },
+    ],
+    details,
   };
 }
 
@@ -29,7 +48,7 @@ function getPluginConfig(api) {
 
 function buildBaseArgs(config) {
   const args = [
-    config.clientPath ?? '/home/openclaw-a2a-mvp/agent/client.py',
+    config.clientPath ?? path.join(__projectDir, 'agent', 'client.py'),
     '--runtime-id',
     config.runtimeId,
     '--name',
@@ -70,7 +89,7 @@ async function runClient(api, extraArgs) {
   const pythonBin = config.pythonBin ?? 'python3';
   const args = [...buildBaseArgs(config), ...extraArgs];
   const { stdout, stderr } = await execFileAsync(pythonBin, args, {
-    cwd: '/home/openclaw-a2a-mvp',
+    cwd: config.projectDir ?? __projectDir,
     maxBuffer: 1024 * 1024,
   });
   if (stderr && stderr.trim()) {
@@ -214,6 +233,68 @@ const plugin = {
     });
 
     api.registerTool({
+      name: 'list_official_notifications',
+      label: 'List Official Notifications',
+      description: 'Show recent official broadcast notifications received by this lobster.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          limit: { type: 'number' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const extraArgs = ['list-official-notifications'];
+          if (params?.limit) {
+            extraArgs.push('--limit', String(params.limit));
+          }
+          const result = await runClient(api, extraArgs);
+          if (Array.isArray(result) && result.length > 0) {
+            const lines = result.map((item, idx) => {
+              const when = String(item.created_at ?? '');
+              const content = String(item.content ?? '');
+              return `${idx + 1}. ${when} ${content}`.trim();
+            });
+            return toolTextResult(lines.join('\n'), { success: true, result });
+          }
+          return toolTextResult('当前没有官方通知。', { success: true, result });
+        } catch (error) {
+          return jsonResult({ success: false, error: String(error) });
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'rename_lobster',
+      label: 'Rename Lobster',
+      description: 'Update the current lobster display name and owner name without re-registering or changing CLAW-ID.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['name'],
+        properties: {
+          name: { type: 'string' },
+          owner_name: { type: 'string' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const extraArgs = ['rename-lobster', params.name];
+          if (params.owner_name) {
+            extraArgs.push('--owner-name', params.owner_name);
+          }
+          const result = await runClient(api, extraArgs);
+          return jsonResult({ success: true, result });
+        } catch (error) {
+          return jsonResult({ success: false, error: String(error) });
+        }
+      }
+    });
+
+    api.registerTool({
       name: 'list_collaboration_requests',
       label: 'List Collaboration Requests',
       description: 'List pending collaboration approval requests for this lobster.',
@@ -339,6 +420,40 @@ const plugin = {
     });
 
     api.registerTool({
+      name: 'official_broadcast',
+      label: 'Official Broadcast',
+      description: 'Send an official broadcast from the official lobster to all joined lobsters, or only currently online lobsters.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['message'],
+        properties: {
+          message: { type: 'string' },
+          online_only: { type: 'boolean' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const extraArgs = ['broadcast-official', params.message];
+          if (params.online_only) {
+            extraArgs.push('--online-only');
+          }
+          const result = await runClient(api, extraArgs);
+          const sentCount = result?.sent_count ?? 0;
+          const deliveredCount = result?.delivered_count ?? 0;
+          const queuedCount = result?.queued_count ?? 0;
+          return toolTextResult(
+            `官方广播已发送：共 ${sentCount} 个目标，已送达 ${deliveredCount}，排队中 ${queuedCount}。`,
+            { success: true, result }
+          );
+        } catch (error) {
+          return jsonResult({ success: false, error: String(error) });
+        }
+      }
+    });
+
+    api.registerTool({
       name: 'ask_lobster',
       label: 'Ask Lobster',
       description: 'Ask a lobster by name or CLAW-XXXXXX and wait for the first reply in the current command.',
@@ -356,10 +471,24 @@ const plugin = {
         try {
           await runClient(api, ['register']);
           const extraArgs = ['ask-lobster', params.target, params.message];
-          if (params.timeout) {
-            extraArgs.push('--timeout', String(params.timeout));
-          }
+          extraArgs.push('--timeout', String(params.timeout ?? 45));
           const result = await runClient(api, extraArgs);
+          if (result?.awaiting_approval) {
+            return toolTextResult(
+              `已向「${params.target}」发起协作请求，当前正在等待对方审批。`,
+              { success: true, result }
+            );
+          }
+          if (result?.reply_received && result?.reply?.content) {
+            return toolTextResult(String(result.reply.content), { success: true, result });
+          }
+          if (result?.timed_out) {
+            const delivered = result?.sent?.event?.status_label ?? '已发送';
+            return toolTextResult(
+              `消息${delivered}，但在等待时间内没有收到「${params.target}」的回复。`,
+              { success: true, result }
+            );
+          }
           return jsonResult({ success: true, result });
         } catch (error) {
           return jsonResult({ success: false, error: String(error) });
