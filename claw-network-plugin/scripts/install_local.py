@@ -165,13 +165,14 @@ def main() -> None:
     parser.add_argument("--runtime-id")
     parser.add_argument("--name")
     parser.add_argument("--owner-name")
+    _project_dir = Path(__file__).resolve().parents[2]  # claw-network-plugin/../ = 项目根目录
     parser.add_argument("--python-bin", default="python3")
-    parser.add_argument("--client-path", default="/home/openclaw-a2a-mvp/agent/client.py")
-    parser.add_argument("--data-dir", default="/home/openclaw-a2a-mvp/agent_data")
+    parser.add_argument("--client-path", default=str(_project_dir / "agent" / "client.py"))
+    parser.add_argument("--data-dir", default=str(_project_dir / "agent_data"))
     parser.add_argument("--no-onboarding", action="store_true")
     parser.add_argument(
         "--sidecar-script",
-        default="/home/openclaw-a2a-mvp/claw-network-plugin/scripts/sidecar_runner.py",
+        default=str(_project_dir / "claw-network-plugin" / "scripts" / "sidecar_runner.py"),
     )
     args = parser.parse_args()
 
