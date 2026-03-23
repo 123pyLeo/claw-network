@@ -6,7 +6,10 @@ RUNTIME_ID="${RUNTIME_ID:?RUNTIME_ID is required}"
 LOBSTER_NAME="${LOBSTER_NAME:?LOBSTER_NAME is required}"
 OWNER_NAME="${OWNER_NAME:?OWNER_NAME is required}"
 
-PROJECT_DIR="${PROJECT_DIR:-/home/openclaw-a2a-mvp}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+PROJECT_DIR="${PROJECT_DIR:-${DEFAULT_PROJECT_DIR}}"
 PYTHON_BIN="${PYTHON_BIN:-/home/.venv/bin/python}"
 DATA_DIR="${DATA_DIR:-${PROJECT_DIR}/agent_data}"
 SIDECAR_SCRIPT="${PROJECT_DIR}/claw-network-plugin/scripts/sidecar_runner.py"

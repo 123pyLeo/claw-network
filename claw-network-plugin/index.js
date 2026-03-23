@@ -3,7 +3,6 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { emptyPluginConfigSchema } from 'openclaw/plugin-sdk';
 
 // 插件根目录（claw-network-plugin/）的上一级，即项目根目录
 const __filename = fileURLToPath(import.meta.url);
@@ -11,6 +10,33 @@ const __pluginDir = path.dirname(__filename);
 const __projectDir = path.resolve(__pluginDir, '..');
 
 const execFileAsync = promisify(execFile);
+
+const clawNetworkConfigSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    endpoint: { type: 'string' },
+    runtimeId: { type: 'string' },
+    name: { type: 'string' },
+    ownerName: { type: 'string' },
+    pythonBin: { type: 'string' },
+    clientPath: { type: 'string' },
+    dataDir: { type: 'string' },
+    sidecarScript: { type: 'string' },
+    projectDir: { type: 'string' },
+    onboarding: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        connectionRequestPolicy: { type: 'string' },
+        collaborationPolicy: { type: 'string' },
+        officialLobsterPolicy: { type: 'string' },
+        sessionLimitPolicy: { type: 'string' },
+      },
+    },
+  },
+  required: ['endpoint', 'runtimeId', 'name', 'ownerName'],
+};
 
 function jsonResult(data) {
   return {
@@ -179,7 +205,7 @@ const plugin = {
   id: 'claw-network',
   name: 'Claw Network',
   description: 'Connect OpenClaw to the Claw Network for lobster IDs, friends, and messages.',
-  configSchema: emptyPluginConfigSchema(),
+  configSchema: clawNetworkConfigSchema,
   register(api) {
     api.registerTool({
       name: 'get_my_lobster_id',

@@ -3,18 +3,21 @@
     "entries": {
       "claw-network": {
         "enabled": true,
-        "endpoint": "https://api.weclaw.icu",
-        "runtimeId": "replace-with-your-openclaw-runtime-id",
-        "name": "我的龙虾",
-        "ownerName": "Myself",
-        "pythonBin": "python3",
-        "clientPath": "/home/openclaw-a2a-mvp/agent/client.py",
-        "dataDir": "/home/openclaw-a2a-mvp/agent_data",
-        "onboarding": {
-          "connectionRequestPolicy": "known_name_or_id_only",
-          "collaborationPolicy": "confirm_every_time",
-          "officialLobsterPolicy": "low_risk_auto_allow",
-          "sessionLimitPolicy": "10_turns_3_minutes"
+        "config": {
+          "endpoint": "https://api.weclaw.icu",
+          "runtimeId": "replace-with-your-openclaw-runtime-id",
+          "name": "我的龙虾",
+          "ownerName": "Myself",
+          "pythonBin": "python3",
+          "clientPath": "/path/to/claw-network/agent/client.py",
+          "dataDir": "/path/to/claw-network/agent_data",
+          "sidecarScript": "/path/to/claw-network/claw-network-plugin/scripts/sidecar_runner.py",
+          "onboarding": {
+            "connectionRequestPolicy": "known_name_or_id_only",
+            "collaborationPolicy": "confirm_every_time",
+            "officialLobsterPolicy": "low_risk_auto_allow",
+            "sessionLimitPolicy": "10_turns_3_minutes"
+          }
         }
       }
     }
