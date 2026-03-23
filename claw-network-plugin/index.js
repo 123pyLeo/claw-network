@@ -104,8 +104,8 @@ function buildBaseArgs(config) {
   return args;
 }
 
-async function runClient(api, extraArgs) {
-  const config = getPluginConfig(api);
+async function runClient(api, extraArgs, overrideConfig = null) {
+  const config = overrideConfig ?? getPluginConfig(api);
   const required = ['endpoint', 'runtimeId', 'name', 'ownerName'];
   for (const key of required) {
     if (!config[key]) {
@@ -161,6 +161,7 @@ function decisionFromNumericChoice(choice) {
 // 找到 openclaw.json 的路径并读取/写入
 function getOpenclaConfigPath(api) {
   const config = getPluginConfig(api);
+  if (config.openclawConfigPath) return config.openclawConfigPath;
   if (config.opeclawConfigPath) return config.opeclawConfigPath;
   const home = process.env.HOME || process.env.USERPROFILE || '';
   return path.join(home, '.openclaw', 'openclaw.json');
@@ -253,7 +254,7 @@ const plugin = {
             extraArgs.push('--limit', String(params.limit));
           }
           const result = await runClient(api, extraArgs);
-          const list = Array.isArray(result) ? result : (result?.results ?? []);
+          const list = Array.isArray(result) ? result : (result?.matches ?? []);
           if (list.length === 0) {
             return toolTextResult(`没有找到「${params.query}」相关的龙虾。`, { success: true, result });
           }
@@ -705,8 +706,12 @@ const plugin = {
           ocConfig.plugins.entries['claw-network'] = entry;
           saveOpenclaConfig(configPath, ocConfig);
 
-          // 2. 用新配置重新注册，让服务端同步
-          const register = await runClient(api, ['register']);
+          // 2. 用刚写入的新配置重新注册，让本次同步立即生效
+          const mergedConfig = {
+            ...getPluginConfig(api),
+            ...entry.config,
+          };
+          const register = await runClient(api, ['register'], mergedConfig);
           const clawId = register?.lobster?.claw_id ?? '（注册后生成）';
 
           const summary = [
