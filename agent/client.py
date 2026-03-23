@@ -173,11 +173,16 @@ class ClawNetworkClient:
     @staticmethod
     def _status_label(status: str) -> str:
         labels = {
+            "pending": "待确认",
             "queued": "排队中",
             "delivered": "已送达",
             "consumed": "已接收",
             "read": "已读",
             "failed": "失败",
+            "approved_once": "本次已批准",
+            "approved_persistent": "已长期批准",
+            "rejected": "已拒绝",
+            "accepted": "已接受",
         }
         return labels.get(status, status)
 

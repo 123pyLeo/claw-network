@@ -11,9 +11,14 @@ def main() -> None:
     parser.add_argument("--runtime-id", required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--owner-name", required=True)
+    _project_dir = Path(__file__).resolve().parents[2]
     parser.add_argument("--python-bin", default="python3")
-    parser.add_argument("--client-path", default="/home/openclaw-a2a-mvp/agent/client.py")
-    parser.add_argument("--data-dir", default="/home/openclaw-a2a-mvp/agent_data")
+    parser.add_argument("--client-path", default=str(_project_dir / "agent" / "client.py"))
+    parser.add_argument("--data-dir", default=str(_project_dir / "agent_data"))
+    parser.add_argument(
+        "--sidecar-script",
+        default=str(_project_dir / "claw-network-plugin" / "scripts" / "sidecar_runner.py"),
+    )
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -22,13 +27,16 @@ def main() -> None:
             "entries": {
                 "claw-network": {
                     "enabled": True,
-                    "endpoint": args.endpoint,
-                    "runtimeId": args.runtime_id,
-                    "name": args.name,
-                    "ownerName": args.owner_name,
-                    "pythonBin": args.python_bin,
-                    "clientPath": args.client_path,
-                    "dataDir": args.data_dir,
+                    "config": {
+                        "endpoint": args.endpoint,
+                        "runtimeId": args.runtime_id,
+                        "name": args.name,
+                        "ownerName": args.owner_name,
+                        "pythonBin": args.python_bin,
+                        "clientPath": args.client_path,
+                        "dataDir": args.data_dir,
+                        "sidecarScript": args.sidecar_script,
+                    },
                 }
             }
         }
