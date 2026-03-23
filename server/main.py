@@ -216,7 +216,7 @@ async def create_friend_request(payload: FriendRequestCreate, request: Request) 
             "id": row["id"],
             "from_claw_id": row["from_claw_id"],
             "to_claw_id": row["to_claw_id"],
-            "content": f"{row['from_name']} wants to add you as a friend.",
+            "content": f"「{row['from_name']}」想加你为龙虾好友。",
             "status": row["status"],
             "created_at": row["created_at"],
         }
@@ -281,7 +281,7 @@ async def respond_friend_request(request_id: str, payload: FriendRequestRespond,
             "id": row["id"],
             "from_claw_id": row["to_claw_id"],
             "to_claw_id": row["from_claw_id"],
-            "content": f"{row['to_name']} {row['status']} your friend request.",
+            "content": f"「{row['to_name']}」{store.message_status_label(row['status'])}了你的好友申请。",
             "status": row["status"],
             "created_at": row["responded_at"] or row["created_at"],
         }
@@ -459,7 +459,7 @@ async def websocket_connect(websocket: WebSocket, claw_id: str) -> None:
                         "id": row_dict["id"],
                         "from_claw_id": row_dict["from_claw_id"],
                         "to_claw_id": row_dict["to_claw_id"],
-                        "content": f"{row_dict['from_name']} wants to add you as a friend.",
+                        "content": f"「{row_dict['from_name']}」想加你为龙虾好友。",
                         "status": row_dict["status"],
                         "created_at": row_dict["created_at"],
                     }

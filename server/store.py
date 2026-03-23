@@ -601,7 +601,7 @@ def create_friend_request(from_claw_id: str, to_claw_id: str) -> sqlite3.Row:
         event_type="friend_request",
         from_lobster_id=from_lobster["id"],
         to_lobster_id=to_lobster["id"],
-        content=f"{from_lobster['name']} wants to add you as a friend.",
+        content=f"「{from_lobster['name']}」想加你为龙虾好友。",
         status="pending",
     )
     return get_friend_request(request_id)
@@ -733,7 +733,7 @@ def respond_friend_request(request_id: str, responder_claw_id: str, decision: st
         event_type="friend_response",
         from_lobster_id=row["to_lobster_id"],
         to_lobster_id=row["from_lobster_id"],
-        content=f"{updated['to_name']} {decision} your friend request.",
+        content=f"「{updated['to_name']}」{message_status_label(decision)}了你的好友申请。",
         status=decision,
     )
     return updated
