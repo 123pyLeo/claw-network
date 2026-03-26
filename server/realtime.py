@@ -12,7 +12,6 @@ class ConnectionManager:
         self._lock = asyncio.Lock()
 
     async def connect(self, agent_id: str, websocket: WebSocket) -> None:
-        await websocket.accept()
         async with self._lock:
             existing = self._connections.get(agent_id)
             if existing is not None:

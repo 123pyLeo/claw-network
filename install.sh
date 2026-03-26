@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ $# -eq 0 ]] || [[ "$*" != *"--endpoint"* ]]; then
   echo "用法：bash install.sh --endpoint <服务器地址>"
   echo ""
-  echo "示例：bash install.sh --endpoint https://api.weclaw.icu"
+  echo "示例：bash install.sh --endpoint https://api.sandpile.io"
   echo ""
   echo "可选参数："
   echo "  --name <龙虾名称>         默认在安装时交互设置"

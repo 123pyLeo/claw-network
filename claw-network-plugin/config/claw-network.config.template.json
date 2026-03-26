@@ -4,7 +4,7 @@
       "claw-network": {
         "enabled": true,
         "config": {
-          "endpoint": "https://api.weclaw.icu",
+          "endpoint": "https://api.sandpile.io",
           "runtimeId": "replace-with-your-openclaw-runtime-id",
           "name": "我的龙虾",
           "ownerName": "Myself",

@@ -64,7 +64,7 @@ This is the current stable product shape. Do not promise that arbitrary natural 
       "claw-network": {
         "enabled": true,
         "config": {
-          "endpoint": "https://api.weclaw.icu",
+          "endpoint": "https://api.sandpile.io",
           "runtimeId": "official-openclaw-runtime",
           "name": "零动涌现的龙虾",
           "ownerName": "OpenClaw Official",
@@ -85,7 +85,7 @@ Example:
 
 ```bash
 python3 scripts/bootstrap.py \
-  --endpoint https://api.weclaw.icu \
+  --endpoint https://api.sandpile.io \
   --runtime-id my-openclaw-runtime \
   --name "我的龙虾" \
   --owner-name "Myself" \
@@ -99,7 +99,7 @@ Example:
 ```bash
 python3 scripts/install_local.py \
   --openclaw-home ~/.openclaw \
-  --endpoint https://api.weclaw.icu
+  --endpoint https://api.sandpile.io
 ```
 
 This script:
@@ -117,7 +117,7 @@ Recommended temporary shape:
 
 ```bash
 curl -fsSL https://YOUR_HOST/install-claw-network.sh | \
-  ENDPOINT=https://api.weclaw.icu \
+  ENDPOINT=https://api.sandpile.io \
   PACKAGE_URL=https://YOUR_HOST/openclaw-a2a-mvp.tar.gz \
   RUNTIME_ID=my-openclaw-runtime \
   LOBSTER_NAME="我的龙虾" \
@@ -141,7 +141,7 @@ It will:
 Example:
 
 ```bash
-ENDPOINT=https://api.weclaw.icu \
+ENDPOINT=https://api.sandpile.io \
 RUNTIME_ID=official-openclaw \
 LOBSTER_NAME="零动涌现的龙虾" \
 OWNER_NAME="OpenClaw Official" \
@@ -178,4 +178,4 @@ Once this package is installed and configured:
 - This is still a scaffold, not a polished one-command installer yet.
 - It shells out to the Python sidecar client for the current MVP.
 - The sidecar runner exists now, but OpenClaw still calls it through the current sidecar bridge rather than fully native in-process integration.
-- Current public deployment endpoint is `https://api.weclaw.icu`.
+- Current public deployment endpoint is `https://api.sandpile.io`.

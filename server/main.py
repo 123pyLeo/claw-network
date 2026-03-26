@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import defaultdict
 from threading import Lock
@@ -9,8 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import store
 from .models import (
+    ActiveRoomRow,
     CollaborationRequestRespond,
     CollaborationRequestRow,
+    DemoParticipantRow,
+    DemoMessageRow,
+    DemoRoomFeedResponse,
     EventAckRequest,
     FriendRequestCreate,
     FriendRequestRespond,
@@ -23,28 +28,31 @@ from .models import (
     OfficialBroadcastResponse,
     RegisterRequest,
     RegisterResponse,
+    RoomMembershipRow,
+    RoomMessageCreate,
+    RoomMessageRow,
+    RoomRow,
+    RoomCreateRequest,
     SendMessageRequest,
     SendMessageResponse,
     StatsOverview,
     UpdateLobsterProfileRequest,
+    UpdateRoundtableNotificationRequest,
 )
 from .realtime import manager
 
 app = FastAPI(title="Claw Network MVP", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.weclaw.icu"],
+    allow_origins=["https://www.sandpile.io"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# 简单的滑动窗口速率限制（针对公开接口，按 IP 限速）
-# 窗口 60 秒内最多 30 次请求
-# ---------------------------------------------------------------------------
-_RATE_LIMIT_WINDOW = 60   # 秒
-_RATE_LIMIT_MAX    = 30   # 每个 IP 每窗口最多请求次数
+_RATE_LIMIT_WINDOW = 60
+_RATE_LIMIT_MAX = 30
+_RATE_LIMIT_LIMIT = 50
 _rate_lock = Lock()
 _rate_buckets: dict[str, list[float]] = defaultdict(list)
 
@@ -54,16 +62,29 @@ def _check_rate_limit(request: Request) -> None:
     now = time.monotonic()
     cutoff = now - _RATE_LIMIT_WINDOW
     with _rate_lock:
-        timestamps = _rate_buckets[ip]
-        # 清掉窗口外的旧记录
-        _rate_buckets[ip] = [t for t in timestamps if t > cutoff]
-        if len(_rate_buckets[ip]) >= _RATE_LIMIT_MAX:
+        timestamps = [t for t in _rate_buckets[ip] if t > cutoff]
+        if len(timestamps) >= _RATE_LIMIT_MAX:
             raise HTTPException(
                 status_code=429,
                 detail="Too many requests. Please slow down.",
                 headers={"Retry-After": str(_RATE_LIMIT_WINDOW)},
             )
-        _rate_buckets[ip].append(now)
+        timestamps.append(now)
+        _rate_buckets[ip] = timestamps
+
+
+def _check_ws_rate_limit(ip: str) -> bool:
+    """WebSocket 写动作限流，按 IP 计数，复用同一个限流桶。
+    返回 True 表示通过，返回 False 表示超限（调用方发 error 消息后 continue）。"""
+    now = time.monotonic()
+    cutoff = now - _RATE_LIMIT_WINDOW
+    with _rate_lock:
+        timestamps = [t for t in _rate_buckets[ip] if t > cutoff]
+        if len(timestamps) >= _RATE_LIMIT_MAX:
+            return False
+        timestamps.append(now)
+        _rate_buckets[ip] = timestamps
+    return True
 
 
 def _message_payload(row: dict) -> dict:
@@ -116,6 +137,7 @@ async def stats_overview() -> StatsOverview:
 
 @app.post("/register", response_model=RegisterResponse)
 def register(payload: RegisterRequest, request: Request) -> RegisterResponse:
+    _check_rate_limit(request)
     onboarding = payload.onboarding
     lobster, auto_created, auth_token = store.register_lobster(
         runtime_id=payload.runtime_id.strip(),
@@ -125,6 +147,7 @@ def register(payload: RegisterRequest, request: Request) -> RegisterResponse:
         collaboration_policy=(onboarding.collaborationPolicy if onboarding else store.DEFAULT_COLLABORATION_POLICY),
         official_lobster_policy=(onboarding.officialLobsterPolicy if onboarding else store.DEFAULT_OFFICIAL_LOBSTER_POLICY),
         session_limit_policy=(onboarding.sessionLimitPolicy if onboarding else store.DEFAULT_SESSION_LIMIT_POLICY),
+        roundtable_notification_mode=(onboarding.roundtableNotificationMode if onboarding else store.DEFAULT_ROUNDTABLE_NOTIFICATION_MODE),
         auth_token=_bearer_token_from_request(request),
     )
     return RegisterResponse(
@@ -138,16 +161,16 @@ def register(payload: RegisterRequest, request: Request) -> RegisterResponse:
 @app.get("/lobsters", response_model=list[LobsterRow])
 def lobsters(request: Request, query: str | None = None, limit: int = 20) -> list[LobsterRow]:
     _check_rate_limit(request)
-    limit = min(limit, 50)
-    return [LobsterRow(**dict(row)) for row in store.search_lobsters(query=query, limit=limit)]
+    safe_limit = max(1, min(limit, _RATE_LIMIT_LIMIT))
+    return [LobsterRow(**dict(row)) for row in store.search_lobsters(query=query, limit=safe_limit)]
 
 
 @app.get("/lobsters_with_presence", response_model=list[LobsterPresenceRow])
 async def lobsters_with_presence(request: Request, query: str | None = None, limit: int = 20) -> list[LobsterPresenceRow]:
     _check_rate_limit(request)
-    limit = min(limit, 50)
     online = set(await manager.list_online())
-    rows = store.search_lobsters(query=query, limit=limit)
+    safe_limit = max(1, min(limit, _RATE_LIMIT_LIMIT))
+    rows = store.search_lobsters(query=query, limit=safe_limit)
     return [LobsterPresenceRow(**dict(row), online=row["claw_id"] in online) for row in rows]
 
 
@@ -163,6 +186,150 @@ def update_lobster_profile(claw_id: str, payload: UpdateLobsterProfileRequest, r
     except ValueError as exc:
         raise _http_error(exc) from exc
     return LobsterRow(**dict(row))
+
+
+@app.patch("/lobsters/{claw_id}/roundtable_notifications", response_model=LobsterRow)
+def update_roundtable_notifications(
+    claw_id: str,
+    payload: UpdateRoundtableNotificationRequest,
+    request: Request,
+) -> LobsterRow:
+    _require_http_auth(request, claw_id)
+    try:
+        row = store.update_roundtable_notification_mode(claw_id=claw_id, mode=payload.mode)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return LobsterRow(**dict(row))
+
+
+@app.post("/rooms", response_model=RoomRow)
+def create_room(payload: RoomCreateRequest, request: Request, claw_id: str) -> RoomRow:
+    _check_rate_limit(request)
+    normalized_claw_id = claw_id.strip().upper()
+    _require_http_auth(request, normalized_claw_id)
+    try:
+        row = store.create_room(
+            claw_id=normalized_claw_id,
+            slug=payload.slug,
+            title=payload.title,
+            description=payload.description,
+            visibility=payload.visibility,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return RoomRow(**dict(row))
+
+
+@app.get("/rooms", response_model=list[RoomRow])
+def rooms(request: Request) -> list[RoomRow]:
+    _check_rate_limit(request)
+    claw_id: str | None = None
+    token = _bearer_token_from_request(request)
+    if token:
+        lobster = store.get_lobster_by_token(token)
+        if lobster is not None:
+            claw_id = str(lobster["claw_id"])
+    try:
+        return [RoomRow(**dict(row)) for row in store.list_rooms(claw_id=claw_id)]
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+
+@app.get("/rooms/active", response_model=list[ActiveRoomRow])
+def active_rooms(request: Request, active_window_minutes: int = 10, limit: int = 20) -> list[ActiveRoomRow]:
+    _check_rate_limit(request)
+    claw_id: str | None = None
+    token = _bearer_token_from_request(request)
+    if token:
+        lobster = store.get_lobster_by_token(token)
+        if lobster is not None:
+            claw_id = str(lobster["claw_id"])
+    try:
+        return [
+            ActiveRoomRow(**dict(row))
+            for row in store.list_active_rooms(
+                claw_id=claw_id,
+                active_window_minutes=active_window_minutes,
+                limit=limit,
+            )
+        ]
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+
+@app.get("/demo-feed/rooms/{room_id}", response_model=DemoRoomFeedResponse)
+def demo_room_feed(room_id: str, after: str | None = None, limit: int = 50) -> DemoRoomFeedResponse:
+    try:
+        payload = store.get_demo_room_feed(room_id, after=after, limit=limit)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return DemoRoomFeedResponse(
+        room_id=str(payload["room_id"]),
+        room_slug=str(payload["room_slug"]),
+        room_title=str(payload["room_title"]),
+        room_description=str(payload["room_description"]),
+        participants=[DemoParticipantRow(**row) for row in payload["participants"]],
+        messages=[DemoMessageRow(**row) for row in payload["messages"]],
+        latest_cursor=payload["latest_cursor"],
+        status=str(payload["status"]),
+    )
+
+
+@app.post("/rooms/{room_id}/join", response_model=RoomMembershipRow)
+def join_room(room_id: str, request: Request, claw_id: str) -> RoomMembershipRow:
+    _require_http_auth(request, claw_id.strip().upper())
+    try:
+        row = store.join_room(room_id=room_id, claw_id=claw_id.strip().upper())
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return RoomMembershipRow(**dict(row))
+
+
+@app.post("/rooms/{room_id}/leave", response_model=RoomMembershipRow)
+def leave_room(room_id: str, request: Request, claw_id: str) -> RoomMembershipRow:
+    _require_http_auth(request, claw_id.strip().upper())
+    try:
+        row = store.leave_room(room_id=room_id, claw_id=claw_id.strip().upper())
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return RoomMembershipRow(**dict(row))
+
+
+@app.get("/rooms/{room_id}/members", response_model=list[RoomMembershipRow])
+def room_members(room_id: str, request: Request, claw_id: str) -> list[RoomMembershipRow]:
+    _require_http_auth(request, claw_id.strip().upper())
+    try:
+        return [RoomMembershipRow(**dict(row)) for row in store.list_room_members(room_id=room_id, claw_id=claw_id.strip().upper())]
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+
+@app.get("/rooms/{room_id}/messages", response_model=list[RoomMessageRow])
+def room_messages(room_id: str, request: Request, claw_id: str, limit: int = 100, before_id: str | None = None) -> list[RoomMessageRow]:
+    _require_http_auth(request, claw_id.strip().upper())
+    try:
+        return [
+            RoomMessageRow(**dict(row))
+            for row in store.list_room_messages(room_id=room_id, claw_id=claw_id.strip().upper(), limit=limit, before_id=before_id)
+        ]
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/rooms/{room_id}/messages", response_model=RoomMessageRow)
+async def create_room_message(room_id: str, payload: RoomMessageCreate, request: Request, claw_id: str) -> RoomMessageRow:
+    _check_rate_limit(request)
+    normalized_claw_id = claw_id.strip().upper()
+    _require_http_auth(request, normalized_claw_id)
+    try:
+        message_row, event_rows = store.create_room_message(room_id=room_id, from_claw_id=normalized_claw_id, content=payload.content)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    for event_row in event_rows:
+        await _deliver_event(dict(event_row))
+    for broadcast_row in store.maybe_create_active_roundtable_broadcasts_for_room(str(message_row["room_id"])):
+        await _deliver_event(dict(broadcast_row))
+    return RoomMessageRow(**dict(message_row))
 
 
 @app.get("/friends/{claw_id}", response_model=list[FriendshipRow])
@@ -202,6 +369,7 @@ async def _deliver_event(event: dict) -> dict:
 
 @app.post("/friend_requests", response_model=FriendRequestRow)
 async def create_friend_request(payload: FriendRequestCreate, request: Request) -> FriendRequestRow:
+    _check_rate_limit(request)
     _require_http_auth(request, payload.from_claw_id.strip().upper())
     try:
         row = store.create_friend_request(
@@ -291,6 +459,7 @@ async def respond_friend_request(request_id: str, payload: FriendRequestRespond,
 
 @app.post("/messages", response_model=SendMessageResponse)
 async def send_message(payload: SendMessageRequest, request: Request) -> SendMessageResponse:
+    _check_rate_limit(request)
     _require_http_auth(request, payload.from_claw_id.strip().upper())
     try:
         row = store.create_message(
@@ -332,6 +501,7 @@ async def send_message(payload: SendMessageRequest, request: Request) -> SendMes
 
 @app.post("/broadcasts/official", response_model=OfficialBroadcastResponse)
 async def official_broadcast(payload: OfficialBroadcastRequest, request: Request) -> OfficialBroadcastResponse:
+    _check_rate_limit(request)
     sender_claw_id = payload.from_claw_id.strip().upper()
     _require_http_auth(request, sender_claw_id)
     online = set(await manager.list_online())
@@ -341,6 +511,50 @@ async def official_broadcast(payload: OfficialBroadcastRequest, request: Request
             content=payload.content,
             online_claw_ids=online,
             online_only=payload.online_only,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+    delivered_count = 0
+    queued_count = 0
+    failed_count = 0
+    target_claw_ids: list[str] = []
+    for row in rows:
+        delivered = await _deliver_event(dict(row))
+        target = str(delivered.get("to_claw_id") or "").strip().upper()
+        if target:
+            target_claw_ids.append(target)
+        status = str(delivered.get("status") or "")
+        if status == "delivered":
+            delivered_count += 1
+        elif status == "failed":
+            failed_count += 1
+        else:
+            queued_count += 1
+
+    return OfficialBroadcastResponse(
+        sent_count=len(rows),
+        delivered_count=delivered_count,
+        queued_count=queued_count,
+        failed_count=failed_count,
+        target_claw_ids=target_claw_ids,
+    )
+
+
+@app.post("/broadcasts/roundtables/active", response_model=OfficialBroadcastResponse)
+async def active_roundtable_broadcast(
+    payload: OfficialBroadcastRequest,
+    request: Request,
+    active_window_minutes: int = 10,
+    limit: int = 3,
+) -> OfficialBroadcastResponse:
+    sender_claw_id = payload.from_claw_id.strip().upper()
+    _require_http_auth(request, sender_claw_id)
+    try:
+        rows = store.create_active_roundtable_broadcasts(
+            from_claw_id=sender_claw_id,
+            active_window_minutes=active_window_minutes,
+            limit=limit,
         )
     except ValueError as exc:
         raise _http_error(exc) from exc
@@ -402,7 +616,24 @@ async def websocket_connect(websocket: WebSocket, claw_id: str) -> None:
     if registered is None:
         await websocket.close(code=4404, reason="Lobster is not registered.")
         return
-    token = websocket.query_params.get("token")
+
+    # token 不再从 URL query 参数读取，改为连接建立后从第一条消息里取。
+    # 客户端连上来后必须在 5 秒内发 {"action": "auth", "token": "..."} 完成鉴权，
+    # 否则服务端关闭连接。这样 token 不会出现在 URL 和访问日志里。
+    ws_ip = websocket.client.host if websocket.client else "unknown"
+    await websocket.accept()
+    try:
+        auth_msg = await asyncio.wait_for(websocket.receive_json(), timeout=5)
+    except asyncio.TimeoutError:
+        await websocket.close(code=4401, reason="Auth timeout.")
+        return
+    except Exception:
+        await websocket.close(code=4401, reason="Auth message expected.")
+        return
+    if not isinstance(auth_msg, dict) or auth_msg.get("action") != "auth":
+        await websocket.close(code=4401, reason="First message must be auth action.")
+        return
+    token = auth_msg.get("token")
     try:
         store.require_auth_token(token, claw_id.strip().upper())
     except ValueError as exc:
@@ -430,6 +661,9 @@ async def websocket_connect(websocket: WebSocket, claw_id: str) -> None:
                 continue
 
             if action == "send_message":
+                if not _check_ws_rate_limit(ws_ip):
+                    await websocket.send_json({"event": "error", "detail": "Too many requests. Please slow down."})
+                    continue
                 try:
                     row = store.create_message(
                         from_claw_id=claw_id,
@@ -445,7 +679,54 @@ async def websocket_connect(websocket: WebSocket, claw_id: str) -> None:
                 await websocket.send_json({"event": "message_accepted", "payload": delivered_payload})
                 continue
 
+            if action == "join_room":
+                room_target = str(payload.get("room_id") or payload.get("room_slug") or "").strip()
+                try:
+                    membership = store.join_room(room_id=room_target, claw_id=claw_id)
+                except ValueError as exc:
+                    await websocket.send_json({"event": "error", "detail": str(exc)})
+                    continue
+                await websocket.send_json({"event": "room_joined", "payload": dict(membership)})
+                continue
+
+            if action == "leave_room":
+                room_target = str(payload.get("room_id") or payload.get("room_slug") or "").strip()
+                try:
+                    membership = store.leave_room(room_id=room_target, claw_id=claw_id)
+                except ValueError as exc:
+                    await websocket.send_json({"event": "error", "detail": str(exc)})
+                    continue
+                await websocket.send_json({"event": "room_left", "payload": dict(membership)})
+                continue
+
+            if action == "send_room_message":
+                if not _check_ws_rate_limit(ws_ip):
+                    await websocket.send_json({"event": "error", "detail": "Too many requests. Please slow down."})
+                    continue
+                room_target = str(payload.get("room_id") or payload.get("room_slug") or "").strip()
+                try:
+                    message_row, event_rows = store.create_room_message(
+                        room_id=room_target,
+                        from_claw_id=claw_id,
+                        content=str(payload["content"]).strip(),
+                    )
+                except (KeyError, ValueError) as exc:
+                    await websocket.send_json({"event": "error", "detail": str(exc)})
+                    continue
+                delivered_payloads = []
+                for event_row in event_rows:
+                    delivered_payloads.append(await _deliver_event(dict(event_row)))
+                for broadcast_row in store.maybe_create_active_roundtable_broadcasts_for_room(str(message_row["room_id"])):
+                    await _deliver_event(dict(broadcast_row))
+                await websocket.send_json(
+                    {"event": "room_message_accepted", "payload": dict(message_row), "delivered": delivered_payloads}
+                )
+                continue
+
             if action == "add_friend":
+                if not _check_ws_rate_limit(ws_ip):
+                    await websocket.send_json({"event": "error", "detail": "Too many requests. Please slow down."})
+                    continue
                 try:
                     row = store.create_friend_request(from_claw_id=claw_id, to_claw_id=str(payload["to_claw_id"]).strip())
                 except (KeyError, ValueError) as exc:

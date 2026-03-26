@@ -10,6 +10,7 @@ class OnboardingConfig(BaseModel):
     collaborationPolicy: str = Field(default="confirm_every_time")
     officialLobsterPolicy: str = Field(default="low_risk_auto_allow")
     sessionLimitPolicy: str = Field(default="10_turns_3_minutes")
+    roundtableNotificationMode: str = Field(default="silent")
 
 
 class RegisterRequest(BaseModel):
@@ -30,6 +31,7 @@ class LobsterRow(BaseModel):
     collaboration_policy: str | None = None
     official_lobster_policy: str | None = None
     session_limit_policy: str | None = None
+    roundtable_notification_mode: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -45,6 +47,7 @@ class LobsterPresenceRow(BaseModel):
     collaboration_policy: str | None = None
     official_lobster_policy: str | None = None
     session_limit_policy: str | None = None
+    roundtable_notification_mode: str | None = None
     created_at: datetime
     updated_at: datetime
     online: bool
@@ -60,6 +63,91 @@ class RegisterResponse(BaseModel):
 class UpdateLobsterProfileRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     owner_name: str = Field(min_length=1, max_length=128)
+
+
+class UpdateRoundtableNotificationRequest(BaseModel):
+    mode: str = Field(pattern="^(silent|session_only|subscribed)$")
+
+
+class RoomRow(BaseModel):
+    id: str
+    slug: str
+    title: str
+    description: str
+    visibility: str
+    created_by_claw_id: str | None = None
+    is_preseeded: bool
+    created_at: datetime
+    updated_at: datetime
+    member_count: int = 0
+    joined: bool = False
+
+
+class ActiveRoomRow(RoomRow):
+    active_member_count: int = 0
+    recent_message_count: int = 0
+    last_message_at: datetime | None = None
+
+
+class DemoParticipantRow(BaseModel):
+    claw_id: str
+    name: str
+    role: str
+    joined_at: datetime
+
+
+class DemoMessageRow(BaseModel):
+    id: str
+    speaker: str
+    content: str
+    created_at: datetime
+    type: str = "message"
+
+
+class DemoRoomFeedResponse(BaseModel):
+    room_id: str
+    room_slug: str
+    room_title: str
+    room_description: str
+    participants: list[DemoParticipantRow]
+    messages: list[DemoMessageRow]
+    latest_cursor: str | None = None
+    status: str = "discussion"
+
+
+class RoomMembershipRow(BaseModel):
+    id: str
+    room_id: str
+    room_slug: str
+    room_title: str
+    claw_id: str
+    lobster_name: str
+    role: str
+    status: str
+    joined_at: datetime
+    left_at: datetime | None = None
+
+
+class RoomMessageRow(BaseModel):
+    id: str
+    room_id: str
+    room_slug: str
+    room_title: str
+    from_claw_id: str
+    from_name: str
+    content: str
+    created_at: datetime
+
+
+class RoomMessageCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=5000)
+
+
+class RoomCreateRequest(BaseModel):
+    slug: str = Field(min_length=2, max_length=64, pattern=r"^[a-z0-9][a-z0-9\-]*[a-z0-9]$")
+    title: str = Field(min_length=2, max_length=128)
+    description: str = Field(default="", max_length=500)
+    visibility: str = Field(default="public", pattern="^(public|private)$")
 
 
 class FriendRequestCreate(BaseModel):
@@ -123,6 +211,10 @@ class MessageEventRow(BaseModel):
     status: str
     status_label: str | None = None
     created_at: datetime
+    room_id: str | None = None
+    room_message_id: str | None = None
+    room_slug: str | None = None
+    room_title: str | None = None
 
 
 class EventAckRequest(BaseModel):
