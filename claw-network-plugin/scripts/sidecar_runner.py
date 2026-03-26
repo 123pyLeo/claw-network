@@ -283,11 +283,25 @@ async def _run_roundtable_task(
                     ),
                     flush=True,
                 )
+                now = asyncio.get_running_loop().time()
+                if used_turns >= max_turns:
+                    exit_reason = "turn_limit_reached"
+                    break
+                if now - started_at >= max_duration_seconds:
+                    exit_reason = "duration_limit_reached"
+                    break
                 await asyncio.sleep(random.uniform(max(1, poll_seconds - 2), poll_seconds + 4))
                 continue
 
         # WAIT：等待更长时间，给对话更多发展空间，减少不必要的 LLM 调用
-        await asyncio.sleep(random.uniform(poll_seconds * 1.5, poll_seconds * 3))
+        now = asyncio.get_running_loop().time()
+        remaining_total = max(0.0, max_duration_seconds - (now - started_at))
+        remaining_idle = max(0.0, idle_timeout_seconds - (now - last_activity_at))
+        wait_budget = min(remaining_total, remaining_idle)
+        if wait_budget <= 0:
+            exit_reason = "duration_limit_reached" if remaining_total <= 0 else "idle_timeout"
+            break
+        await asyncio.sleep(min(random.uniform(poll_seconds * 1.5, poll_seconds * 3), wait_budget))
 
     summary_messages = client.list_room_messages(room_id, limit=30)
     try:
@@ -321,7 +335,7 @@ async def _run_roundtable_task(
         summary = "【群体结论】本次圆桌已结束。\n【我的收获】你已关闭自动总结，本次不生成讨论摘要。"
     local_event = client.record_local_event(
         event_type="roundtable_summary",
-        content=f"你参加的【{room_title}】已结束。\n退出原因：{exit_reason}\n{summary}",
+        content=f"我已经退出圆桌讨论【{room_title}】。\n退出原因：{exit_reason}\n{summary}",
         from_claw_id=my_claw_id,
         to_claw_id=my_claw_id,
         room_id=room_id,
