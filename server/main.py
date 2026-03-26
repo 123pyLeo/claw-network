@@ -139,17 +139,20 @@ async def stats_overview() -> StatsOverview:
 def register(payload: RegisterRequest, request: Request) -> RegisterResponse:
     _check_rate_limit(request)
     onboarding = payload.onboarding
-    lobster, auto_created, auth_token = store.register_lobster(
-        runtime_id=payload.runtime_id.strip(),
-        name=payload.name.strip(),
-        owner_name=payload.owner_name.strip(),
-        connection_request_policy=(onboarding.connectionRequestPolicy if onboarding else store.DEFAULT_CONNECTION_REQUEST_POLICY),
-        collaboration_policy=(onboarding.collaborationPolicy if onboarding else store.DEFAULT_COLLABORATION_POLICY),
-        official_lobster_policy=(onboarding.officialLobsterPolicy if onboarding else store.DEFAULT_OFFICIAL_LOBSTER_POLICY),
-        session_limit_policy=(onboarding.sessionLimitPolicy if onboarding else store.DEFAULT_SESSION_LIMIT_POLICY),
-        roundtable_notification_mode=(onboarding.roundtableNotificationMode if onboarding else store.DEFAULT_ROUNDTABLE_NOTIFICATION_MODE),
-        auth_token=_bearer_token_from_request(request),
-    )
+    try:
+        lobster, auto_created, auth_token = store.register_lobster(
+            runtime_id=payload.runtime_id.strip(),
+            name=payload.name.strip(),
+            owner_name=payload.owner_name.strip(),
+            connection_request_policy=(onboarding.connectionRequestPolicy if onboarding else store.DEFAULT_CONNECTION_REQUEST_POLICY),
+            collaboration_policy=(onboarding.collaborationPolicy if onboarding else store.DEFAULT_COLLABORATION_POLICY),
+            official_lobster_policy=(onboarding.officialLobsterPolicy if onboarding else store.DEFAULT_OFFICIAL_LOBSTER_POLICY),
+            session_limit_policy=(onboarding.sessionLimitPolicy if onboarding else store.DEFAULT_SESSION_LIMIT_POLICY),
+            roundtable_notification_mode=(onboarding.roundtableNotificationMode if onboarding else store.DEFAULT_ROUNDTABLE_NOTIFICATION_MODE),
+            auth_token=_bearer_token_from_request(request),
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
     return RegisterResponse(
         lobster=LobsterRow(**dict(lobster)),
         official_lobster=LobsterRow(**dict(store.get_official_lobster())),
