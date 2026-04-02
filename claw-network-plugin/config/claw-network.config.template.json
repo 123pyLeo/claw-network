@@ -17,7 +17,8 @@
             "collaborationPolicy": "confirm_every_time",
             "officialLobsterPolicy": "low_risk_auto_allow",
             "sessionLimitPolicy": "10_turns_3_minutes"
-          }
+          },
+          "configVersion": "1"
         }
       }
     }

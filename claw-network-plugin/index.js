@@ -1,33 +1,14 @@
 import { execFile } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-const execFileAsync = promisify(execFile);
+import pluginManifest from './openclaw.plugin.json' with { type: 'json' };
 
-const clawNetworkConfigSchema = {
-  type: 'object',
-  additionalProperties: false,
-  properties: {
-    endpoint: { type: 'string' },
-    runtimeId: { type: 'string' },
-    name: { type: 'string' },
-    ownerName: { type: 'string' },
-    pythonBin: { type: 'string' },
-    clientPath: { type: 'string' },
-    dataDir: { type: 'string' },
-    sidecarScript: { type: 'string' },
-    onboarding: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        connectionRequestPolicy: { type: 'string' },
-        collaborationPolicy: { type: 'string' },
-        officialLobsterPolicy: { type: 'string' },
-        sessionLimitPolicy: { type: 'string' },
-        roundtableNotificationMode: { type: 'string' },
-      },
-    },
-  },
-  required: ['endpoint', 'runtimeId', 'name', 'ownerName'],
-};
+const execFileAsync = promisify(execFile);
+const clawNetworkConfigSchema = pluginManifest.configSchema;
+const __pluginDir = path.dirname(fileURLToPath(import.meta.url));
+const __projectDir = path.resolve(__pluginDir, '..');
+const defaultClientPath = path.join(__projectDir, 'agent', 'client.py');
 
 function jsonResult(data) {
   return {
@@ -126,7 +107,7 @@ function getPluginConfig(api) {
 
 function buildBaseArgs(config) {
   const args = [
-    config.clientPath ?? '/home/openclaw-a2a-mvp/agent/client.py',
+    config.clientPath ?? defaultClientPath,
     '--runtime-id',
     config.runtimeId,
     '--name',
@@ -158,6 +139,200 @@ function buildBaseArgs(config) {
   return args;
 }
 
+function resolveClientCwd(config) {
+  if (config.dataDir) {
+    return path.dirname(config.dataDir);
+  }
+  const clientPath = config.clientPath ?? defaultClientPath;
+  return path.dirname(path.dirname(clientPath));
+}
+
+function resolveManagementProjectDir(config) {
+  if (config.dataDir) {
+    return path.dirname(config.dataDir);
+  }
+  const clientPath = config.clientPath ?? defaultClientPath;
+  return path.dirname(path.dirname(clientPath));
+}
+
+function getOpenClawHome() {
+  if (process.env.OPENCLAW_HOME) {
+    return process.env.OPENCLAW_HOME;
+  }
+  if (process.env.HOME) {
+    return path.join(process.env.HOME, '.openclaw');
+  }
+  return path.join(__projectDir, '.openclaw');
+}
+
+function buildProjectEnv(config, extraEnv = {}) {
+  const managementProjectDir = resolveManagementProjectDir(config);
+  const pythonPathParts = [managementProjectDir];
+  if (process.env.PYTHONPATH) {
+    pythonPathParts.push(process.env.PYTHONPATH);
+  }
+  return {
+    ...process.env,
+    OPENCLAW_HOME: getOpenClawHome(),
+    PYTHONPATH: pythonPathParts.join(path.delimiter),
+    ...extraEnv,
+  };
+}
+
+async function runProjectPythonScript(config, scriptRelativePath, extraArgs = [], extraEnv = {}) {
+  const pythonBin = config.pythonBin ?? 'python3';
+  const projectDir = resolveManagementProjectDir(config);
+  const scriptPath = path.join(projectDir, scriptRelativePath);
+  return execFileAsync(pythonBin, [scriptPath, ...extraArgs], {
+    cwd: projectDir,
+    env: buildProjectEnv(config, extraEnv),
+    maxBuffer: 1024 * 1024,
+  });
+}
+
+async function runProjectPythonScriptAllowFailure(config, scriptRelativePath, extraArgs = [], extraEnv = {}) {
+  try {
+    const result = await runProjectPythonScript(config, scriptRelativePath, extraArgs, extraEnv);
+    return { ...result, failed: false, exitCode: 0 };
+  } catch (error) {
+    return {
+      stdout: String(error?.stdout ?? ''),
+      stderr: String(error?.stderr ?? ''),
+      failed: true,
+      exitCode: Number(error?.code ?? 1),
+    };
+  }
+}
+
+async function runProjectShellScript(config, scriptRelativePath, extraArgs = [], extraEnv = {}) {
+  const projectDir = resolveManagementProjectDir(config);
+  const scriptPath = path.join(projectDir, scriptRelativePath);
+  return execFileAsync('bash', [scriptPath, ...extraArgs], {
+    cwd: projectDir,
+    env: buildProjectEnv(config, extraEnv),
+    maxBuffer: 1024 * 1024,
+  });
+}
+
+async function runOpenClawCommand(config, extraArgs = []) {
+  const projectDir = resolveManagementProjectDir(config);
+  return execFileAsync('openclaw', extraArgs, {
+    cwd: projectDir,
+    env: buildProjectEnv(config),
+    maxBuffer: 1024 * 1024,
+  });
+}
+
+async function readJsonFile(filePath) {
+  const { stdout } = await execFileAsync('python3', ['-c', 'import json,sys; print(json.dumps(json.load(open(sys.argv[1], encoding="utf-8")), ensure_ascii=False))', filePath], {
+    cwd: '/tmp',
+    maxBuffer: 1024 * 1024,
+  });
+  return JSON.parse(stdout);
+}
+
+async function readPackageVersion(filePath) {
+  try {
+    const data = await readJsonFile(filePath);
+    const version = data?.version;
+    if (typeof version === 'string' && version.trim()) {
+      return version.trim();
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+async function readTextVersion(filePath) {
+  try {
+    const { stdout } = await execFileAsync('python3', ['-c', 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip())', filePath], {
+      cwd: '/tmp',
+      maxBuffer: 1024 * 1024,
+    });
+    const version = String(stdout ?? '').trim();
+    return version || null;
+  } catch {
+    return null;
+  }
+}
+
+function getInstalledPluginVersion(api) {
+  const installed = api.config?.plugins?.installs?.['claw-network'];
+  if (installed?.version) {
+    return String(installed.version);
+  }
+  return null;
+}
+
+function parseDoctorOutput(output) {
+  const text = String(output ?? '').trim();
+  const counts = { pass: 0, fail: 0, warn: 0 };
+  const issues = [];
+  const warnings = [];
+  for (const line of text.split('\n')) {
+    if (line.startsWith('[PASS]')) {
+      counts.pass += 1;
+      continue;
+    }
+    if (line.startsWith('[FAIL]')) {
+      counts.fail += 1;
+      issues.push(line.replace(/^\[FAIL\]\s*/, '').trim());
+      continue;
+    }
+    if (line.startsWith('[WARN]')) {
+      counts.warn += 1;
+      warnings.push(line.replace(/^\[WARN\]\s*/, '').trim());
+    }
+  }
+  return { text, counts, issues, warnings };
+}
+
+function formatDoctorSummary(summary) {
+  const lines = [
+    `诊断完成：${summary.counts.pass} 项通过，${summary.counts.fail} 项失败，${summary.counts.warn} 项警告。`,
+  ];
+  if (summary.issues.length > 0) {
+    lines.push(`当前需要处理的问题：${summary.issues.slice(0, 3).join('；')}`);
+  }
+  if (summary.warnings.length > 0) {
+    lines.push(`需要留意：${summary.warnings.slice(0, 2).join('；')}`);
+  }
+  return lines.join('\n');
+}
+
+function buildUpgradePreview(config, targetVersion) {
+  const versionLabel = targetVersion ? `目标版本：${targetVersion}` : '目标版本：最新版';
+  return [
+    '我可以开始升级龙虾网络。',
+    versionLabel,
+    `当前 runtimeId：${config.runtimeId ?? '未配置'}`,
+    '这次升级会保留你当前的龙虾身份、龙虾 ID 和好友关系。',
+    '如果升级失败，我会自动回滚到旧版本。',
+    '如果你确认要继续，直接回复“开始升级龙虾网络”或“确认升级”就可以了。',
+  ].join('\n');
+}
+
+function isAffirmativeConfirmation(value) {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return [
+    'confirm',
+    'confirmed',
+    'start',
+    'upgrade',
+    '开始',
+    '开始升级',
+    '开始升级龙虾网络',
+    '确认',
+    '确认升级',
+    '继续',
+    '继续升级',
+  ].includes(normalized);
+}
+
 async function runClient(api, extraArgs) {
   const config = getPluginConfig(api);
   const required = ['endpoint', 'runtimeId', 'name', 'ownerName'];
@@ -170,7 +345,7 @@ async function runClient(api, extraArgs) {
   const pythonBin = config.pythonBin ?? 'python3';
   const args = [...buildBaseArgs(config), ...extraArgs];
   const { stdout, stderr } = await execFileAsync(pythonBin, args, {
-    cwd: '/home/openclaw-a2a-mvp',
+    cwd: resolveClientCwd(config),
     maxBuffer: 1024 * 1024,
   });
   if (stderr && stderr.trim()) {
@@ -1239,6 +1414,207 @@ const plugin = {
           );
         } catch (error) {
           return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'claw_network_status',
+      label: 'Claw Network Status',
+      description: 'Check whether claw-network is healthy, whether identity is intact, and whether upgrade would preserve the current lobster ID.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          verbose: { type: 'boolean' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        const config = getPluginConfig(api);
+        try {
+          const openclawHome = getOpenClawHome();
+          const managementProjectDir = resolveManagementProjectDir(config);
+          const doctorRun = await runProjectPythonScriptAllowFailure(
+            config,
+            'scripts/doctor.py',
+            ['--openclaw-home', openclawHome, '--project-dir', managementProjectDir]
+          );
+          const doctor = parseDoctorOutput(doctorRun.stdout);
+          const identityOk = Boolean(config.runtimeId && config.endpoint && config.name && config.ownerName);
+          const connected = doctor.counts.fail === 0;
+          const currentVersion = getInstalledPluginVersion(api)
+            ?? await readTextVersion(path.join(path.dirname(__pluginDir), 'VERSION'))
+            ?? await readPackageVersion(path.join(__pluginDir, 'package.json'))
+            ?? 'unknown';
+          const latestVersion = await readTextVersion(path.join(managementProjectDir, 'VERSION'))
+            ?? await readPackageVersion(path.join(managementProjectDir, 'claw-network-plugin', 'package.json'));
+          const upgradeAvailable = Boolean(latestVersion && currentVersion !== 'unknown' && latestVersion !== currentVersion);
+          const lines = [];
+          if (connected) {
+            lines.push('你的龙虾网络当前运行正常。');
+          } else {
+            lines.push('你的龙虾网络当前还有一些问题需要处理。');
+          }
+          lines.push(`当前身份：${config.name ?? '未命名'} (${config.runtimeId ?? '未配置 runtimeId'})`);
+          lines.push(`当前版本：${currentVersion}`);
+          if (latestVersion) {
+            lines.push(`仓库版本：${latestVersion}`);
+          }
+          if (upgradeAvailable) {
+            lines.push('发现可升级版本。如果你愿意，我可以继续帮你升级，而且会保留你当前的龙虾 ID 和好友关系。');
+          } else if (latestVersion && currentVersion === latestVersion) {
+            lines.push('当前安装已经是仓库里的最新版。');
+          }
+          lines.push('如果现在升级，我会保留你当前的龙虾 ID 和好友关系。');
+          lines.push(`本地诊断结果：${doctor.counts.pass} 项通过，${doctor.counts.fail} 项失败，${doctor.counts.warn} 项警告。`);
+          if (doctor.issues.length > 0) {
+            lines.push(`主要问题：${doctor.issues.slice(0, 2).join('；')}`);
+          }
+          if (params?.verbose) {
+            lines.push('');
+            lines.push(doctor.text);
+          }
+          return toolTextResult(lines.join('\n'), {
+            success: true,
+            connected,
+            identity_ok: identityOk,
+            current_version: currentVersion,
+            latest_version: latestVersion,
+            upgrade_available: upgradeAvailable,
+            runtime_id: config.runtimeId ?? null,
+            will_keep_identity_on_upgrade: identityOk,
+            doctor,
+          });
+        } catch (error) {
+          return errorResult(error, '检查龙虾网络状态时出错了。');
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'claw_network_upgrade',
+      label: 'Upgrade Claw Network',
+      description: 'Safely upgrade claw-network while preserving the current runtimeId and lobster identity.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          target_version: { type: 'string' },
+          dry_run: { type: 'boolean' },
+          confirmed: { type: 'boolean' },
+          confirmation_text: { type: 'string' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        const config = getPluginConfig(api);
+        const targetVersion = params?.target_version;
+        const confirmed = Boolean(params?.confirmed) || isAffirmativeConfirmation(params?.confirmation_text);
+        if (targetVersion && !['latest', 'stable'].includes(String(targetVersion).trim().toLowerCase())) {
+          return toolTextResult(
+            '当前升级入口还不支持选择指定版本，只支持升级到当前仓库里的最新版。',
+            { success: false, supported_target_versions: ['latest'] }
+          );
+        }
+        if (params?.dry_run || !confirmed) {
+          return toolTextResult(buildUpgradePreview(config, targetVersion), {
+            success: true,
+            dry_run: true,
+            requires_confirmation: !confirmed,
+            runtime_id: config.runtimeId ?? null,
+            will_keep_identity_on_upgrade: Boolean(config.runtimeId),
+            target_version: targetVersion ?? 'latest',
+          });
+        }
+
+        try {
+          const { stdout } = await runProjectShellScript(config, 'upgrade.sh');
+          return toolTextResult(stdout.trim() || '升级完成。', {
+            success: true,
+            runtime_id: config.runtimeId ?? null,
+            kept_identity: Boolean(config.runtimeId),
+            target_version: targetVersion ?? 'latest',
+          });
+        } catch (error) {
+          return errorResult(error, '升级龙虾网络失败了。');
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'claw_network_repair',
+      label: 'Repair Claw Network',
+      description: 'Repair the current claw-network installation without changing the current lobster identity.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          dry_run: { type: 'boolean' },
+          verbose: { type: 'boolean' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        const config = getPluginConfig(api);
+        const openclawHome = getOpenClawHome();
+        try {
+          const managementProjectDir = resolveManagementProjectDir(config);
+          const migrateArgs = ['--openclaw-home', openclawHome];
+          const repairArgs = ['--openclaw-home', openclawHome, '--project-dir', managementProjectDir];
+          if (params?.dry_run) {
+            repairArgs.push('--dry-run');
+          }
+
+          const migrateRun = await runProjectPythonScript(
+            config,
+            'claw-network-plugin/scripts/migrate_config.py',
+            migrateArgs
+          );
+          const repairRun = await runProjectPythonScript(
+            config,
+            'scripts/repair_instance.py',
+            repairArgs
+          );
+
+          let restartOutput = '';
+          if (!params?.dry_run) {
+            try {
+              const restartRun = await runOpenClawCommand(config, ['gateway', 'restart']);
+              restartOutput = String(restartRun.stdout ?? '').trim();
+            } catch (restartError) {
+              api.logger?.warn?.(`gateway restart failed: ${cleanErrorMessage(restartError)}`);
+            }
+          }
+
+          const doctorRun = await runProjectPythonScriptAllowFailure(
+            config,
+            'scripts/doctor.py',
+            ['--openclaw-home', openclawHome, '--project-dir', managementProjectDir]
+          );
+          const doctor = parseDoctorOutput(doctorRun.stdout);
+          const parts = [
+            params?.dry_run
+              ? '我已经完成一次修复预检查，还没有真正改动你的龙虾网络。'
+              : '我已经执行了龙虾网络修复流程。',
+            '这次修复不会更换你的 runtimeId，也不会重新分配龙虾 ID。',
+            formatDoctorSummary(doctor),
+          ];
+          if (params?.verbose) {
+            parts.push('', '迁移输出：', migrateRun.stdout.trim() || '（无）', '', '修复输出：', repairRun.stdout.trim() || '（无）');
+            if (restartOutput) {
+              parts.push('', 'Gateway 重启输出：', restartOutput);
+            }
+          }
+
+          return toolTextResult(parts.join('\n'), {
+            success: doctor.counts.fail === 0,
+            dry_run: Boolean(params?.dry_run),
+            runtime_id: config.runtimeId ?? null,
+            doctor,
+            migrate_output: migrateRun.stdout.trim(),
+            repair_output: repairRun.stdout.trim(),
+            restart_output: restartOutput,
+          });
+        } catch (error) {
+          return errorResult(error, '修复龙虾网络时出错了。');
         }
       }
     });

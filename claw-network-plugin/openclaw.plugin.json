@@ -30,6 +30,30 @@
       },
       "sidecarScript": {
         "type": "string"
+      },
+      "onboarding": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "connectionRequestPolicy": {
+            "type": "string"
+          },
+          "collaborationPolicy": {
+            "type": "string"
+          },
+          "officialLobsterPolicy": {
+            "type": "string"
+          },
+          "sessionLimitPolicy": {
+            "type": "string"
+          },
+          "roundtableNotificationMode": {
+            "type": "string"
+          }
+        }
+      },
+      "configVersion": {
+        "type": "string"
       }
     },
     "required": [

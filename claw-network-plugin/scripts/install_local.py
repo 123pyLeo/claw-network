@@ -32,6 +32,33 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def load_allowed_config_keys(source_dir: Path) -> set[str]:
+    manifest_path = source_dir / "openclaw.plugin.json"
+    manifest = load_json(manifest_path)
+    properties = manifest.get("configSchema", {}).get("properties", {})
+    return set(properties)
+
+
+def load_plugin_version(source_dir: Path) -> str:
+    version_file = source_dir.parent / "VERSION"
+    if version_file.is_file():
+        version = version_file.read_text(encoding="utf-8").strip()
+        if version:
+            return version
+
+    package_path = source_dir / "package.json"
+    package_data = load_json(package_path)
+    version = package_data.get("version")
+    if isinstance(version, str) and version.strip():
+        return version.strip()
+    return "0.1.0"
+
+
+def build_plugin_config(source_dir: Path, raw_config: dict) -> dict:
+    allowed_keys = load_allowed_config_keys(source_dir)
+    return {key: value for key, value in raw_config.items() if key in allowed_keys}
+
+
 def prompt_choice(title: str, options: list[tuple[str, str]]) -> str:
     print()
     print(title)
@@ -184,6 +211,7 @@ def main() -> None:
 
     extensions_dir.mkdir(parents=True, exist_ok=True)
     copy_plugin_tree(source_dir, plugin_dir)
+    plugin_version = load_plugin_version(source_dir)
 
     config = load_json(config_path)
     config.setdefault("plugins", {})
@@ -202,24 +230,28 @@ def main() -> None:
 
     config["plugins"]["entries"]["claw-network"] = {
         "enabled": True,
-        "config": {
-            "endpoint": args.endpoint,
-            "runtimeId": resolved_runtime_id,
-            "name": "",
-            "ownerName": "",
-            "pythonBin": args.python_bin,
-            "clientPath": args.client_path,
-            "dataDir": args.data_dir,
-            "sidecarScript": args.sidecar_script,
-            "onboarding": {},
-        },
+        "config": build_plugin_config(
+            source_dir,
+            {
+                "endpoint": args.endpoint,
+                "runtimeId": resolved_runtime_id,
+                "name": "",
+                "ownerName": "",
+                "pythonBin": args.python_bin,
+                "clientPath": args.client_path,
+                "dataDir": args.data_dir,
+                "sidecarScript": args.sidecar_script,
+                "onboarding": {},
+                "configVersion": "1",
+            },
+        ),
     }
 
     config["plugins"]["installs"]["claw-network"] = {
         "source": "path",
         "spec": str(source_dir),
         "installPath": str(plugin_dir),
-        "version": "0.1.0",
+        "version": plugin_version,
         "installedAt": utc_now(),
     }
 
@@ -275,9 +307,11 @@ def main() -> None:
                 continue
             raise SystemExit("安装已取消。")
 
-    config["plugins"]["entries"]["claw-network"]["config"]["name"] = resolved_name
-    config["plugins"]["entries"]["claw-network"]["config"]["ownerName"] = resolved_owner_name
-    config["plugins"]["entries"]["claw-network"]["config"]["onboarding"] = onboarding
+    plugin_config = config["plugins"]["entries"]["claw-network"]["config"]
+    plugin_config["name"] = resolved_name
+    plugin_config["ownerName"] = resolved_owner_name
+    if "onboarding" in plugin_config:
+        plugin_config["onboarding"] = onboarding
     write_json(config_path, config)
 
     print()
