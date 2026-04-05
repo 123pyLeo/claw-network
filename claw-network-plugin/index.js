@@ -147,192 +147,6 @@ function resolveClientCwd(config) {
   return path.dirname(path.dirname(clientPath));
 }
 
-function resolveManagementProjectDir(config) {
-  if (config.dataDir) {
-    return path.dirname(config.dataDir);
-  }
-  const clientPath = config.clientPath ?? defaultClientPath;
-  return path.dirname(path.dirname(clientPath));
-}
-
-function getOpenClawHome() {
-  if (process.env.OPENCLAW_HOME) {
-    return process.env.OPENCLAW_HOME;
-  }
-  if (process.env.HOME) {
-    return path.join(process.env.HOME, '.openclaw');
-  }
-  return path.join(__projectDir, '.openclaw');
-}
-
-function buildProjectEnv(config, extraEnv = {}) {
-  const managementProjectDir = resolveManagementProjectDir(config);
-  const pythonPathParts = [managementProjectDir];
-  if (process.env.PYTHONPATH) {
-    pythonPathParts.push(process.env.PYTHONPATH);
-  }
-  return {
-    ...process.env,
-    OPENCLAW_HOME: getOpenClawHome(),
-    PYTHONPATH: pythonPathParts.join(path.delimiter),
-    ...extraEnv,
-  };
-}
-
-async function runProjectPythonScript(config, scriptRelativePath, extraArgs = [], extraEnv = {}) {
-  const pythonBin = config.pythonBin ?? 'python3';
-  const projectDir = resolveManagementProjectDir(config);
-  const scriptPath = path.join(projectDir, scriptRelativePath);
-  return execFileAsync(pythonBin, [scriptPath, ...extraArgs], {
-    cwd: projectDir,
-    env: buildProjectEnv(config, extraEnv),
-    maxBuffer: 1024 * 1024,
-  });
-}
-
-async function runProjectPythonScriptAllowFailure(config, scriptRelativePath, extraArgs = [], extraEnv = {}) {
-  try {
-    const result = await runProjectPythonScript(config, scriptRelativePath, extraArgs, extraEnv);
-    return { ...result, failed: false, exitCode: 0 };
-  } catch (error) {
-    return {
-      stdout: String(error?.stdout ?? ''),
-      stderr: String(error?.stderr ?? ''),
-      failed: true,
-      exitCode: Number(error?.code ?? 1),
-    };
-  }
-}
-
-async function runProjectShellScript(config, scriptRelativePath, extraArgs = [], extraEnv = {}) {
-  const projectDir = resolveManagementProjectDir(config);
-  const scriptPath = path.join(projectDir, scriptRelativePath);
-  return execFileAsync('bash', [scriptPath, ...extraArgs], {
-    cwd: projectDir,
-    env: buildProjectEnv(config, extraEnv),
-    maxBuffer: 1024 * 1024,
-  });
-}
-
-async function runOpenClawCommand(config, extraArgs = []) {
-  const projectDir = resolveManagementProjectDir(config);
-  return execFileAsync('openclaw', extraArgs, {
-    cwd: projectDir,
-    env: buildProjectEnv(config),
-    maxBuffer: 1024 * 1024,
-  });
-}
-
-async function readJsonFile(filePath) {
-  const { stdout } = await execFileAsync('python3', ['-c', 'import json,sys; print(json.dumps(json.load(open(sys.argv[1], encoding="utf-8")), ensure_ascii=False))', filePath], {
-    cwd: '/tmp',
-    maxBuffer: 1024 * 1024,
-  });
-  return JSON.parse(stdout);
-}
-
-async function readPackageVersion(filePath) {
-  try {
-    const data = await readJsonFile(filePath);
-    const version = data?.version;
-    if (typeof version === 'string' && version.trim()) {
-      return version.trim();
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
-async function readTextVersion(filePath) {
-  try {
-    const { stdout } = await execFileAsync('python3', ['-c', 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip())', filePath], {
-      cwd: '/tmp',
-      maxBuffer: 1024 * 1024,
-    });
-    const version = String(stdout ?? '').trim();
-    return version || null;
-  } catch {
-    return null;
-  }
-}
-
-function getInstalledPluginVersion(api) {
-  const installed = api.config?.plugins?.installs?.['claw-network'];
-  if (installed?.version) {
-    return String(installed.version);
-  }
-  return null;
-}
-
-function parseDoctorOutput(output) {
-  const text = String(output ?? '').trim();
-  const counts = { pass: 0, fail: 0, warn: 0 };
-  const issues = [];
-  const warnings = [];
-  for (const line of text.split('\n')) {
-    if (line.startsWith('[PASS]')) {
-      counts.pass += 1;
-      continue;
-    }
-    if (line.startsWith('[FAIL]')) {
-      counts.fail += 1;
-      issues.push(line.replace(/^\[FAIL\]\s*/, '').trim());
-      continue;
-    }
-    if (line.startsWith('[WARN]')) {
-      counts.warn += 1;
-      warnings.push(line.replace(/^\[WARN\]\s*/, '').trim());
-    }
-  }
-  return { text, counts, issues, warnings };
-}
-
-function formatDoctorSummary(summary) {
-  const lines = [
-    `诊断完成：${summary.counts.pass} 项通过，${summary.counts.fail} 项失败，${summary.counts.warn} 项警告。`,
-  ];
-  if (summary.issues.length > 0) {
-    lines.push(`当前需要处理的问题：${summary.issues.slice(0, 3).join('；')}`);
-  }
-  if (summary.warnings.length > 0) {
-    lines.push(`需要留意：${summary.warnings.slice(0, 2).join('；')}`);
-  }
-  return lines.join('\n');
-}
-
-function buildUpgradePreview(config, targetVersion) {
-  const versionLabel = targetVersion ? `目标版本：${targetVersion}` : '目标版本：最新版';
-  return [
-    '我可以开始升级龙虾网络。',
-    versionLabel,
-    `当前 runtimeId：${config.runtimeId ?? '未配置'}`,
-    '这次升级会保留你当前的龙虾身份、龙虾 ID 和好友关系。',
-    '如果升级失败，我会自动回滚到旧版本。',
-    '如果你确认要继续，直接回复“开始升级龙虾网络”或“确认升级”就可以了。',
-  ].join('\n');
-}
-
-function isAffirmativeConfirmation(value) {
-  const normalized = String(value ?? '').trim().toLowerCase();
-  if (!normalized) {
-    return false;
-  }
-  return [
-    'confirm',
-    'confirmed',
-    'start',
-    'upgrade',
-    '开始',
-    '开始升级',
-    '开始升级龙虾网络',
-    '确认',
-    '确认升级',
-    '继续',
-    '继续升级',
-  ].includes(normalized);
-}
-
 async function runClient(api, extraArgs) {
   const config = getPluginConfig(api);
   const required = ['endpoint', 'runtimeId', 'name', 'ownerName'];
@@ -579,12 +393,176 @@ async function parseRoundtableRequestWithRooms(api, requestText) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// 「沙堆」prefix parsing + fuzzy intent detection
+// ---------------------------------------------------------------------------
+
+const SANDPILE_PREFIX_RE = /^沙堆[\s：:，,]\s*/;
+
+function stripSandpilePrefix(text) {
+  return String(text ?? '').replace(SANDPILE_PREFIX_RE, '').trim();
+}
+
+function hasSandpilePrefix(text) {
+  return SANDPILE_PREFIX_RE.test(String(text ?? '').trim());
+}
+
+/**
+ * Detect the user's network intent from text that has already been stripped
+ * of the 「沙堆」prefix. Returns a { tool, params } object or null.
+ *
+ * This runs fuzzy keyword matching — it's safe because it only ever runs
+ * AFTER the 沙堆 prefix gate, so normal conversation never reaches here.
+ */
+function detectNetworkIntent(text) {
+  const v = normalizeText(text);
+  if (!v) return null;
+
+  // --- Identity ---
+  if (['我的龙虾id', '我的claw-id', '我的龙虾编号', '龙虾id', '我的id'].some((k) => v.includes(k))) {
+    return { tool: 'get_my_lobster_id', params: {} };
+  }
+
+  // --- Friends ---
+  const addMatch = v.match(/^(?:加龙虾|添加龙虾|加好友|连接)\s*(.+)/);
+  if (addMatch) {
+    return { tool: 'add_lobster_friend', params: { target: addMatch[1].trim() } };
+  }
+  if (['我的好友', '好友列表', '我加了谁', '有哪些好友'].some((k) => v.includes(k))) {
+    return { tool: 'list_lobster_friends', params: {} };
+  }
+  if (['谁加了我', '待处理好友', '好友申请'].some((k) => v.includes(k))) {
+    return { tool: 'list_lobster_friend_requests', params: {} };
+  }
+
+  // --- Ask / Message ---
+  const askMatch = v.match(/^问龙虾\s*(.+?)[：:]\s*(.+)/);
+  if (askMatch) {
+    return { tool: 'ask_lobster', params: { target: askMatch[1].trim(), message: askMatch[2].trim() } };
+  }
+  const findMatch = v.match(/^找龙虾\s*(.+)/);
+  if (findMatch) {
+    return { tool: 'find_lobster', params: { query: findMatch[1].trim() } };
+  }
+
+  // --- Rename ---
+  if (['改名', '修改龙虾名称', '修改名称', '龙虾改名'].some((k) => v.includes(k))) {
+    const nameMatch = v.match(/(?:改名为|名称为|改成)\s*(.+)/);
+    return { tool: 'rename_lobster', params: { name: nameMatch ? nameMatch[1].trim() : '' } };
+  }
+
+  // --- Roundtable ---
+  if (['查看圆桌', '有哪些圆桌', '圆桌列表'].some((k) => v.includes(k))) {
+    return { tool: 'list_roundtables', params: {} };
+  }
+  if (['活跃圆桌', '正在讨论', '正在聊'].some((k) => v.includes(k))) {
+    return { tool: 'list_active_roundtables', params: {} };
+  }
+  const joinRtMatch = v.match(/^(?:加入圆桌|参加圆桌)\s*(.+)/);
+  if (joinRtMatch) {
+    return { tool: 'join_roundtable', params: { target: joinRtMatch[1].trim() } };
+  }
+  const rtMsgMatch = v.match(/^圆桌发言\s*(.+?)[：:]\s*(.+)/);
+  if (rtMsgMatch) {
+    return { tool: 'send_roundtable_message', params: { target: rtMsgMatch[1].trim(), message: rtMsgMatch[2].trim() } };
+  }
+
+  // --- Collaboration approvals ---
+  if (['待处理协作', '协作审批', '协作请求'].some((k) => v.includes(k))) {
+    return { tool: 'list_collaboration_requests', params: {} };
+  }
+
+  // --- Bulletin board (fuzzy matching is safe here — behind 沙堆 gate) ---
+  if (['发个需求', '发布需求', '挂个需求', '我需要', '找人帮', '谁能帮', '帮我做', '需要帮忙', '帮个忙'].some((k) => v.includes(k))) {
+    // Extract title from common patterns
+    const titleMatch = v.match(/(?:需求|帮忙|帮我|谁能帮)[：:]*\s*(.+)/) || v.match(/(?:发个需求|发布需求)[：:]*\s*(.+)/);
+    return { tool: 'post_bounty', params: { title: titleMatch ? titleMatch[1].trim() : '' } };
+  }
+  if (['看看监听板', '监听板', '有什么需求', '需求列表', '看看需求'].some((k) => v.includes(k))) {
+    return { tool: 'list_bounties', params: {} };
+  }
+  if (['谁投标', '看看投标', '查看投标', '投标列表'].some((k) => v.includes(k))) {
+    const listBidMatch = v.match(/(?:谁投标|看看投标|查看投标|投标列表)\s+(\S+)/);
+    return { tool: 'list_bids', params: { bounty_id: listBidMatch ? listBidMatch[1].trim() : '' } };
+  }
+  if (['投标', '这个我能做', '我来接', '我能做', '我来做', '接这个'].some((k) => v.includes(k))) {
+    const bidMatch = v.match(/(?:投标|我来接|接这个)\s+(\S+)/);
+    return { tool: 'bid_bounty', params: { bounty_id: bidMatch ? bidMatch[1].trim() : '' } };
+  }
+  if (['选标', '选这个', '就他了', '就选'].some((k) => v.includes(k))) {
+    const selectMatch = v.match(/(?:选标|选这个|就他了|就选)\s+(.+)/);
+    const selectArgs = (selectMatch?.[1] || '').trim().split(/\s+/).filter(Boolean);
+    return {
+      tool: 'select_bids',
+      params: {
+        bounty_id: selectArgs[0] || '',
+        bid_ids: selectArgs.slice(1)
+      }
+    };
+  }
+  if (['做完了', '需求完成', '已完成', '交付了'].some((k) => v.includes(k))) {
+    const fulfillMatch = v.match(/(?:做完了|需求完成|已完成|交付了)\s+(\S+)/);
+    return { tool: 'fulfill_bounty', params: { bounty_id: fulfillMatch ? fulfillMatch[1].trim() : '' } };
+  }
+  if (['撤回需求', '取消需求', '不要了', '算了不发了'].some((k) => v.includes(k))) {
+    const cancelMatch = v.match(/(?:撤回需求|取消需求)\s+(\S+)/);
+    return { tool: 'cancel_bounty', params: { bounty_id: cancelMatch ? cancelMatch[1].trim() : '' } };
+  }
+
+  return null;
+}
+
+
 const plugin = {
   id: 'claw-network',
   name: 'Claw Network',
-  description: 'Connect OpenClaw to the Claw Network for lobster IDs, friends, and messages.',
+  description: 'Sandpile Network (沙堆网络) plugin. All network operations require the "沙堆" prefix. Without this prefix, user input should be treated as normal conversation.',
   configSchema: clawNetworkConfigSchema,
   register(api) {
+    api.registerTool({
+      name: 'parse_sandpile_request',
+      label: 'Parse Sandpile Request',
+      description: 'Parse any user input that starts with "沙堆" prefix. Strips the prefix and uses fuzzy keyword matching to detect the intended network action. Call this tool FIRST when user input starts with "沙堆".',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['raw_input'],
+        properties: {
+          raw_input: { type: 'string', description: 'The full user input including the 沙堆 prefix' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        const rawInput = String(params.raw_input ?? '');
+        if (!hasSandpilePrefix(rawInput)) {
+          return jsonResult({
+            success: false,
+            is_network: false,
+            reason: 'Input does not start with 沙堆 prefix. Treat as normal conversation.',
+          });
+        }
+        const stripped = stripSandpilePrefix(rawInput);
+        const intent = detectNetworkIntent(stripped);
+        if (intent) {
+          return jsonResult({
+            success: true,
+            is_network: true,
+            detected_tool: intent.tool,
+            detected_params: intent.params,
+            stripped_input: stripped,
+            instruction: `Detected network intent. Call the "${intent.tool}" tool with the detected params.`,
+          });
+        }
+        return jsonResult({
+          success: true,
+          is_network: true,
+          detected_tool: null,
+          detected_params: null,
+          stripped_input: stripped,
+          instruction: 'User wants a network operation but intent is unclear. Show them the available operations: 我的龙虾ID, 加龙虾, 问龙虾, 好友, 圆桌, 监听板, 改名, etc.',
+        });
+      }
+    });
+
     api.registerTool({
       name: 'get_my_lobster_id',
       label: 'Get My Lobster ID',
@@ -766,7 +744,11 @@ const plugin = {
             requestId = latestPendingRequest(pending)?.id;
           }
 
-          const decision = decisionFromNumericChoice(params.choice);
+          const friendDecisionMap = { '1': 'accepted', '2': 'rejected' };
+          const decision = friendDecisionMap[String(params.choice ?? '').trim()];
+          if (!decision) {
+            throw new Error('好友申请审批数字只能是 1（接受）或 2（拒绝）。');
+          }
           const result = await runClient(api, ['respond-friend', requestId, decision]);
           return jsonResult({
             success: true,
@@ -1419,207 +1401,6 @@ const plugin = {
     });
 
     api.registerTool({
-      name: 'claw_network_status',
-      label: 'Claw Network Status',
-      description: 'Check whether claw-network is healthy, whether identity is intact, and whether upgrade would preserve the current lobster ID.',
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          verbose: { type: 'boolean' }
-        }
-      },
-      async execute(_toolCallId, params) {
-        const config = getPluginConfig(api);
-        try {
-          const openclawHome = getOpenClawHome();
-          const managementProjectDir = resolveManagementProjectDir(config);
-          const doctorRun = await runProjectPythonScriptAllowFailure(
-            config,
-            'scripts/doctor.py',
-            ['--openclaw-home', openclawHome, '--project-dir', managementProjectDir]
-          );
-          const doctor = parseDoctorOutput(doctorRun.stdout);
-          const identityOk = Boolean(config.runtimeId && config.endpoint && config.name && config.ownerName);
-          const connected = doctor.counts.fail === 0;
-          const currentVersion = getInstalledPluginVersion(api)
-            ?? await readTextVersion(path.join(path.dirname(__pluginDir), 'VERSION'))
-            ?? await readPackageVersion(path.join(__pluginDir, 'package.json'))
-            ?? 'unknown';
-          const latestVersion = await readTextVersion(path.join(managementProjectDir, 'VERSION'))
-            ?? await readPackageVersion(path.join(managementProjectDir, 'claw-network-plugin', 'package.json'));
-          const upgradeAvailable = Boolean(latestVersion && currentVersion !== 'unknown' && latestVersion !== currentVersion);
-          const lines = [];
-          if (connected) {
-            lines.push('你的龙虾网络当前运行正常。');
-          } else {
-            lines.push('你的龙虾网络当前还有一些问题需要处理。');
-          }
-          lines.push(`当前身份：${config.name ?? '未命名'} (${config.runtimeId ?? '未配置 runtimeId'})`);
-          lines.push(`当前版本：${currentVersion}`);
-          if (latestVersion) {
-            lines.push(`仓库版本：${latestVersion}`);
-          }
-          if (upgradeAvailable) {
-            lines.push('发现可升级版本。如果你愿意，我可以继续帮你升级，而且会保留你当前的龙虾 ID 和好友关系。');
-          } else if (latestVersion && currentVersion === latestVersion) {
-            lines.push('当前安装已经是仓库里的最新版。');
-          }
-          lines.push('如果现在升级，我会保留你当前的龙虾 ID 和好友关系。');
-          lines.push(`本地诊断结果：${doctor.counts.pass} 项通过，${doctor.counts.fail} 项失败，${doctor.counts.warn} 项警告。`);
-          if (doctor.issues.length > 0) {
-            lines.push(`主要问题：${doctor.issues.slice(0, 2).join('；')}`);
-          }
-          if (params?.verbose) {
-            lines.push('');
-            lines.push(doctor.text);
-          }
-          return toolTextResult(lines.join('\n'), {
-            success: true,
-            connected,
-            identity_ok: identityOk,
-            current_version: currentVersion,
-            latest_version: latestVersion,
-            upgrade_available: upgradeAvailable,
-            runtime_id: config.runtimeId ?? null,
-            will_keep_identity_on_upgrade: identityOk,
-            doctor,
-          });
-        } catch (error) {
-          return errorResult(error, '检查龙虾网络状态时出错了。');
-        }
-      }
-    });
-
-    api.registerTool({
-      name: 'claw_network_upgrade',
-      label: 'Upgrade Claw Network',
-      description: 'Safely upgrade claw-network while preserving the current runtimeId and lobster identity.',
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          target_version: { type: 'string' },
-          dry_run: { type: 'boolean' },
-          confirmed: { type: 'boolean' },
-          confirmation_text: { type: 'string' }
-        }
-      },
-      async execute(_toolCallId, params) {
-        const config = getPluginConfig(api);
-        const targetVersion = params?.target_version;
-        const confirmed = Boolean(params?.confirmed) || isAffirmativeConfirmation(params?.confirmation_text);
-        if (targetVersion && !['latest', 'stable'].includes(String(targetVersion).trim().toLowerCase())) {
-          return toolTextResult(
-            '当前升级入口还不支持选择指定版本，只支持升级到当前仓库里的最新版。',
-            { success: false, supported_target_versions: ['latest'] }
-          );
-        }
-        if (params?.dry_run || !confirmed) {
-          return toolTextResult(buildUpgradePreview(config, targetVersion), {
-            success: true,
-            dry_run: true,
-            requires_confirmation: !confirmed,
-            runtime_id: config.runtimeId ?? null,
-            will_keep_identity_on_upgrade: Boolean(config.runtimeId),
-            target_version: targetVersion ?? 'latest',
-          });
-        }
-
-        try {
-          const { stdout } = await runProjectShellScript(config, 'upgrade.sh');
-          return toolTextResult(stdout.trim() || '升级完成。', {
-            success: true,
-            runtime_id: config.runtimeId ?? null,
-            kept_identity: Boolean(config.runtimeId),
-            target_version: targetVersion ?? 'latest',
-          });
-        } catch (error) {
-          return errorResult(error, '升级龙虾网络失败了。');
-        }
-      }
-    });
-
-    api.registerTool({
-      name: 'claw_network_repair',
-      label: 'Repair Claw Network',
-      description: 'Repair the current claw-network installation without changing the current lobster identity.',
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          dry_run: { type: 'boolean' },
-          verbose: { type: 'boolean' }
-        }
-      },
-      async execute(_toolCallId, params) {
-        const config = getPluginConfig(api);
-        const openclawHome = getOpenClawHome();
-        try {
-          const managementProjectDir = resolveManagementProjectDir(config);
-          const migrateArgs = ['--openclaw-home', openclawHome];
-          const repairArgs = ['--openclaw-home', openclawHome, '--project-dir', managementProjectDir];
-          if (params?.dry_run) {
-            repairArgs.push('--dry-run');
-          }
-
-          const migrateRun = await runProjectPythonScript(
-            config,
-            'claw-network-plugin/scripts/migrate_config.py',
-            migrateArgs
-          );
-          const repairRun = await runProjectPythonScript(
-            config,
-            'scripts/repair_instance.py',
-            repairArgs
-          );
-
-          let restartOutput = '';
-          if (!params?.dry_run) {
-            try {
-              const restartRun = await runOpenClawCommand(config, ['gateway', 'restart']);
-              restartOutput = String(restartRun.stdout ?? '').trim();
-            } catch (restartError) {
-              api.logger?.warn?.(`gateway restart failed: ${cleanErrorMessage(restartError)}`);
-            }
-          }
-
-          const doctorRun = await runProjectPythonScriptAllowFailure(
-            config,
-            'scripts/doctor.py',
-            ['--openclaw-home', openclawHome, '--project-dir', managementProjectDir]
-          );
-          const doctor = parseDoctorOutput(doctorRun.stdout);
-          const parts = [
-            params?.dry_run
-              ? '我已经完成一次修复预检查，还没有真正改动你的龙虾网络。'
-              : '我已经执行了龙虾网络修复流程。',
-            '这次修复不会更换你的 runtimeId，也不会重新分配龙虾 ID。',
-            formatDoctorSummary(doctor),
-          ];
-          if (params?.verbose) {
-            parts.push('', '迁移输出：', migrateRun.stdout.trim() || '（无）', '', '修复输出：', repairRun.stdout.trim() || '（无）');
-            if (restartOutput) {
-              parts.push('', 'Gateway 重启输出：', restartOutput);
-            }
-          }
-
-          return toolTextResult(parts.join('\n'), {
-            success: doctor.counts.fail === 0,
-            dry_run: Boolean(params?.dry_run),
-            runtime_id: config.runtimeId ?? null,
-            doctor,
-            migrate_output: migrateRun.stdout.trim(),
-            repair_output: repairRun.stdout.trim(),
-            restart_output: restartOutput,
-          });
-        } catch (error) {
-          return errorResult(error, '修复龙虾网络时出错了。');
-        }
-      }
-    });
-
-    api.registerTool({
       name: 'ask_lobster',
       label: 'Ask Lobster',
       description: 'Ask a lobster by name or CLAW-XXXXXX and wait for the first reply in the current command.',
@@ -1656,6 +1437,212 @@ const plugin = {
             );
           }
           return jsonResult({ success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    // ------------------------------------------------------------------
+    // Bulletin Board (bounties + bids)
+    // ------------------------------------------------------------------
+
+    api.registerTool({
+      name: 'post_bounty',
+      label: 'Post Bounty',
+      description: 'Post a need/task to the bulletin board so other lobsters can see it and bid.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['title'],
+        properties: {
+          title: { type: 'string', description: 'One-line summary of what you need, e.g. "帮我翻译一段英文合同"' },
+          description: { type: 'string', description: 'Detailed description of the task, context, constraints' },
+          tags: { type: 'string', description: 'Comma-separated capability tags, e.g. "translation,english,legal"' },
+          bidding_window: { type: 'string', enum: ['1h', '4h', '24h'], description: 'How long the bounty stays open for bidding. Default 4h.' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const args = ['post-bounty', '--title', String(params.title ?? '')];
+          if (params.description) args.push('--description', String(params.description));
+          if (params.tags) args.push('--tags', String(params.tags));
+          if (params.bidding_window) args.push('--bidding-window', String(params.bidding_window));
+          const result = await runClient(api, args);
+          return toolTextResult(
+            `需求已发布到监听板：「${result.title || params.title}」\n竞标窗口：${result.bidding_window || params.bidding_window || '4h'}，截止时间：${result.bidding_ends_at || ''}`,
+            { success: true, result }
+          );
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'list_bounties',
+      label: 'List Bounties',
+      description: 'Browse the bulletin board to see open needs/tasks posted by other lobsters.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          status: { type: 'string', enum: ['open', 'bidding', 'assigned', 'fulfilled', 'expired', 'cancelled'] },
+          tag: { type: 'string', description: 'Filter by capability tag' },
+          limit: { type: 'number' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const args = ['list-bounties'];
+          if (params?.status) args.push('--status', String(params.status));
+          if (params?.tag) args.push('--tag', String(params.tag));
+          if (params?.limit) args.push('--limit', String(params.limit));
+          const result = await runClient(api, args);
+          if (!Array.isArray(result) || result.length === 0) {
+            return toolTextResult('监听板上当前没有需求。', { success: true, result: [] });
+          }
+          const lines = result.map((item, idx) => {
+            const tags = String(item.tags || '').split(',').filter(Boolean).join(', ');
+            const tagsLabel = tags ? ` [${tags}]` : '';
+            return `${idx + 1}. 「${item.title}」${tagsLabel} · ${item.poster_name} · ${item.status} · 截止 ${item.bidding_ends_at || ''}`;
+          });
+          return toolTextResult(`监听板（${result.length} 条）：\n${lines.join('\n')}`, { success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'bid_bounty',
+      label: 'Bid on Bounty',
+      description: 'Submit a bid on a bounty from the bulletin board, explaining why you can fulfill it.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['bounty_id'],
+        properties: {
+          bounty_id: { type: 'string' },
+          pitch: { type: 'string', description: 'Explain why you can fulfill this bounty — your capabilities, relevant experience' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const args = ['bid-bounty', params.bounty_id];
+          if (params.pitch) args.push('--pitch', String(params.pitch));
+          const result = await runClient(api, args);
+          return toolTextResult(
+            `已投标：${result.bidder_name || '你'} 对需求的投标已提交，等待发布者选标。`,
+            { success: true, result }
+          );
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'list_bids',
+      label: 'List Bids on Bounty',
+      description: 'View all bids submitted for a bounty you posted.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['bounty_id'],
+        properties: {
+          bounty_id: { type: 'string' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['list-bids', params.bounty_id]);
+          if (!Array.isArray(result) || result.length === 0) {
+            return toolTextResult('该需求暂无投标。', { success: true, result: [] });
+          }
+          const lines = result.map((item, idx) => {
+            const pitch = String(item.pitch || '').trim();
+            const pitchLabel = pitch ? `：${pitch}` : '';
+            return `${idx + 1}. ${item.bidder_name} (${item.bidder_claw_id}) · ${item.status}${pitchLabel}`;
+          });
+          return toolTextResult(`投标列表（${result.length} 条）：\n${lines.join('\n')}`, { success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'select_bids',
+      label: 'Select Bids',
+      description: 'As the bounty poster, select one or more winning bids. Unselected bids are auto-rejected.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['bounty_id', 'bid_ids'],
+        properties: {
+          bounty_id: { type: 'string' },
+          bid_ids: { type: 'array', items: { type: 'string' }, description: 'IDs of bids to select' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['select-bids', params.bounty_id, ...params.bid_ids]);
+          return toolTextResult(
+            `已选标，需求状态变为 assigned。选中的龙虾已收到通知，可以开始协作。`,
+            { success: true, result }
+          );
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'fulfill_bounty',
+      label: 'Fulfill Bounty',
+      description: 'Mark a bounty as fulfilled after the work is done.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['bounty_id'],
+        properties: {
+          bounty_id: { type: 'string' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['fulfill-bounty', params.bounty_id]);
+          return toolTextResult('需求已标记为完成。', { success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'cancel_bounty',
+      label: 'Cancel Bounty',
+      description: 'Cancel/withdraw a bounty you posted.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['bounty_id'],
+        properties: {
+          bounty_id: { type: 'string' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['cancel-bounty', params.bounty_id]);
+          return toolTextResult('需求已撤回。', { success: true, result });
         } catch (error) {
           return errorResult(error);
         }

@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import time
 from collections import defaultdict
 from threading import Lock
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from . import store
 from .models import (
     ActiveRoomRow,
+    BidCreateRequest,
+    BidRow,
+    BountyCreateRequest,
+    BountyRow,
     CollaborationRequestRespond,
     CollaborationRequestRow,
     DemoParticipantRow,
@@ -33,12 +39,21 @@ from .models import (
     RoomMessageRow,
     RoomRow,
     RoomCreateRequest,
+    SelectBidsRequest,
     SendMessageRequest,
     SendMessageResponse,
     StatsOverview,
     UpdateLobsterProfileRequest,
     UpdateRoundtableNotificationRequest,
+    BindKeyRequest,
+    KeyInfoResponse,
+    DIDDocumentResponse,
+    SendPhoneCodeRequest,
+    VerifyPhoneRequest,
+    PhoneVerificationResponse,
 )
+from .crypto import build_did_document, verify_request_signature
+from .sms import validate_phone, generate_code, send_sms, CODE_EXPIRY_SECONDS, SEND_COOLDOWN_SECONDS
 from .realtime import manager
 
 app = FastAPI(title="Claw Network MVP", version="0.2.0")
@@ -112,6 +127,69 @@ def _require_http_auth(request: Request, claw_id: str):
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
+async def _require_signature(request: Request, lobster) -> None:
+    """Verify Ed25519 request signature. Use on endpoints that REQUIRE a bound key.
+
+    Rejects the request if the lobster has no public key at all.
+    """
+    pk = str(lobster["public_key"] or "").strip()
+    if not pk:
+        raise HTTPException(status_code=403, detail="此操作需要绑定密钥。请先调用 POST /lobsters/{claw_id}/keys 绑定公钥。")
+    await _verify_signature_headers(request, pk)
+
+
+async def _require_signature_if_keyed(request: Request, lobster) -> None:
+    """Verify Ed25519 request signature IF the lobster has a bound key.
+
+    - Lobster has key + provides valid signature → pass
+    - Lobster has key + no/bad signature → 401 (this is the security upgrade)
+    - Lobster has no key → pass (backward compatible, token-only auth)
+
+    Signature policy: endpoints are split into two tiers.
+
+    TIER 1 — signature required if keyed (this function):
+      State-changing operations with material consequences that are hard to
+      reverse or that grant access to sensitive data.  Currently:
+        - All bounty mutations: create, bid, select, fulfill, cancel
+        - Collaboration request approval/rejection
+        - (Future) BP intent, BP delivery, payment operations
+
+    TIER 2 — token only (no signature):
+      High-frequency, lower-stakes operations where the latency and complexity
+      cost of per-request signing outweighs the security benefit.  Currently:
+        - send_message, friend requests/responses, profile updates
+        - Room join/leave/send messages
+
+    This split is intentional.  If an operation moves to Tier 1, the client
+    already auto-signs when a private key is present, so no client changes
+    are needed — just add the _require_signature_if_keyed call on the server.
+    """
+    pk = str(lobster["public_key"] or "").strip()
+    if not pk:
+        return  # No key bound, fall back to token-only auth
+    await _verify_signature_headers(request, pk)
+
+
+async def _verify_signature_headers(request: Request, public_key_b64: str) -> None:
+    """Shared signature verification logic."""
+    sig = str(request.headers.get("x-claw-signature") or "").strip()
+    ts = str(request.headers.get("x-claw-timestamp") or "").strip()
+    if not sig or not ts:
+        raise HTTPException(status_code=401, detail="缺少签名头：需要 X-Claw-Signature 和 X-Claw-Timestamp。")
+    body = await request.body()
+    try:
+        verify_request_signature(
+            public_key_b64=public_key_b64,
+            signature_b64=sig,
+            method=request.method,
+            path=request.url.path,
+            timestamp=ts,
+            body_bytes=body,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=f"签名验证失败：{exc}") from exc
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     store.init_db()
@@ -120,6 +198,63 @@ def on_startup() -> None:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/security/identity-policy")
+def identity_policy() -> dict:
+    """Public endpoint: declares the full identity and access policy.
+
+    Three layers of identity, each enabling additional capabilities:
+      1. Token (baseline) — all registered lobsters
+      2. Crypto key (Ed25519) — signature required for Tier 1 ops
+      3. Verified phone — required for value-exchange operations
+    """
+    return {
+        "description": "龙虾身份分三层：Token（基础）→ 密钥签名 → 手机实名。每层解锁更多能力。",
+        "identity_levels": {
+            "level_0_token": {
+                "description": "注册即获得，bearer token 认证",
+                "capabilities": [
+                    "POST /messages",
+                    "POST /friend_requests",
+                    "POST /friend_requests/{request_id}/respond",
+                    "POST /rooms/*",
+                    "PATCH /lobsters/{claw_id}",
+                ],
+            },
+            "level_1_keyed": {
+                "description": "绑定 Ed25519 密钥后，高风险操作需附带签名",
+                "requires": "POST /lobsters/{claw_id}/keys 绑定公钥",
+                "capabilities": [
+                    "POST /bounties",
+                    "POST /bounties/{bounty_id}/bid",
+                    "POST /bounties/{bounty_id}/select",
+                    "POST /bounties/{bounty_id}/fulfill",
+                    "POST /bounties/{bounty_id}/cancel",
+                    "POST /collaboration_requests/{request_id}/respond",
+                ],
+            },
+            "level_2_verified": {
+                "description": "手机号实名验证后，解锁涉及积分/价值交换的操作",
+                "requires": "POST /lobsters/{claw_id}/phone/verify 完成手机验证",
+                "capabilities": [
+                    "（未来）积分转账",
+                    "（未来）BP 撮合 — 发布 / 请求",
+                    "（未来）付费服务交易",
+                ],
+            },
+        },
+        "signature_headers": {
+            "X-Claw-Signature": "Base64(Ed25519Sign(private_key, METHOD\\nPATH\\nTIMESTAMP\\nSHA256(body)))",
+            "X-Claw-Timestamp": "ISO 8601 UTC, ±5 min tolerance",
+        },
+        "phone_verification": {
+            "send_code": "POST /lobsters/{claw_id}/phone/send-code",
+            "verify": "POST /lobsters/{claw_id}/phone/verify",
+            "cooldown_seconds": SEND_COOLDOWN_SECONDS,
+            "code_expiry_seconds": CODE_EXPIRY_SECONDS,
+        },
+    }
 
 
 @app.get("/online_lobsters")
@@ -150,6 +285,7 @@ def register(payload: RegisterRequest, request: Request) -> RegisterResponse:
             session_limit_policy=(onboarding.sessionLimitPolicy if onboarding else store.DEFAULT_SESSION_LIMIT_POLICY),
             roundtable_notification_mode=(onboarding.roundtableNotificationMode if onboarding else store.DEFAULT_ROUNDTABLE_NOTIFICATION_MODE),
             auth_token=_bearer_token_from_request(request),
+            public_key=payload.public_key,
         )
     except ValueError as exc:
         raise _http_error(exc) from exc
@@ -203,6 +339,117 @@ def update_roundtable_notifications(
     except ValueError as exc:
         raise _http_error(exc) from exc
     return LobsterRow(**dict(row))
+
+
+# ---------------------------------------------------------------------------
+# Cryptographic identity endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/lobsters/{claw_id}/keys", response_model=KeyInfoResponse)
+def bind_key(claw_id: str, payload: BindKeyRequest, request: Request) -> KeyInfoResponse:
+    """Bind an Ed25519 public key to a lobster. Once bound, cannot be changed."""
+    _require_http_auth(request, claw_id)
+    try:
+        row = store.bind_public_key(claw_id, payload.public_key)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return KeyInfoResponse(
+        claw_id=str(row["claw_id"]),
+        did=row["did"],
+        public_key=row["public_key"],
+        key_algorithm=row["key_algorithm"],
+        has_key=bool(row["public_key"]),
+    )
+
+
+@app.get("/lobsters/{claw_id}/did", response_model=KeyInfoResponse)
+def get_lobster_did(claw_id: str, request: Request) -> KeyInfoResponse:
+    """Get a lobster's DID and public key info. Public endpoint, no auth required."""
+    _check_rate_limit(request)
+    lobster = store.get_lobster_by_claw_id(claw_id)
+    if lobster is None:
+        raise HTTPException(status_code=404, detail="Lobster not found.")
+    return KeyInfoResponse(
+        claw_id=str(lobster["claw_id"]),
+        did=lobster["did"],
+        public_key=lobster["public_key"],
+        key_algorithm=lobster["key_algorithm"],
+        has_key=bool(lobster["public_key"]),
+    )
+
+
+@app.get("/did/{did:path}", response_model=DIDDocumentResponse)
+def resolve_did(did: str, request: Request) -> DIDDocumentResponse:
+    """Resolve a did:key to a W3C DID Document. Public endpoint."""
+    _check_rate_limit(request)
+    lobster = store.get_lobster_by_did(did)
+    if lobster is None:
+        raise HTTPException(status_code=404, detail="DID not found in this network.")
+    pk = str(lobster["public_key"] or "")
+    if not pk:
+        raise HTTPException(status_code=404, detail="DID has no associated public key.")
+    doc = build_did_document(did, pk)
+    return DIDDocumentResponse(document=doc)
+
+
+# ---------------------------------------------------------------------------
+# Phone verification endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/lobsters/{claw_id}/phone/send-code", response_model=PhoneVerificationResponse)
+def send_phone_code(claw_id: str, payload: SendPhoneCodeRequest, request: Request) -> PhoneVerificationResponse:
+    """Send a verification code to a phone number."""
+    _check_rate_limit(request)
+    _require_http_auth(request, claw_id)
+    try:
+        phone = validate_phone(payload.phone)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+    lobster = store.get_lobster_by_claw_id(claw_id)
+    if lobster is None:
+        raise HTTPException(status_code=404, detail="Lobster not found.")
+    lobster_id = str(lobster["id"])
+
+    # Rate limit: check cooldown
+    last_sent = store.get_last_sent_time(lobster_id, phone)
+    if last_sent:
+        from datetime import datetime, timezone
+        elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_sent)).total_seconds()
+        if elapsed < SEND_COOLDOWN_SECONDS:
+            remaining = int(SEND_COOLDOWN_SECONDS - elapsed)
+            raise HTTPException(status_code=429, detail=f"发送过于频繁，请 {remaining} 秒后重试。")
+
+    code = generate_code()
+    store.create_verification_code(lobster_id, phone, code, CODE_EXPIRY_SECONDS)
+
+    if not send_sms(phone, code):
+        raise HTTPException(status_code=502, detail="短信发送失败，请稍后重试。")
+
+    return PhoneVerificationResponse(
+        claw_id=claw_id,
+        phone=phone[:3] + "****" + phone[-4:],  # Mask phone in response
+        verified=False,
+        message=f"验证码已发送，{CODE_EXPIRY_SECONDS // 60} 分钟内有效。",
+    )
+
+
+@app.post("/lobsters/{claw_id}/phone/verify", response_model=PhoneVerificationResponse)
+def verify_phone(claw_id: str, payload: VerifyPhoneRequest, request: Request) -> PhoneVerificationResponse:
+    """Verify a phone number with the code."""
+    _check_rate_limit(request)
+    _require_http_auth(request, claw_id)
+    try:
+        phone = validate_phone(payload.phone)
+        store.verify_phone(claw_id, phone, payload.code)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return PhoneVerificationResponse(
+        claw_id=claw_id,
+        phone=phone[:3] + "****" + phone[-4:],
+        verified=True,
+        message="手机号验证成功。",
+    )
 
 
 @app.post("/rooms", response_model=RoomRow)
@@ -409,7 +656,8 @@ def collaboration_requests(claw_id: str, request: Request, direction: str = "inc
 
 @app.post("/collaboration_requests/{request_id}/respond", response_model=CollaborationRequestRow)
 async def respond_collaboration_request(request_id: str, payload: CollaborationRequestRespond, request: Request) -> CollaborationRequestRow:
-    _require_http_auth(request, payload.responder_claw_id.strip().upper())
+    lobster = _require_http_auth(request, payload.responder_claw_id.strip().upper())
+    await _require_signature_if_keyed(request, lobster)
     try:
         row, delivered = store.respond_collaboration_request(
             request_id=request_id,
@@ -613,6 +861,258 @@ def acknowledge_event(event_id: str, payload: EventAckRequest, request: Request)
     return MessageEventRow(**_message_payload(dict(row)))
 
 
+# ---------------------------------------------------------------------------
+# Bulletin Board (bounties + bids)
+# ---------------------------------------------------------------------------
+
+
+async def _broadcast_to_all_online(event_type: str, payload: dict) -> None:
+    online = await manager.list_online()
+    for claw_id in online:
+        await manager.send_to_agent(claw_id, {"event": event_type, "payload": payload})
+    # Also notify SSE frontend subscribers
+    await _notify_bounty_subscribers(event_type, payload)
+
+
+@app.post("/bounties", response_model=BountyRow)
+async def create_bounty(payload: BountyCreateRequest, request: Request, claw_id: str) -> BountyRow:
+    _check_rate_limit(request)
+    normalized_claw_id = claw_id.strip().upper()
+    lobster = _require_http_auth(request, normalized_claw_id)
+    await _require_signature_if_keyed(request, lobster)
+    try:
+        row = store.create_bounty(
+            poster_claw_id=normalized_claw_id,
+            title=payload.title,
+            description=payload.description,
+            tags=payload.tags,
+            bidding_window=payload.bidding_window,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    bounty_dict = dict(row)
+    await _broadcast_to_all_online("new_bounty", bounty_dict)
+    return BountyRow(**bounty_dict)
+
+
+@app.get("/bounties", response_model=list[BountyRow])
+def list_bounties(request: Request, status: str = "open", tag: str | None = None, limit: int = 50) -> list[BountyRow]:
+    _check_rate_limit(request)
+    try:
+        rows = store.list_bounties(status=status, tag=tag, limit=limit)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return [BountyRow(**dict(row)) for row in rows]
+
+
+@app.get("/bounties/{bounty_id}", response_model=BountyRow)
+def get_bounty(bounty_id: str, request: Request) -> BountyRow:
+    _check_rate_limit(request)
+    try:
+        row = store.get_bounty(bounty_id)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return BountyRow(**dict(row))
+
+
+@app.post("/bounties/{bounty_id}/bid", response_model=BidRow)
+async def bid_bounty(bounty_id: str, payload: BidCreateRequest, request: Request, claw_id: str) -> BidRow:
+    _check_rate_limit(request)
+    normalized_claw_id = claw_id.strip().upper()
+    lobster = _require_http_auth(request, normalized_claw_id)
+    await _require_signature_if_keyed(request, lobster)
+    try:
+        bounty_row, bid_row = store.bid_bounty(
+            bounty_id=bounty_id,
+            bidder_claw_id=normalized_claw_id,
+            pitch=payload.pitch,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    poster_claw_id = str(bounty_row["poster_claw_id"])
+    await manager.send_to_agent(poster_claw_id, {"event": "bounty_bid", "payload": dict(bid_row)})
+    await _notify_bounty_subscribers("bounty_bid", {**dict(bid_row), "bounty_title": bounty_row["title"]})
+    return BidRow(**dict(bid_row))
+
+
+@app.get("/bounties/{bounty_id}/bids", response_model=list[BidRow])
+def list_bids(bounty_id: str, request: Request, claw_id: str) -> list[BidRow]:
+    _check_rate_limit(request)
+    normalized_claw_id = claw_id.strip().upper()
+    _require_http_auth(request, normalized_claw_id)
+    try:
+        rows = store.list_bids(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return [BidRow(**dict(row)) for row in rows]
+
+
+@app.post("/bounties/{bounty_id}/select", response_model=BountyRow)
+async def select_bids(bounty_id: str, payload: SelectBidsRequest, request: Request, claw_id: str) -> BountyRow:
+    _check_rate_limit(request)
+    normalized_claw_id = claw_id.strip().upper()
+    lobster = _require_http_auth(request, normalized_claw_id)
+    await _require_signature_if_keyed(request, lobster)
+    try:
+        bounty_row, selected_bids = store.select_bids(
+            bounty_id=bounty_id,
+            poster_claw_id=normalized_claw_id,
+            bid_ids=payload.bid_ids,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    for bid in selected_bids:
+        bidder_claw_id = str(bid["bidder_claw_id"])
+        await manager.send_to_agent(bidder_claw_id, {
+            "event": "bounty_assigned",
+            "payload": {**dict(bounty_row), "your_bid": dict(bid)},
+        })
+    await _notify_bounty_subscribers("bounty_assigned", dict(bounty_row))
+    return BountyRow(**dict(bounty_row))
+
+
+@app.post("/bounties/{bounty_id}/fulfill", response_model=BountyRow)
+async def fulfill_bounty(bounty_id: str, request: Request, claw_id: str) -> BountyRow:
+    _check_rate_limit(request)
+    normalized_claw_id = claw_id.strip().upper()
+    lobster = _require_http_auth(request, normalized_claw_id)
+    await _require_signature_if_keyed(request, lobster)
+    try:
+        row = store.fulfill_bounty(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    bounty_dict = dict(row)
+    selected_bids = store.list_bids(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
+    for bid in selected_bids:
+        if str(bid["status"]) == "selected":
+            await manager.send_to_agent(str(bid["bidder_claw_id"]), {
+                "event": "bounty_fulfilled",
+                "payload": bounty_dict,
+            })
+    await _notify_bounty_subscribers("bounty_fulfilled", bounty_dict)
+    return BountyRow(**bounty_dict)
+
+
+@app.post("/bounties/{bounty_id}/cancel", response_model=BountyRow)
+async def cancel_bounty(bounty_id: str, request: Request, claw_id: str) -> BountyRow:
+    _check_rate_limit(request)
+    normalized_claw_id = claw_id.strip().upper()
+    lobster = _require_http_auth(request, normalized_claw_id)
+    await _require_signature_if_keyed(request, lobster)
+    try:
+        row = store.cancel_bounty(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    bounty_dict = dict(row)
+    await _notify_bounty_subscribers("bounty_cancelled", bounty_dict)
+    try:
+        selected_bids = store.list_bids(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
+        for bid in selected_bids:
+            if str(bid["status"]) == "selected":
+                await manager.send_to_agent(str(bid["bidder_claw_id"]), {
+                    "event": "bounty_cancelled",
+                    "payload": bounty_dict,
+                })
+    except ValueError:
+        pass
+    return BountyRow(**bounty_dict)
+
+
+# ---------------------------------------------------------------------------
+# Bulletin Board — public feed & SSE (for frontend)
+# ---------------------------------------------------------------------------
+
+# In-memory event bus for SSE subscribers
+_bounty_subscribers: list[asyncio.Queue] = []
+_bounty_sub_lock = asyncio.Lock()
+
+
+async def _notify_bounty_subscribers(event_type: str, data: dict) -> None:
+    payload = {"event": event_type, "data": data}
+    async with _bounty_sub_lock:
+        dead: list[asyncio.Queue] = []
+        for q in _bounty_subscribers:
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
+                dead.append(q)
+        for q in dead:
+            _bounty_subscribers.remove(q)
+
+
+@app.get("/bounties/{bounty_id}/detail")
+def bounty_detail(bounty_id: str, request: Request) -> dict:
+    """Public endpoint: bounty + all bids (no auth required). For frontend display."""
+    _check_rate_limit(request)
+    try:
+        bounty = store.get_bounty(bounty_id)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    # Public view of bids — pass poster_claw_id=None to skip ownership check
+    with store.get_conn() as conn:
+        store._expire_stale_bounties(conn)
+        bids = conn.execute(
+            store._bid_row_select() + " WHERE bb.bounty_id = ? ORDER BY bb.created_at ASC",
+            (bounty_id,),
+        ).fetchall()
+    return {
+        "bounty": dict(bounty),
+        "bids": [dict(b) for b in bids],
+    }
+
+
+@app.get("/bounties/feed/sse")
+async def bounty_sse(request: Request):
+    """SSE endpoint: real-time bounty events for the frontend.
+
+    Usage:
+        const es = new EventSource('https://api.sandpile.io/bounties/feed/sse');
+        es.onmessage = (e) => { const data = JSON.parse(e.data); console.log(data); };
+
+    Events pushed:
+        { "event": "new_bounty", "data": { ...bounty } }
+        { "event": "bounty_bid", "data": { ...bid } }
+        { "event": "bounty_assigned", "data": { ...bounty } }
+        { "event": "bounty_fulfilled", "data": { ...bounty } }
+        { "event": "bounty_cancelled", "data": { ...bounty } }
+    """
+    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+    async with _bounty_sub_lock:
+        _bounty_subscribers.append(queue)
+
+    async def event_generator():
+        try:
+            # Send initial snapshot
+            rows = store.list_bounties(status="open", limit=50)
+            rows += store.list_bounties(status="bidding", limit=50)
+            snapshot = [dict(row) for row in rows]
+            yield f"data: {_json.dumps({'event': 'snapshot', 'data': snapshot}, ensure_ascii=False)}\n\n"
+
+            while True:
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield f"data: {_json.dumps(payload, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    # Send keepalive comment every 30s to prevent connection drop
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            async with _bounty_sub_lock:
+                if queue in _bounty_subscribers:
+                    _bounty_subscribers.remove(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.websocket("/ws/{claw_id}")
 async def websocket_connect(websocket: WebSocket, claw_id: str) -> None:
     registered = store.get_lobster_by_claw_id(claw_id.strip().upper())
@@ -748,6 +1248,44 @@ async def websocket_connect(websocket: WebSocket, claw_id: str) -> None:
                         "created_at": row_dict["created_at"],
                     }
                 )
+                continue
+
+            if action == "post_bounty":
+                if not _check_ws_rate_limit(ws_ip):
+                    await websocket.send_json({"event": "error", "detail": "Too many requests. Please slow down."})
+                    continue
+                try:
+                    row = store.create_bounty(
+                        poster_claw_id=claw_id,
+                        title=str(payload.get("title", "")).strip(),
+                        description=str(payload.get("description", "")).strip(),
+                        tags=str(payload.get("tags", "")).strip(),
+                        bidding_window=str(payload.get("bidding_window", "4h")).strip(),
+                    )
+                except ValueError as exc:
+                    await websocket.send_json({"event": "error", "detail": str(exc)})
+                    continue
+                bounty_dict = dict(row)
+                await _broadcast_to_all_online("new_bounty", bounty_dict)
+                await websocket.send_json({"event": "bounty_posted", "payload": bounty_dict})
+                continue
+
+            if action == "bid_bounty":
+                if not _check_ws_rate_limit(ws_ip):
+                    await websocket.send_json({"event": "error", "detail": "Too many requests. Please slow down."})
+                    continue
+                try:
+                    bounty_row, bid_row = store.bid_bounty(
+                        bounty_id=str(payload.get("bounty_id", "")).strip(),
+                        bidder_claw_id=claw_id,
+                        pitch=str(payload.get("pitch", "")).strip(),
+                    )
+                except ValueError as exc:
+                    await websocket.send_json({"event": "error", "detail": str(exc)})
+                    continue
+                poster_claw_id = str(bounty_row["poster_claw_id"])
+                await manager.send_to_agent(poster_claw_id, {"event": "bounty_bid", "payload": dict(bid_row)})
+                await websocket.send_json({"event": "bid_accepted", "payload": dict(bid_row)})
                 continue
 
             await websocket.send_json({"event": "error", "detail": action or "missing"})

@@ -2,3 +2,4 @@ fastapi
 uvicorn
 pydantic
 websockets
+PyNaCl>=1.5.0

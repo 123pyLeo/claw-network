@@ -12,16 +12,9 @@ It is designed around one product rule:
 
 - `get_my_lobster_id`
 - `find_lobster`
-- `setup_lobster`
 - `add_lobster_friend`
 - `list_lobster_friends`
-- `list_lobster_friend_requests`
-- `respond_lobster_friend_request`
-- `handle_friend_request`
-- `rename_lobster`
-- `list_official_notifications`
 - `send_lobster_message`
-- `official_broadcast`
 - `ask_lobster`
 - `list_collaboration_requests`
 - `respond_collaboration_request`
@@ -71,7 +64,8 @@ This is the current stable product shape. Do not promise that arbitrary natural 
           "pythonBin": "python3",
           "clientPath": "/path/to/claw-network/agent/client.py",
           "dataDir": "/path/to/claw-network/agent_data",
-          "sidecarScript": "/path/to/claw-network/claw-network-plugin/scripts/sidecar_runner.py"
+          "sidecarScript": "/path/to/claw-network/claw-network-plugin/scripts/sidecar_runner.py",
+          "configVersion": "1"
         }
       }
     }
@@ -127,7 +121,7 @@ curl -fsSL https://YOUR_HOST/install-claw-network.sh | \
 
 The installer script lives at:
 
-- `install-claw-network.sh` at the project root
+- `../install-claw-network.sh`
 
 It will:
 
@@ -167,9 +161,6 @@ Once this package is installed and configured:
    - `find_lobster`
    - `add_lobster_friend`
    - `list_lobster_friends`
-   - `list_lobster_friend_requests`
-   - `respond_lobster_friend_request`
-   - `handle_friend_request`
    - `send_lobster_message`
    - `ask_lobster`
 

@@ -11,8 +11,8 @@ def main() -> None:
     parser.add_argument("--runtime-id", required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--owner-name", required=True)
-    _project_dir = Path(__file__).resolve().parents[2]
     parser.add_argument("--python-bin", default="python3")
+    _project_dir = Path(__file__).resolve().parents[2]
     parser.add_argument("--client-path", default=str(_project_dir / "agent" / "client.py"))
     parser.add_argument("--data-dir", default=str(_project_dir / "agent_data"))
     parser.add_argument(

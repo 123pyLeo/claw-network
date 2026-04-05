@@ -39,21 +39,6 @@ def load_allowed_config_keys(source_dir: Path) -> set[str]:
     return set(properties)
 
 
-def load_plugin_version(source_dir: Path) -> str:
-    version_file = source_dir.parent / "VERSION"
-    if version_file.is_file():
-        version = version_file.read_text(encoding="utf-8").strip()
-        if version:
-            return version
-
-    package_path = source_dir / "package.json"
-    package_data = load_json(package_path)
-    version = package_data.get("version")
-    if isinstance(version, str) and version.strip():
-        return version.strip()
-    return "0.1.0"
-
-
 def build_plugin_config(source_dir: Path, raw_config: dict) -> dict:
     allowed_keys = load_allowed_config_keys(source_dir)
     return {key: value for key, value in raw_config.items() if key in allowed_keys}
@@ -192,8 +177,8 @@ def main() -> None:
     parser.add_argument("--runtime-id")
     parser.add_argument("--name")
     parser.add_argument("--owner-name")
-    _project_dir = Path(__file__).resolve().parents[2]  # claw-network-plugin/../ = 项目根目录
     parser.add_argument("--python-bin", default="python3")
+    _project_dir = Path(__file__).resolve().parents[2]  # claw-network-plugin/../ = 项目根目录
     parser.add_argument("--client-path", default=str(_project_dir / "agent" / "client.py"))
     parser.add_argument("--data-dir", default=str(_project_dir / "agent_data"))
     parser.add_argument("--no-onboarding", action="store_true")
@@ -211,7 +196,6 @@ def main() -> None:
 
     extensions_dir.mkdir(parents=True, exist_ok=True)
     copy_plugin_tree(source_dir, plugin_dir)
-    plugin_version = load_plugin_version(source_dir)
 
     config = load_json(config_path)
     config.setdefault("plugins", {})
@@ -251,7 +235,7 @@ def main() -> None:
         "source": "path",
         "spec": str(source_dir),
         "installPath": str(plugin_dir),
-        "version": plugin_version,
+        "version": "0.2.0",
         "installedAt": utc_now(),
     }
 
@@ -352,15 +336,13 @@ def main() -> None:
                 "owner_name": resolved_owner_name,
                 "onboarding": onboarding,
                 "next_step": (
-                    f"ENDPOINT={args.endpoint} RUNTIME_ID={resolved_runtime_id}"
-                    f" LOBSTER_NAME={resolved_name} OWNER_NAME={resolved_owner_name}"
-                    f" PYTHON_BIN={args.python_bin} PROJECT_DIR={_project_dir}"
-                    f" DATA_DIR={args.data_dir}"
-                    f" CONNECTION_REQUEST_POLICY={onboarding.get('connectionRequestPolicy', 'known_name_or_id_only')}"
-                    f" COLLABORATION_POLICY={onboarding.get('collaborationPolicy', 'confirm_every_time')}"
-                    f" OFFICIAL_LOBSTER_POLICY={onboarding.get('officialLobsterPolicy', 'low_risk_auto_allow')}"
-                    f" SESSION_LIMIT_POLICY={onboarding.get('sessionLimitPolicy', '10_turns_3_minutes')}"
-                    f" bash {_project_dir / 'claw-network-plugin' / 'scripts' / 'start_sidecar.sh'}"
+                    f"{args.python_bin} {args.sidecar_script} --endpoint {args.endpoint}"
+                    f" --runtime-id {resolved_runtime_id} --name {resolved_name}"
+                    f" --owner-name {resolved_owner_name} --data-dir {args.data_dir}"
+                    f" --connection-request-policy {onboarding.get('connectionRequestPolicy', 'known_name_or_id_only')}"
+                    f" --collaboration-policy {onboarding.get('collaborationPolicy', 'confirm_every_time')}"
+                    f" --official-lobster-policy {onboarding.get('officialLobsterPolicy', 'low_risk_auto_allow')}"
+                    f" --session-limit-policy {onboarding.get('sessionLimitPolicy', '10_turns_3_minutes')}"
                 ),
             },
             ensure_ascii=False,

@@ -213,6 +213,44 @@ def init_db() -> None:
                 recent_message_count INTEGER NOT NULL DEFAULT 0,
                 member_count INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS bounties (
+                id TEXT PRIMARY KEY,
+                poster_lobster_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'open',
+                bidding_window TEXT NOT NULL DEFAULT '4h',
+                bidding_ends_at TEXT NOT NULL,
+                deadline_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                fulfilled_at TEXT,
+                cancelled_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS bounty_bids (
+                id TEXT PRIMARY KEY,
+                bounty_id TEXT NOT NULL,
+                bidder_lobster_id TEXT NOT NULL,
+                pitch TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                selected_at TEXT,
+                UNIQUE(bounty_id, bidder_lobster_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS verification_codes (
+                id TEXT PRIMARY KEY,
+                lobster_id TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                code TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0
+            );
             """
         )
         _ensure_column(conn, "lobsters", "connection_request_policy", "TEXT NOT NULL DEFAULT 'known_name_or_id_only'")
@@ -222,8 +260,17 @@ def init_db() -> None:
         _ensure_column(conn, "lobsters", "roundtable_notification_mode", "TEXT NOT NULL DEFAULT 'silent'")
         _ensure_column(conn, "lobsters", "auth_token", "TEXT")
         _ensure_column(conn, "lobsters", "token_updated_at", "TEXT")
+        _ensure_column(conn, "lobsters", "did", "TEXT")
+        _ensure_column(conn, "lobsters", "public_key", "TEXT")
+        _ensure_column(conn, "lobsters", "key_algorithm", "TEXT DEFAULT 'Ed25519'")
+        _ensure_column(conn, "lobsters", "verified_phone", "TEXT")
+        _ensure_column(conn, "lobsters", "phone_verified_at", "TEXT")
         _ensure_column(conn, "message_events", "room_id", "TEXT")
         _ensure_column(conn, "message_events", "room_message_id", "TEXT")
+        _ensure_column(conn, "verification_codes", "attempts", "INTEGER NOT NULL DEFAULT 0")
+        # Unique indexes for identity columns (CREATE INDEX IF NOT EXISTS is safe to re-run)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lobsters_did ON lobsters(did) WHERE did IS NOT NULL")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lobsters_verified_phone ON lobsters(verified_phone) WHERE verified_phone IS NOT NULL")
     seed_official_lobster()
     seed_public_rooms()
 
@@ -285,6 +332,8 @@ def _lobster_by_runtime_id(runtime_id: str) -> sqlite3.Row | None:
             SELECT id, runtime_id, claw_id, name, owner_name, is_official,
                    connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
                    auth_token, token_updated_at,
+                   did, public_key, key_algorithm,
+                   verified_phone, phone_verified_at,
                    created_at, updated_at
             FROM lobsters
             WHERE runtime_id = ?
@@ -300,6 +349,8 @@ def get_lobster_by_claw_id(claw_id: str) -> sqlite3.Row | None:
             SELECT id, runtime_id, claw_id, name, owner_name, is_official,
                    connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
                    auth_token, token_updated_at,
+                   did, public_key, key_algorithm,
+                   verified_phone, phone_verified_at,
                    created_at, updated_at
             FROM lobsters
             WHERE claw_id = ?
@@ -370,6 +421,8 @@ def get_lobster_by_token(token: str) -> sqlite3.Row | None:
             SELECT id, runtime_id, claw_id, name, owner_name, is_official,
                    connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
                    auth_token, token_updated_at,
+                   did, public_key, key_algorithm,
+                   verified_phone, phone_verified_at,
                    created_at, updated_at
             FROM lobsters
             WHERE auth_token = ?
@@ -489,7 +542,10 @@ def register_lobster(
     session_limit_policy: str = DEFAULT_SESSION_LIMIT_POLICY,
     roundtable_notification_mode: str = DEFAULT_ROUNDTABLE_NOTIFICATION_MODE,
     auth_token: str | None = None,
+    public_key: str | None = None,
 ) -> tuple[sqlite3.Row, bool, str]:
+    from server.crypto import public_key_b64_to_did, validate_public_key_b64
+
     existing = _lobster_by_runtime_id(runtime_id)
     now = utc_now()
     cleaned_name = " ".join(name.strip().split())
@@ -503,6 +559,15 @@ def register_lobster(
     official_lobster_policy = _normalize_official_policy(official_lobster_policy)
     session_limit_policy = _normalize_session_limit_policy(session_limit_policy)
     roundtable_notification_mode = _normalize_roundtable_notification_mode(roundtable_notification_mode)
+
+    # Validate and derive DID from public key if provided
+    derived_did: str | None = None
+    validated_pk: str | None = None
+    if public_key:
+        validate_public_key_b64(public_key)
+        derived_did = public_key_b64_to_did(public_key)
+        validated_pk = public_key.strip()
+
     if existing is not None:
         with get_conn() as conn:
             conflicting = _find_lobster_by_normalized_name(conn, _normalize_lobster_name(cleaned_name), exclude_runtime_id=runtime_id)
@@ -529,12 +594,24 @@ def register_lobster(
                     runtime_id,
                 ),
             )
+            # Bind key if provided and not already bound
+            if validated_pk and not existing["public_key"]:
+                _assert_did_unique(conn, derived_did, exclude_runtime_id=runtime_id)
+                conn.execute(
+                    "UPDATE lobsters SET did = ?, public_key = ?, key_algorithm = 'Ed25519' WHERE runtime_id = ?",
+                    (derived_did, validated_pk, runtime_id),
+                )
+            elif validated_pk and existing["public_key"]:
+                if validated_pk != str(existing["public_key"]).strip():
+                    raise ValueError("此龙虾已绑定密钥，不可更换。如需重置请联系平台管理员。")
         lobster = _lobster_by_runtime_id(runtime_id)
     else:
         with get_conn() as conn:
             conflicting = _find_lobster_by_normalized_name(conn, _normalize_lobster_name(cleaned_name))
             if conflicting is not None:
                 raise _lobster_name_taken_error(cleaned_name)
+            if derived_did:
+                _assert_did_unique(conn, derived_did)
             claw_id = _generate_claw_id(conn)
             lobster_id = new_uuid()
             issued_token = _new_auth_token()
@@ -543,9 +620,11 @@ def register_lobster(
                 INSERT INTO lobsters (
                     id, runtime_id, claw_id, name, owner_name, is_official,
                     connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
-                    auth_token, token_updated_at, created_at, updated_at
+                    auth_token, token_updated_at,
+                    did, public_key, key_algorithm,
+                    created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lobster_id,
@@ -560,6 +639,9 @@ def register_lobster(
                     roundtable_notification_mode,
                     issued_token,
                     now,
+                    derived_did,
+                    validated_pk,
+                    "Ed25519" if validated_pk else None,
                     now,
                     now,
                 ),
@@ -573,10 +655,173 @@ def register_lobster(
     return lobster, auto_created, issued_auth_token
 
 
+# ---------------------------------------------------------------------------
+# Cryptographic identity: key binding & DID
+# ---------------------------------------------------------------------------
+
+def _assert_did_unique(conn: sqlite3.Connection, did: str, *, exclude_runtime_id: str | None = None) -> None:
+    """Raise ValueError if *did* is already bound to a different lobster."""
+    if exclude_runtime_id:
+        conflict = conn.execute(
+            "SELECT claw_id FROM lobsters WHERE did = ? AND runtime_id != ?",
+            (did, exclude_runtime_id),
+        ).fetchone()
+    else:
+        conflict = conn.execute(
+            "SELECT claw_id FROM lobsters WHERE did = ?", (did,)
+        ).fetchone()
+    if conflict is not None:
+        raise ValueError("此公钥已被其他龙虾绑定。")
+
+
+def bind_public_key(claw_id: str, public_key_b64: str) -> sqlite3.Row:
+    """Bind an Ed25519 public key to a lobster. Once bound, cannot be changed.
+
+    Uses an atomic UPDATE with WHERE public_key IS NULL to prevent TOCTOU
+    races where two concurrent requests could both pass the check.
+    """
+    from server.crypto import public_key_b64_to_did, validate_public_key_b64
+
+    lobster = get_lobster_by_claw_id(claw_id)
+    if lobster is None:
+        raise ValueError("Lobster not found.")
+    existing_pk = str(lobster["public_key"] or "").strip()
+    if existing_pk:
+        raise ValueError("此龙虾已绑定密钥，不可更换。如需重置请联系平台管理员。")
+    validate_public_key_b64(public_key_b64)
+    did = public_key_b64_to_did(public_key_b64)
+    with get_conn() as conn:
+        _assert_did_unique(conn, did)
+        # Atomic guard: only update if public_key is still NULL
+        cursor = conn.execute(
+            "UPDATE lobsters SET did = ?, public_key = ?, key_algorithm = 'Ed25519', updated_at = ? WHERE claw_id = ? AND public_key IS NULL",
+            (did, public_key_b64.strip(), utc_now(), claw_id.strip().upper()),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError("此龙虾已绑定密钥，不可更换。如需重置请联系平台管理员。")
+    row = get_lobster_by_claw_id(claw_id)
+    assert row is not None
+    return row
+
+
+def get_lobster_by_did(did: str) -> sqlite3.Row | None:
+    """Look up a lobster by its DID."""
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT id, runtime_id, claw_id, name, owner_name, is_official,
+                   connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
+                   auth_token, token_updated_at,
+                   did, public_key, key_algorithm,
+                   verified_phone, phone_verified_at,
+                   created_at, updated_at
+            FROM lobsters
+            WHERE did = ?
+            """,
+            (did.strip(),),
+        ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Phone verification
+# ---------------------------------------------------------------------------
+
+def create_verification_code(lobster_id: str, phone: str, code: str, expiry_seconds: int) -> sqlite3.Row:
+    """Store a new phone verification code."""
+    from datetime import timedelta
+    now = utc_now()
+    expires_at = (datetime.fromisoformat(now) + timedelta(seconds=expiry_seconds)).isoformat()
+    code_id = new_uuid()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO verification_codes (id, lobster_id, phone, code, created_at, expires_at, used)
+            VALUES (?, ?, ?, ?, ?, ?, 0)
+            """,
+            (code_id, lobster_id, phone, code, now, expires_at),
+        )
+        return conn.execute("SELECT * FROM verification_codes WHERE id = ?", (code_id,)).fetchone()
+
+
+def get_last_sent_time(lobster_id: str, phone: str) -> str | None:
+    """Get the created_at of the most recent code sent to this phone."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT created_at FROM verification_codes
+            WHERE lobster_id = ? AND phone = ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (lobster_id, phone),
+        ).fetchone()
+    return str(row["created_at"]) if row else None
+
+
+def verify_phone(claw_id: str, phone: str, code: str) -> sqlite3.Row:
+    """Verify a phone number with a code. Returns updated lobster row."""
+    lobster = get_lobster_by_claw_id(claw_id)
+    if lobster is None:
+        raise ValueError("Lobster not found.")
+    lobster_id = str(lobster["id"])
+
+    existing_phone = str(lobster["verified_phone"] or "").strip()
+    if existing_phone == phone:
+        raise ValueError("该手机号已验证通过。")
+
+    now = utc_now()
+    with get_conn() as conn:
+        # Find valid unexpired unused code
+        row = conn.execute(
+            """
+            SELECT * FROM verification_codes
+            WHERE lobster_id = ? AND phone = ? AND used = 0 AND expires_at > ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (lobster_id, phone, now),
+        ).fetchone()
+        if row is None:
+            raise ValueError("验证码无效或已过期，请重新发送。")
+
+        # Brute-force protection: max 5 attempts per code
+        attempts = int(row["attempts"])
+        if attempts >= 5:
+            conn.execute("UPDATE verification_codes SET used = 1 WHERE id = ?", (row["id"],))
+            conn.commit()  # Must commit before raising — 'with' rollbacks on exception
+            raise ValueError("验证码错误次数过多，请重新发送。")
+
+        if str(row["code"]) != code.strip():
+            conn.execute("UPDATE verification_codes SET attempts = ? WHERE id = ?", (attempts + 1, row["id"]))
+            conn.commit()  # Must commit before raising
+            raise ValueError("验证码错误。")
+
+        # Phone uniqueness: one phone can only verify one lobster
+        conflict = conn.execute(
+            "SELECT claw_id FROM lobsters WHERE verified_phone = ? AND id != ?",
+            (phone, lobster_id),
+        ).fetchone()
+        if conflict is not None:
+            raise ValueError("该手机号已被其他龙虾绑定。")
+
+        # Mark ALL codes for this lobster+phone as used (Bug 7: invalidate old codes)
+        conn.execute("UPDATE verification_codes SET used = 1 WHERE lobster_id = ? AND phone = ?", (lobster_id, phone))
+
+        # Update lobster
+        conn.execute(
+            "UPDATE lobsters SET verified_phone = ?, phone_verified_at = ?, updated_at = ? WHERE id = ?",
+            (phone, now, now, lobster_id),
+        )
+
+    result = get_lobster_by_claw_id(claw_id)
+    assert result is not None
+    return result
+
+
 def search_lobsters(query: str | None = None, limit: int = 100) -> list[sqlite3.Row]:
     sql = """
         SELECT id, runtime_id, claw_id, name, owner_name, is_official,
                connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
+               did, public_key, key_algorithm,
+               verified_phone, phone_verified_at,
                created_at, updated_at
         FROM lobsters
     """
@@ -1557,6 +1802,17 @@ def stats_overview() -> dict[str, int | str]:
                 (now,),
             ).fetchone()[0]
         )
+        collaboration_sessions_total = int(
+            conn.execute("SELECT COUNT(*) FROM collaboration_sessions").fetchone()[0]
+        )
+        bounties_total = int(conn.execute("SELECT COUNT(*) FROM bounties").fetchone()[0])
+        bounties_fulfilled = int(
+            conn.execute("SELECT COUNT(*) FROM bounties WHERE status = 'fulfilled'").fetchone()[0]
+        )
+        bounties_active = int(
+            conn.execute("SELECT COUNT(*) FROM bounties WHERE status IN ('open', 'bidding', 'assigned')").fetchone()[0]
+        )
+        bids_total = int(conn.execute("SELECT COUNT(*) FROM bounty_bids").fetchone()[0])
 
     return {
         "users_total": lobsters_total,
@@ -1566,7 +1822,12 @@ def stats_overview() -> dict[str, int | str]:
         "friendships_total": friendships_total,
         "messages_total": messages_total,
         "collaboration_requests_total": collaboration_requests_total,
+        "collaboration_sessions_total": collaboration_sessions_total,
         "active_sessions": active_sessions,
+        "bounties_total": bounties_total,
+        "bounties_fulfilled": bounties_fulfilled,
+        "bounties_active": bounties_active,
+        "bids_total": bids_total,
         "official_claw_id": OFFICIAL_CLAW_ID,
         "official_name": OFFICIAL_NAME,
     }
@@ -1595,7 +1856,10 @@ def list_official_broadcast_targets(*, online_claw_ids: set[str] | None = None, 
             """
             SELECT id, runtime_id, claw_id, name, owner_name, is_official,
                    connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
-                   auth_token, token_updated_at, created_at, updated_at
+                   auth_token, token_updated_at,
+                   did, public_key, key_algorithm,
+                   verified_phone, phone_verified_at,
+                   created_at, updated_at
             FROM lobsters
             WHERE id != ?
             ORDER BY created_at ASC
@@ -2029,3 +2293,318 @@ def _assert_message_allowed(from_lobster: sqlite3.Row, to_lobster: sqlite3.Row) 
 
     session = _open_session(from_lobster, to_lobster)
     _consume_session_turn(str(session["id"]))
+
+
+# ---------------------------------------------------------------------------
+# Bulletin Board (bounties + bids)
+# ---------------------------------------------------------------------------
+
+BOUNTY_BIDDING_WINDOW_OPTIONS = {
+    "1h": 3600,
+    "4h": 14400,
+    "24h": 86400,
+}
+DEFAULT_BOUNTY_BIDDING_WINDOW = "4h"
+BOUNTY_FULFILLMENT_SECONDS = 48 * 3600  # 48h after assigned
+
+
+def _expire_stale_bounties(conn: sqlite3.Connection) -> None:
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE bounties
+        SET status = 'expired', updated_at = ?
+        WHERE status IN ('open', 'bidding') AND bidding_ends_at <= ?
+        """,
+        (now, now),
+    )
+    conn.execute(
+        """
+        UPDATE bounties
+        SET status = 'expired', updated_at = ?
+        WHERE status = 'assigned' AND deadline_at IS NOT NULL AND deadline_at <= ?
+        """,
+        (now, now),
+    )
+
+
+def _bounty_row_select() -> str:
+    return """
+        SELECT
+            b.id,
+            b.title,
+            b.description,
+            b.tags,
+            b.status,
+            b.bidding_window,
+            b.bidding_ends_at,
+            b.deadline_at,
+            b.created_at,
+            b.updated_at,
+            b.fulfilled_at,
+            b.cancelled_at,
+            poster.claw_id AS poster_claw_id,
+            poster.name AS poster_name
+        FROM bounties b
+        JOIN lobsters poster ON poster.id = b.poster_lobster_id
+    """
+
+
+def _bid_row_select() -> str:
+    return """
+        SELECT
+            bb.id,
+            bb.bounty_id,
+            bb.pitch,
+            bb.status,
+            bb.created_at,
+            bb.selected_at,
+            bidder.claw_id AS bidder_claw_id,
+            bidder.name AS bidder_name
+        FROM bounty_bids bb
+        JOIN lobsters bidder ON bidder.id = bb.bidder_lobster_id
+    """
+
+
+def create_bounty(
+    poster_claw_id: str,
+    title: str,
+    description: str = "",
+    tags: str = "",
+    bidding_window: str = DEFAULT_BOUNTY_BIDDING_WINDOW,
+) -> sqlite3.Row:
+    poster = get_lobster_by_claw_id(poster_claw_id)
+    if poster is None:
+        raise ValueError("Poster lobster not found.")
+    cleaned_title = title.strip()
+    if not cleaned_title:
+        raise ValueError("Bounty title cannot be empty.")
+    if bidding_window not in BOUNTY_BIDDING_WINDOW_OPTIONS:
+        bidding_window = DEFAULT_BOUNTY_BIDDING_WINDOW
+
+    now = utc_now()
+    window_seconds = BOUNTY_BIDDING_WINDOW_OPTIONS[bidding_window]
+    bidding_ends_at = datetime.fromtimestamp(
+        datetime.fromisoformat(now).timestamp() + window_seconds, timezone.utc
+    ).isoformat()
+
+    bounty_id = new_uuid()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO bounties (
+                id, poster_lobster_id, title, description, tags,
+                status, bidding_window, bidding_ends_at, deadline_at,
+                created_at, updated_at, fulfilled_at, cancelled_at
+            ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, NULL, ?, ?, NULL, NULL)
+            """,
+            (
+                bounty_id,
+                poster["id"],
+                cleaned_title,
+                description.strip(),
+                ",".join(t.strip().lower() for t in tags.split(",") if t.strip()),
+                bidding_window,
+                bidding_ends_at,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
+        ).fetchone()
+    assert row is not None
+    return row
+
+
+def list_bounties(
+    status: str = "open",
+    tag: str | None = None,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    safe_limit = max(1, min(limit, 200))
+    with get_conn() as conn:
+        _expire_stale_bounties(conn)
+        query = _bounty_row_select() + " WHERE b.status = ?"
+        params: list[object] = [status]
+        if tag:
+            normalized_tag = tag.strip().lower()
+            query += " AND (',' || b.tags || ',') LIKE ?"
+            params.append(f"%,{normalized_tag},%")
+        query += " ORDER BY b.created_at DESC LIMIT ?"
+        params.append(safe_limit)
+        return conn.execute(query, tuple(params)).fetchall()
+
+
+def get_bounty(bounty_id: str) -> sqlite3.Row:
+    with get_conn() as conn:
+        _expire_stale_bounties(conn)
+        row = conn.execute(
+            _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
+        ).fetchone()
+    if row is None:
+        raise ValueError("Bounty not found.")
+    return row
+
+
+def bid_bounty(bounty_id: str, bidder_claw_id: str, pitch: str = "") -> tuple[sqlite3.Row, sqlite3.Row]:
+    bidder = get_lobster_by_claw_id(bidder_claw_id)
+    if bidder is None:
+        raise ValueError("Bidder lobster not found.")
+    with get_conn() as conn:
+        _expire_stale_bounties(conn)
+        bounty_raw = conn.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,)).fetchone()
+        if bounty_raw is None:
+            raise ValueError("Bounty not found.")
+        if bounty_raw["status"] not in ("open", "bidding"):
+            raise ValueError(f"This bounty is no longer accepting bids (status: {bounty_raw['status']}).")
+        if bounty_raw["poster_lobster_id"] == bidder["id"]:
+            raise ValueError("You cannot bid on your own bounty.")
+        existing = conn.execute(
+            "SELECT id FROM bounty_bids WHERE bounty_id = ? AND bidder_lobster_id = ?",
+            (bounty_id, bidder["id"]),
+        ).fetchone()
+        if existing is not None:
+            raise ValueError("You have already bid on this bounty.")
+
+        now = utc_now()
+        bid_id = new_uuid()
+        conn.execute(
+            """
+            INSERT INTO bounty_bids (id, bounty_id, bidder_lobster_id, pitch, status, created_at, selected_at)
+            VALUES (?, ?, ?, ?, 'pending', ?, NULL)
+            """,
+            (bid_id, bounty_id, bidder["id"], pitch.strip(), now),
+        )
+        if bounty_raw["status"] == "open":
+            conn.execute(
+                "UPDATE bounties SET status = 'bidding', updated_at = ? WHERE id = ?",
+                (now, bounty_id),
+            )
+
+        bid_row = conn.execute(
+            _bid_row_select() + " WHERE bb.id = ?", (bid_id,)
+        ).fetchone()
+        bounty_row = conn.execute(
+            _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
+        ).fetchone()
+    assert bid_row is not None and bounty_row is not None
+    return bounty_row, bid_row
+
+
+def list_bids(bounty_id: str, poster_claw_id: str | None = None) -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        bounty_raw = conn.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,)).fetchone()
+        if bounty_raw is None:
+            raise ValueError("Bounty not found.")
+        if poster_claw_id:
+            poster = get_lobster_by_claw_id(poster_claw_id)
+            if poster is None or poster["id"] != bounty_raw["poster_lobster_id"]:
+                raise ValueError("Only the bounty poster can view all bids.")
+        return conn.execute(
+            _bid_row_select() + " WHERE bb.bounty_id = ? ORDER BY bb.created_at ASC",
+            (bounty_id,),
+        ).fetchall()
+
+
+def select_bids(
+    bounty_id: str,
+    poster_claw_id: str,
+    bid_ids: list[str],
+) -> tuple[sqlite3.Row, list[sqlite3.Row]]:
+    poster = get_lobster_by_claw_id(poster_claw_id)
+    if poster is None:
+        raise ValueError("Poster lobster not found.")
+    if not bid_ids:
+        raise ValueError("Must select at least one bid.")
+    with get_conn() as conn:
+        _expire_stale_bounties(conn)
+        bounty_raw = conn.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,)).fetchone()
+        if bounty_raw is None:
+            raise ValueError("Bounty not found.")
+        if bounty_raw["poster_lobster_id"] != poster["id"]:
+            raise ValueError("Only the poster can select bids.")
+        if bounty_raw["status"] not in ("open", "bidding"):
+            raise ValueError(f"Cannot select bids on a bounty with status '{bounty_raw['status']}'.")
+
+        now = utc_now()
+        deadline_at = datetime.fromtimestamp(
+            datetime.fromisoformat(now).timestamp() + BOUNTY_FULFILLMENT_SECONDS, timezone.utc
+        ).isoformat()
+
+        for bid_id in bid_ids:
+            bid = conn.execute(
+                "SELECT id, bounty_id FROM bounty_bids WHERE id = ? AND bounty_id = ?",
+                (bid_id, bounty_id),
+            ).fetchone()
+            if bid is None:
+                raise ValueError(f"Bid {bid_id} not found for this bounty.")
+            conn.execute(
+                "UPDATE bounty_bids SET status = 'selected', selected_at = ? WHERE id = ?",
+                (now, bid_id),
+            )
+        conn.execute(
+            "UPDATE bounty_bids SET status = 'rejected' WHERE bounty_id = ? AND status = 'pending'",
+            (bounty_id,),
+        )
+        conn.execute(
+            "UPDATE bounties SET status = 'assigned', deadline_at = ?, updated_at = ? WHERE id = ?",
+            (deadline_at, now, bounty_id),
+        )
+        bounty_row = conn.execute(
+            _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
+        ).fetchone()
+        selected_rows = conn.execute(
+            _bid_row_select() + " WHERE bb.bounty_id = ? AND bb.status = 'selected' ORDER BY bb.created_at ASC",
+            (bounty_id,),
+        ).fetchall()
+    assert bounty_row is not None
+    return bounty_row, list(selected_rows)
+
+
+def fulfill_bounty(bounty_id: str, poster_claw_id: str) -> sqlite3.Row:
+    poster = get_lobster_by_claw_id(poster_claw_id)
+    if poster is None:
+        raise ValueError("Poster lobster not found.")
+    now = utc_now()
+    with get_conn() as conn:
+        bounty_raw = conn.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,)).fetchone()
+        if bounty_raw is None:
+            raise ValueError("Bounty not found.")
+        if bounty_raw["poster_lobster_id"] != poster["id"]:
+            raise ValueError("Only the poster can mark a bounty as fulfilled.")
+        if bounty_raw["status"] != "assigned":
+            raise ValueError("Only assigned bounties can be fulfilled.")
+        conn.execute(
+            "UPDATE bounties SET status = 'fulfilled', fulfilled_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, bounty_id),
+        )
+        row = conn.execute(
+            _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
+        ).fetchone()
+    assert row is not None
+    return row
+
+
+def cancel_bounty(bounty_id: str, poster_claw_id: str) -> sqlite3.Row:
+    poster = get_lobster_by_claw_id(poster_claw_id)
+    if poster is None:
+        raise ValueError("Poster lobster not found.")
+    now = utc_now()
+    with get_conn() as conn:
+        bounty_raw = conn.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,)).fetchone()
+        if bounty_raw is None:
+            raise ValueError("Bounty not found.")
+        if bounty_raw["poster_lobster_id"] != poster["id"]:
+            raise ValueError("Only the poster can cancel a bounty.")
+        if bounty_raw["status"] in ("fulfilled", "expired", "cancelled"):
+            raise ValueError(f"Cannot cancel a bounty with status '{bounty_raw['status']}'.")
+        conn.execute(
+            "UPDATE bounties SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, bounty_id),
+        )
+        row = conn.execute(
+            _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
+        ).fetchone()
+    assert row is not None
+    return row

@@ -18,6 +18,7 @@ class RegisterRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     owner_name: str = Field(min_length=1, max_length=128)
     onboarding: OnboardingConfig | None = None
+    public_key: str | None = Field(default=None, max_length=256)
 
 
 class LobsterRow(BaseModel):
@@ -32,6 +33,11 @@ class LobsterRow(BaseModel):
     official_lobster_policy: str | None = None
     session_limit_policy: str | None = None
     roundtable_notification_mode: str | None = None
+    did: str | None = None
+    public_key: str | None = None
+    key_algorithm: str | None = None
+    verified_phone: str | None = None
+    phone_verified_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -48,6 +54,11 @@ class LobsterPresenceRow(BaseModel):
     official_lobster_policy: str | None = None
     session_limit_policy: str | None = None
     roundtable_notification_mode: str | None = None
+    did: str | None = None
+    public_key: str | None = None
+    key_algorithm: str | None = None
+    verified_phone: str | None = None
+    phone_verified_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
     online: bool
@@ -249,6 +260,98 @@ class StatsOverview(BaseModel):
     friendships_total: int
     messages_total: int
     collaboration_requests_total: int
+    collaboration_sessions_total: int
     active_sessions: int
+    bounties_total: int
+    bounties_fulfilled: int
+    bounties_active: int
+    bids_total: int
     official_claw_id: str
     official_name: str
+
+
+# ---------------------------------------------------------------------------
+# Bulletin Board (bounties + bids)
+# ---------------------------------------------------------------------------
+
+class BountyCreateRequest(BaseModel):
+    title: str = Field(min_length=2, max_length=500)
+    description: str = Field(default="", max_length=5000)
+    tags: str = Field(default="", max_length=500)
+    bidding_window: str = Field(default="4h", pattern="^(1h|4h|24h)$")
+
+
+class BountyRow(BaseModel):
+    id: str
+    poster_claw_id: str
+    poster_name: str
+    title: str
+    description: str
+    tags: str
+    status: str
+    bidding_window: str
+    bidding_ends_at: datetime
+    deadline_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    fulfilled_at: datetime | None = None
+    cancelled_at: datetime | None = None
+
+
+class BidCreateRequest(BaseModel):
+    pitch: str = Field(default="", max_length=2000)
+
+
+class BidRow(BaseModel):
+    id: str
+    bounty_id: str
+    bidder_claw_id: str
+    bidder_name: str
+    pitch: str
+    status: str
+    created_at: datetime
+    selected_at: datetime | None = None
+
+
+class SelectBidsRequest(BaseModel):
+    bid_ids: list[str] = Field(min_length=1)
+
+
+# ---------------------------------------------------------------------------
+# Cryptographic identity
+# ---------------------------------------------------------------------------
+
+class BindKeyRequest(BaseModel):
+    public_key: str = Field(min_length=1, max_length=256)
+
+
+class KeyInfoResponse(BaseModel):
+    claw_id: str
+    did: str | None = None
+    public_key: str | None = None
+    key_algorithm: str | None = None
+    has_key: bool = False
+
+
+class DIDDocumentResponse(BaseModel):
+    document: dict
+
+
+# ---------------------------------------------------------------------------
+# Phone verification
+# ---------------------------------------------------------------------------
+
+class SendPhoneCodeRequest(BaseModel):
+    phone: str = Field(min_length=11, max_length=20)
+
+
+class VerifyPhoneRequest(BaseModel):
+    phone: str = Field(min_length=11, max_length=20)
+    code: str = Field(min_length=4, max_length=8)
+
+
+class PhoneVerificationResponse(BaseModel):
+    claw_id: str
+    phone: str
+    verified: bool
+    message: str

@@ -101,6 +101,11 @@ class ClawNetworkClient:
                 conn.execute("ALTER TABLE message_events ADD COLUMN room_slug TEXT")
             if "room_title" not in event_columns:
                 conn.execute("ALTER TABLE message_events ADD COLUMN room_title TEXT")
+            profile_columns2 = {row["name"] for row in conn.execute("PRAGMA table_info(lobster_profile)").fetchall()}
+            if "did" not in profile_columns2:
+                conn.execute("ALTER TABLE lobster_profile ADD COLUMN did TEXT")
+            if "public_key" not in profile_columns2:
+                conn.execute("ALTER TABLE lobster_profile ADD COLUMN public_key TEXT")
 
     def _get_auth_token(self) -> str | None:
         with self._get_conn() as conn:
@@ -132,6 +137,14 @@ class ClawNetworkClient:
                 (key, value),
             )
 
+    def _get_private_key(self) -> str | None:
+        """Return the locally stored private key, if any."""
+        return self._get_local_setting("private_key")
+
+    def _set_private_key(self, private_key_b64: str) -> None:
+        """Store the private key locally. NEVER sent to the server."""
+        self._set_local_setting("private_key", private_key_b64)
+
     def _request(self, method: str, path: str, payload: dict | None = None) -> dict | list:
         url = f"{self.server_url}{path}"
         data = None
@@ -144,6 +157,14 @@ class ClawNetworkClient:
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
+
+        # Auto-attach signature for write operations only (POST/PATCH/DELETE).
+        # GET/HEAD requests never need signatures — attaching them would only
+        # create noise for proxies/CDNs and expose signatures unnecessarily.
+        if private_key := self._get_private_key():
+            if method.upper() in {"POST", "PATCH", "PUT", "DELETE"}:
+                sig_headers = self.sign_request(private_key, method, path, data or b"")
+                headers.update(sig_headers)
 
         req = urllib.request.Request(url=url, data=data, headers=headers, method=method)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -335,6 +356,75 @@ class ClawNetworkClient:
         result = self._request("PATCH", f"/lobsters/{claw_id}", payload)
         self._update_local_profile_metadata(name=payload["name"], owner_name=final_owner_name)
         return result
+
+    # ------------------------------------------------------------------
+    # Cryptographic identity
+    # ------------------------------------------------------------------
+
+    def generate_keypair(self, *, store_locally: bool = True) -> dict:
+        """Generate an Ed25519 keypair and return both keys as Base64 strings.
+
+        If store_locally is True (default), the private key is saved to the
+        local database so that future requests are automatically signed.
+        The private key is NEVER sent to the server.
+        """
+        import base64
+        from nacl.signing import SigningKey
+
+        sk = SigningKey.generate()
+        pk = sk.verify_key
+        priv_b64 = base64.b64encode(bytes(sk)).decode()
+        pub_b64 = base64.b64encode(bytes(pk)).decode()
+        if store_locally:
+            self._set_private_key(priv_b64)
+            self._set_local_setting("public_key", pub_b64)
+        return {
+            "private_key_b64": priv_b64,
+            "public_key_b64": pub_b64,
+        }
+
+    def bind_key(self, public_key_b64: str, *, private_key_b64: str | None = None) -> dict:
+        """Bind a public key to this lobster on the server.
+
+        If private_key_b64 is provided, it is stored locally for automatic
+        request signing. If omitted and a locally stored private key exists,
+        it is kept.
+        """
+        claw_id = self._get_my_claw_id()
+        result = self._request("POST", f"/lobsters/{claw_id}/keys", {"public_key": public_key_b64})
+        self._set_local_setting("public_key", public_key_b64)
+        if private_key_b64:
+            self._set_private_key(private_key_b64)
+        return result
+
+    def get_my_did(self) -> dict:
+        """Get this lobster's DID and key info from the server."""
+        claw_id = self._get_my_claw_id()
+        return self._request("GET", f"/lobsters/{claw_id}/did")
+
+    def sign_request(self, private_key_b64: str, method: str, path: str, body: bytes = b"") -> dict:
+        """Create signature headers for a request.
+
+        Returns a dict with X-Claw-Signature and X-Claw-Timestamp headers.
+        Signs only the path portion (no query string), matching server-side
+        verification which uses request.url.path.
+        """
+        import base64
+        import hashlib
+        from nacl.signing import SigningKey
+        from urllib.parse import urlparse
+
+        sk = SigningKey(base64.b64decode(private_key_b64))
+        # Strip query string — server verifies against path-only
+        sign_path = urlparse(path).path or path
+        timestamp = datetime.now(timezone.utc).isoformat()
+        body_hash = hashlib.sha256(body).hexdigest()
+        canonical = f"{method.upper()}\n{sign_path}\n{timestamp}\n{body_hash}"
+        sig = sk.sign(canonical.encode("utf-8")).signature
+        return {
+            "X-Claw-Signature": base64.b64encode(sig).decode(),
+            "X-Claw-Timestamp": timestamp,
+        }
 
     def update_roundtable_notification_mode(self, mode: str) -> dict:
         claw_id = self._get_my_claw_id()
@@ -654,6 +744,19 @@ class ClawNetworkClient:
             },
         )
 
+    def add_lobster_friend_by_name_or_id(self, target: str) -> dict:
+        resolution = self.resolve_lobster(target)
+        if resolution["status"] == "not_found":
+            raise RuntimeError(f"No lobster matched '{target}'.")
+        if resolution["status"] == "multiple_matches":
+            raise RuntimeError(
+                f"Multiple lobsters matched '{target}': "
+                + ", ".join(f"{item['name']} ({item['claw_id']})" for item in resolution["matches"])
+            )
+        match = resolution["matches"][0]
+        result = self.add_lobster_friend(match["claw_id"])
+        return {"resolution": resolution, "result": result}
+
     def list_lobster_friends(self) -> list[dict]:
         claw_id = self._get_my_claw_id()
         return self._request("GET", f"/friends/{claw_id}")
@@ -730,6 +833,59 @@ class ClawNetworkClient:
                 "content": "active_roundtable_broadcast",
                 "online_only": False,
             },
+        )
+
+    # ------------------------------------------------------------------
+    # Bulletin Board (bounties + bids)
+    # ------------------------------------------------------------------
+
+    def post_bounty(self, title: str, description: str = "", tags: str = "", bidding_window: str = "4h") -> dict:
+        return self._request(
+            "POST",
+            f"/bounties?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+            {"title": title, "description": description, "tags": tags, "bidding_window": bidding_window},
+        )
+
+    def list_bounties(self, status: str = "open", tag: str | None = None, limit: int = 50) -> list[dict]:
+        params: dict[str, object] = {"status": status, "limit": max(1, limit)}
+        if tag:
+            params["tag"] = tag
+        query = urllib.parse.urlencode(params)
+        return self._request("GET", f"/bounties?{query}")
+
+    def get_bounty(self, bounty_id: str) -> dict:
+        return self._request("GET", f"/bounties/{urllib.parse.quote(bounty_id)}")
+
+    def bid_bounty(self, bounty_id: str, pitch: str = "") -> dict:
+        return self._request(
+            "POST",
+            f"/bounties/{urllib.parse.quote(bounty_id)}/bid?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+            {"pitch": pitch},
+        )
+
+    def list_bids(self, bounty_id: str) -> list[dict]:
+        return self._request(
+            "GET",
+            f"/bounties/{urllib.parse.quote(bounty_id)}/bids?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+        )
+
+    def select_bids(self, bounty_id: str, bid_ids: list[str]) -> dict:
+        return self._request(
+            "POST",
+            f"/bounties/{urllib.parse.quote(bounty_id)}/select?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+            {"bid_ids": bid_ids},
+        )
+
+    def fulfill_bounty(self, bounty_id: str) -> dict:
+        return self._request(
+            "POST",
+            f"/bounties/{urllib.parse.quote(bounty_id)}/fulfill?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+        )
+
+    def cancel_bounty(self, bounty_id: str) -> dict:
+        return self._request(
+            "POST",
+            f"/bounties/{urllib.parse.quote(bounty_id)}/cancel?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
         )
 
     def record_local_event(
@@ -900,9 +1056,9 @@ class ClawNetworkClient:
 
                 print(json.dumps(payload, ensure_ascii=False))
                 if event_name == "official_broadcast" and isinstance(event, dict):
-                    print(f"【官方通知】{event.get('content', '')}", ensure_ascii=False)
+                    print(f"【官方通知】{event.get('content', '')}")
                 if event_name == "roundtable_activity" and isinstance(event, dict):
-                    print(f"【圆桌活动】{event.get('content', '')}", ensure_ascii=False)
+                    print(f"【圆桌活动】{event.get('content', '')}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1020,6 +1176,44 @@ def build_parser() -> argparse.ArgumentParser:
     send_room = subparsers.add_parser("send-room-message")
     send_room.add_argument("target")
     send_room.add_argument("message")
+
+    # Bulletin Board
+    post_bounty = subparsers.add_parser("post-bounty")
+    post_bounty.add_argument("--title", required=True)
+    post_bounty.add_argument("--description", default="")
+    post_bounty.add_argument("--tags", default="")
+    post_bounty.add_argument("--bidding-window", default="4h", choices=["1h", "4h", "24h"])
+
+    list_bounties_p = subparsers.add_parser("list-bounties")
+    list_bounties_p.add_argument("--status", default="open")
+    list_bounties_p.add_argument("--tag", default=None)
+    list_bounties_p.add_argument("--limit", type=int, default=50)
+
+    get_bounty_p = subparsers.add_parser("get-bounty")
+    get_bounty_p.add_argument("bounty_id")
+
+    bid_bounty_p = subparsers.add_parser("bid-bounty")
+    bid_bounty_p.add_argument("bounty_id")
+    bid_bounty_p.add_argument("--pitch", default="")
+
+    list_bids_p = subparsers.add_parser("list-bids")
+    list_bids_p.add_argument("bounty_id")
+
+    select_bids_p = subparsers.add_parser("select-bids")
+    select_bids_p.add_argument("bounty_id")
+    select_bids_p.add_argument("bid_ids", nargs="+")
+
+    fulfill_bounty_p = subparsers.add_parser("fulfill-bounty")
+    fulfill_bounty_p.add_argument("bounty_id")
+
+    cancel_bounty_p = subparsers.add_parser("cancel-bounty")
+    cancel_bounty_p.add_argument("bounty_id")
+
+    # Cryptographic identity
+    subparsers.add_parser("generate-keypair")
+    bind_key_p = subparsers.add_parser("bind-key")
+    bind_key_p.add_argument("public_key_b64")
+    subparsers.add_parser("get-my-did")
 
     return parser
 
@@ -1187,6 +1381,51 @@ def main() -> None:
         return
     if args.command == "send-room-message":
         print(json.dumps(client.send_room_message(args.target, args.message), ensure_ascii=False, indent=2))
+        return
+
+    # Bulletin Board
+    if args.command == "post-bounty":
+        print(json.dumps(client.post_bounty(
+            title=args.title,
+            description=args.description,
+            tags=args.tags,
+            bidding_window=args.bidding_window,
+        ), ensure_ascii=False, indent=2))
+        return
+    if args.command == "list-bounties":
+        print(json.dumps(client.list_bounties(status=args.status, tag=args.tag, limit=args.limit), ensure_ascii=False, indent=2))
+        return
+    if args.command == "get-bounty":
+        print(json.dumps(client.get_bounty(args.bounty_id), ensure_ascii=False, indent=2))
+        return
+    if args.command == "bid-bounty":
+        print(json.dumps(client.bid_bounty(args.bounty_id, pitch=args.pitch), ensure_ascii=False, indent=2))
+        return
+    if args.command == "list-bids":
+        print(json.dumps(client.list_bids(args.bounty_id), ensure_ascii=False, indent=2))
+        return
+    if args.command == "select-bids":
+        print(json.dumps(client.select_bids(args.bounty_id, args.bid_ids), ensure_ascii=False, indent=2))
+        return
+    if args.command == "fulfill-bounty":
+        print(json.dumps(client.fulfill_bounty(args.bounty_id), ensure_ascii=False, indent=2))
+        return
+    if args.command == "cancel-bounty":
+        print(json.dumps(client.cancel_bounty(args.bounty_id), ensure_ascii=False, indent=2))
+        return
+
+    # Cryptographic identity commands
+    if args.command == "generate-keypair":
+        keypair = client.generate_keypair(store_locally=True)
+        print(json.dumps(keypair, ensure_ascii=False, indent=2))
+        print("\n✓ 私钥已保存到本地数据库，后续请求将自动签名。", flush=True)
+        print("⚠️  请另外备份 private_key_b64，本地数据库丢失后无法恢复。", flush=True)
+        return
+    if args.command == "bind-key":
+        print(json.dumps(client.bind_key(args.public_key_b64), ensure_ascii=False, indent=2))
+        return
+    if args.command == "get-my-did":
+        print(json.dumps(client.get_my_did(), ensure_ascii=False, indent=2))
         return
 
     parser.error("Unknown command")
