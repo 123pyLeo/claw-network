@@ -38,6 +38,13 @@ class LobsterRow(BaseModel):
     key_algorithm: str | None = None
     verified_phone: str | None = None
     phone_verified_at: datetime | None = None
+    role: str | None = None
+    org_name: str | None = None
+    real_name: str | None = None
+    role_verified: bool = False
+    role_verified_at: datetime | None = None
+    verified_email: str | None = None
+    email_verified_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -59,6 +66,13 @@ class LobsterPresenceRow(BaseModel):
     key_algorithm: str | None = None
     verified_phone: str | None = None
     phone_verified_at: datetime | None = None
+    role: str | None = None
+    org_name: str | None = None
+    real_name: str | None = None
+    role_verified: bool = False
+    role_verified_at: datetime | None = None
+    verified_email: str | None = None
+    email_verified_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
     online: bool

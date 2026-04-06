@@ -193,6 +193,20 @@ async def _verify_signature_headers(request: Request, public_key_b64: str) -> No
 @app.on_event("startup")
 def on_startup() -> None:
     store.init_db()
+    # Initialize feature modules
+    # Feature: Role Verification
+    from features.role_verification.routes import router as role_router, init_helpers as role_init
+    from features.role_verification.store import ensure_role_columns
+    ensure_role_columns()
+    role_init(_check_rate_limit, _require_http_auth)
+    app.include_router(role_router)
+
+    # Feature: BP Matching
+    from features.bp_matching.routes import router as bp_router, init_helpers as bp_init
+    from features.bp_matching.store import ensure_bp_tables
+    ensure_bp_tables()
+    bp_init(_check_rate_limit, _require_http_auth, _require_signature_if_keyed)
+    app.include_router(bp_router)
 
 
 @app.get("/health")

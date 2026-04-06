@@ -87,8 +87,9 @@ _EVENT_ROW_SELECT = """
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -265,6 +266,13 @@ def init_db() -> None:
         _ensure_column(conn, "lobsters", "key_algorithm", "TEXT DEFAULT 'Ed25519'")
         _ensure_column(conn, "lobsters", "verified_phone", "TEXT")
         _ensure_column(conn, "lobsters", "phone_verified_at", "TEXT")
+        _ensure_column(conn, "lobsters", "role", "TEXT")
+        _ensure_column(conn, "lobsters", "org_name", "TEXT")
+        _ensure_column(conn, "lobsters", "real_name", "TEXT")
+        _ensure_column(conn, "lobsters", "role_verified", "INTEGER DEFAULT 0")
+        _ensure_column(conn, "lobsters", "role_verified_at", "TEXT")
+        _ensure_column(conn, "lobsters", "verified_email", "TEXT")
+        _ensure_column(conn, "lobsters", "email_verified_at", "TEXT")
         _ensure_column(conn, "message_events", "room_id", "TEXT")
         _ensure_column(conn, "message_events", "room_message_id", "TEXT")
         _ensure_column(conn, "verification_codes", "attempts", "INTEGER NOT NULL DEFAULT 0")
@@ -334,6 +342,7 @@ def _lobster_by_runtime_id(runtime_id: str) -> sqlite3.Row | None:
                    auth_token, token_updated_at,
                    did, public_key, key_algorithm,
                    verified_phone, phone_verified_at,
+                   role, org_name, real_name, role_verified, role_verified_at, verified_email, email_verified_at,
                    created_at, updated_at
             FROM lobsters
             WHERE runtime_id = ?
@@ -351,6 +360,7 @@ def get_lobster_by_claw_id(claw_id: str) -> sqlite3.Row | None:
                    auth_token, token_updated_at,
                    did, public_key, key_algorithm,
                    verified_phone, phone_verified_at,
+                   role, org_name, real_name, role_verified, role_verified_at, verified_email, email_verified_at,
                    created_at, updated_at
             FROM lobsters
             WHERE claw_id = ?
@@ -423,6 +433,7 @@ def get_lobster_by_token(token: str) -> sqlite3.Row | None:
                    auth_token, token_updated_at,
                    did, public_key, key_algorithm,
                    verified_phone, phone_verified_at,
+                   role, org_name, real_name, role_verified, role_verified_at, verified_email, email_verified_at,
                    created_at, updated_at
             FROM lobsters
             WHERE auth_token = ?
@@ -714,6 +725,7 @@ def get_lobster_by_did(did: str) -> sqlite3.Row | None:
                    auth_token, token_updated_at,
                    did, public_key, key_algorithm,
                    verified_phone, phone_verified_at,
+                   role, org_name, real_name, role_verified, role_verified_at, verified_email, email_verified_at,
                    created_at, updated_at
             FROM lobsters
             WHERE did = ?
@@ -1859,6 +1871,7 @@ def list_official_broadcast_targets(*, online_claw_ids: set[str] | None = None, 
                    auth_token, token_updated_at,
                    did, public_key, key_algorithm,
                    verified_phone, phone_verified_at,
+                   role, org_name, real_name, role_verified, role_verified_at, verified_email, email_verified_at,
                    created_at, updated_at
             FROM lobsters
             WHERE id != ?
