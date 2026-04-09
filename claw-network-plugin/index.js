@@ -480,6 +480,15 @@ function detectNetworkIntent(text) {
     return { tool: 'list_collaboration_requests', params: {} };
   }
 
+  // --- Self upgrade ---
+  // Lets the user say "沙堆 升级" instead of opening a terminal. The first
+  // upgrade still has to use the curl-pipe-bash one-liner from the official
+  // broadcast (because that's the version that adds this intent), but every
+  // upgrade after this one becomes a single chat message.
+  if (['升级', '更新插件', '更新沙堆', '更新一下', '检查更新'].some((k) => v.includes(k))) {
+    return { tool: 'upgrade_self', params: {} };
+  }
+
   // --- Account balance ---
   if (['我的余额', '账户余额', '我的账户', '我还有多少', '我的积分'].some((k) => v.includes(k))) {
     return { tool: 'get_account_balance', params: {} };
@@ -1893,6 +1902,56 @@ const plugin = {
         } catch (error) {
           return errorResult(error);
         }
+      }
+    });
+
+    api.registerTool({
+      name: 'upgrade_self',
+      label: 'Upgrade Claw Network',
+      description: 'Pull the latest claw-network from GitHub and re-install the plugin locally. Requires git + bash. After upgrade, restart OpenClaw to load the new plugin code.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {}
+      },
+      async execute() {
+        // We shell out to bash, fetching the upgrade-remote script over HTTPS
+        // and piping it into bash. The same one-liner that the broadcast tells
+        // people to copy-paste — but here the chat triggers it for them.
+        return await new Promise((resolve) => {
+          const cp = require('child_process');
+          const cmd = 'curl -fsSL https://sandpile.io/upgrade.sh | bash';
+          const child = cp.spawn('bash', ['-c', cmd], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            env: process.env,
+          });
+          let stdout = '';
+          let stderr = '';
+          child.stdout.on('data', (d) => { stdout += d.toString(); });
+          child.stderr.on('data', (d) => { stderr += d.toString(); });
+          child.on('error', (err) => {
+            resolve(toolTextResult(
+              `❌ 无法启动升级脚本:${err.message}\n请手动在终端跑:\n  curl -fsSL https://sandpile.io/upgrade.sh | bash`,
+              { success: false }
+            ));
+          });
+          child.on('close', (code) => {
+            const combined = (stdout + (stderr ? '\n' + stderr : '')).trim();
+            // Only show the last ~30 lines to keep the chat readable.
+            const tail = combined.split('\n').slice(-30).join('\n');
+            if (code === 0) {
+              resolve(toolTextResult(
+                `✅ 升级完成。\n\n${tail}\n\n💡 请重启 OpenClaw 让新插件生效。`,
+                { success: true }
+              ));
+            } else {
+              resolve(toolTextResult(
+                `❌ 升级失败 (exit ${code}):\n\n${tail}\n\n如果无法解决,可以在终端手动跑:\n  curl -fsSL https://sandpile.io/upgrade.sh | bash`,
+                { success: false }
+              ));
+            }
+          });
+        });
       }
     });
 
