@@ -621,8 +621,25 @@ async def run_forever(
 ) -> None:
     room_tasks: dict[str, asyncio.Task] = {}
     credentials_mode = bool(preset_claw_id and preset_auth_token)
+
+    # ----- One-shot registration BEFORE the reconnect loop -----
+    #
+    # Critical bug fix (2026-04-09): previously this register() call lived
+    # INSIDE the `while True` reconnect loop, which meant any WebSocket
+    # disconnect (network blip, server restart, token edge case) would loop
+    # back to register() — hammering POST /register at ~1 req per few seconds
+    # forever. One stuck sidecar registered ~10000 times in a few hours and
+    # ate the global rate limit, blocking other users.
+    #
+    # The fix: register exactly once at startup, then enter the reconnect
+    # loop which only re-runs _listen_and_bridge. WebSocket reconnects do NOT
+    # need a re-register — the auth token is already cached locally.
+    #
+    # If the initial register itself fails (e.g. network down at startup),
+    # we retry it with backoff but that's a clearly bounded "first contact"
+    # path, not the steady-state reconnect path.
+    register_attempt = 0
     while True:
-        roundtable_monitor: asyncio.Task | None = None
         try:
             if credentials_mode:
                 # CREDENTIALS MODE: identity was issued elsewhere (e.g. by
@@ -642,16 +659,41 @@ async def run_forever(
             else:
                 registration = client.register()
                 print(json.dumps({"event": "registered", "payload": registration}, ensure_ascii=False), flush=True)
-            official_claw_id = None
-            if isinstance(registration, dict):
-                official = registration.get("official_lobster") or {}
-                if isinstance(official, dict):
-                    official_claw_id = str(official.get("claw_id") or "").strip().upper() or None
-            if credentials_mode and not official_claw_id:
-                # Credentials-mode import doesn't return official_lobster info.
-                # Fall back to the well-known seeded constant.
-                official_claw_id = OFFICIAL_LOBSTER_CLAW_ID_FALLBACK
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            register_attempt += 1
+            backoff = min(60, 5 * register_attempt)  # 5s, 10s, 15s ... capped at 60s
+            print(
+                json.dumps(
+                    {
+                        "event": "sidecar_register_failed",
+                        "detail": str(exc),
+                        "attempt": register_attempt,
+                        "retry_in_seconds": backoff,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            await asyncio.sleep(backoff)
 
+    # Pin official lobster claw_id once.
+    official_claw_id = None
+    if isinstance(registration, dict):
+        official = registration.get("official_lobster") or {}
+        if isinstance(official, dict):
+            official_claw_id = str(official.get("claw_id") or "").strip().upper() or None
+    if credentials_mode and not official_claw_id:
+        # Credentials-mode import doesn't return official_lobster info.
+        # Fall back to the well-known seeded constant.
+        official_claw_id = OFFICIAL_LOBSTER_CLAW_ID_FALLBACK
+
+    # ----- Reconnect loop: only re-runs WS bridge, NEVER re-registers -----
+    while True:
+        roundtable_monitor: asyncio.Task | None = None
+        try:
             if autonomous_roundtables:
                 roundtable_monitor = asyncio.create_task(
                     _monitor_joined_roundtables(

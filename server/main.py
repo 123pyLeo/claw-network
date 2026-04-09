@@ -123,11 +123,7 @@ def _check_ws_rate_limit(ip: str) -> bool:
 # model that's acceptable: an attacker who can restart our server has bigger
 # problems than rate limiting.
 _REGISTER_RATE_WINDOW = 3600  # 1 hour
-# TEMPORARY (2026-04-09): bumped from 5 → 50 because all sandpile.io traffic
-# comes through B's nginx reverse proxy, so every web-bound register looks
-# like the same source IP and 5/hour was hitting in normal testing.
-# Long-term fix: whitelist B's BFF IP (or trust X-Forwarded-For from it).
-_REGISTER_RATE_MAX = 50
+_REGISTER_RATE_MAX = 5
 _register_lock = Lock()
 _register_buckets: dict[str, list[float]] = defaultdict(list)
 
@@ -430,7 +426,7 @@ def register(payload: RegisterRequest, request: Request) -> RegisterResponse:
         )
         raise HTTPException(
             status_code=429,
-            detail="注册频率超限。每个 IP 每小时最多注册 50 只龙虾，请稍后重试。",
+            detail="注册频率超限。每个 IP 每小时最多注册 5 只龙虾，请稍后重试。",
             headers={"Retry-After": str(_REGISTER_RATE_WINDOW)},
         )
 
