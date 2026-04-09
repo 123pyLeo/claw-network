@@ -672,13 +672,26 @@ def claim_pairing_code(code: str, lobster_id: str) -> dict:
 
         # Check the lobster's current owner_id
         lob = conn.execute(
-            "SELECT owner_id FROM lobsters WHERE id = ?", (lobster_id,)
+            "SELECT owner_id, owner_name FROM lobsters WHERE id = ?", (lobster_id,)
         ).fetchone()
         if lob is None:
             raise ValueError(f"Lobster not found: {lobster_id}")
         current_owner = str(lob["owner_id"] or "")
         if current_owner and current_owner != target_owner_id:
             raise LobsterAlreadyBound()
+        previous_owner_name = (lob["owner_name"] or "").strip()
+
+        # Look up the target owner's canonical nickname so we can sync the
+        # lobster's cached owner_name field after binding. The design rule
+        # (set in the owner-nickname migration earlier) is:
+        # owner.nickname is the source of truth, lobster.owner_name is just
+        # a display cache. After pairing, the cache must match the source.
+        target_owner_row = conn.execute(
+            "SELECT nickname FROM owners WHERE id = ?", (target_owner_id,)
+        ).fetchone()
+        target_nickname = ""
+        if target_owner_row is not None:
+            target_nickname = (target_owner_row["nickname"] or "").strip()
 
         # All good — bind and mark used in a single transaction
         if not current_owner:
@@ -686,6 +699,20 @@ def claim_pairing_code(code: str, lobster_id: str) -> dict:
                 "UPDATE lobsters SET owner_id = ?, updated_at = ? WHERE id = ?",
                 (target_owner_id, now, lobster_id),
             )
+
+        # Sync the lobster's cached owner_name to the platform's canonical
+        # nickname. We only overwrite when there's a real platform nickname
+        # to set; if the platform owner has nickname IS NULL (rare —
+        # auto-created owners without explicit nickname yet), we leave the
+        # locally-typed name alone so the user still sees something.
+        nickname_overwritten = False
+        if target_nickname and target_nickname != previous_owner_name:
+            conn.execute(
+                "UPDATE lobsters SET owner_name = ?, updated_at = ? WHERE id = ?",
+                (target_nickname, now, lobster_id),
+            )
+            nickname_overwritten = True
+
         conn.execute(
             "UPDATE pairing_codes SET used_at = ?, claimed_lobster_id = ? WHERE code = ?",
             (now, lobster_id, cleaned_code),
@@ -695,6 +722,11 @@ def claim_pairing_code(code: str, lobster_id: str) -> dict:
         "owner_id": target_owner_id,
         "claimed_at": now,
         "code": cleaned_code,
+        # Echo back the rename so the API can tell the user "we replaced your
+        # local 'Leo' with the platform's '李大锤' — that's intentional".
+        "previous_owner_name": previous_owner_name or None,
+        "synced_owner_name": target_nickname or None,
+        "owner_name_changed": nickname_overwritten,
     }
 
 

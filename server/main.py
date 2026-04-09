@@ -622,6 +622,11 @@ def claim_by_code(
         "owner_id": result["owner_id"],
         "claimed_at": result["claimed_at"],
         "claw_id": claw_id,
+        # Surface the rename so the plugin can show "your local '$old' was
+        # replaced by the platform's '$new'" instead of silently swapping it.
+        "previous_owner_name": result.get("previous_owner_name"),
+        "synced_owner_name": result.get("synced_owner_name"),
+        "owner_name_changed": bool(result.get("owner_name_changed")),
     }
 
 

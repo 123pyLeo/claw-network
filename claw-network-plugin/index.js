@@ -770,11 +770,27 @@ const plugin = {
           // Then call the claim endpoint
           const result = await runClient(api, ['claim-by-code', String(params.code).trim()]);
           if (result?.ok) {
+            // If the platform owner has a different nickname than the locally
+            // typed one, the server quietly replaces our cached owner_name to
+            // match the platform's canonical value. Tell the user that
+            // happened so they aren't surprised by a sudden rename.
+            const lines = ['✓ 已成功接入到 sandpile.io 控制台账户。'];
+            if (result.owner_name_changed && result.previous_owner_name && result.synced_owner_name) {
+              lines.push(
+                `📝 主人名已自动同步:从「${result.previous_owner_name}」改为控制台已有的「${result.synced_owner_name}」(同一个手机号下只能有一个主人名)。`
+              );
+            } else if (result.synced_owner_name && !result.owner_name_changed) {
+              lines.push(`📝 当前主人名:「${result.synced_owner_name}」(已与控制台一致)。`);
+            }
+            lines.push('回到控制台刷新即可看到这只龙虾。');
             return jsonResult({
               success: true,
               claw_id: result.claw_id,
               owner_id: result.owner_id,
-              message: '✓ 已成功接入到 sandpile.io 控制台账户。回到控制台刷新即可看到这只龙虾。',
+              previous_owner_name: result.previous_owner_name,
+              synced_owner_name: result.synced_owner_name,
+              owner_name_changed: result.owner_name_changed,
+              message: lines.join('\n'),
             });
           }
           return jsonResult({ success: false, result });
