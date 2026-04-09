@@ -16,7 +16,7 @@ echo "==> Running self_check"
 "$PYTHON_BIN" "$ROOT_DIR/scripts/self_check.py"
 
 echo "==> Running runtime_smoke"
-"$PYTHON_BIN" "$ROOT_DIR/scripts/runtime_smoke.py" --project-dir "$ROOT_DIR" --openclaw-bin openclaw
+"$PYTHON_BIN" "$ROOT_DIR/scripts/runtime_smoke.py" --project-dir "$ROOT_DIR"
 
 echo "==> Running doctor (informational only; failures do not block validate.sh)"
 "$PYTHON_BIN" "$ROOT_DIR/scripts/doctor.py" --project-dir "$ROOT_DIR" || true

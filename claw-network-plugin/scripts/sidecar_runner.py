@@ -598,6 +598,13 @@ async def _listen_and_bridge(
             )
 
 
+# The official lobster's CLAW ID is fixed by the seed in server/store.py.
+# In credentials mode we can't get it from a register() response, so we
+# fall back to this constant. (Used to filter messages from the official
+# lobster in the OpenClaw bridge.)
+OFFICIAL_LOBSTER_CLAW_ID_FALLBACK = "CLAW-000001"
+
+
 async def run_forever(
     client: ClawNetworkClient,
     *,
@@ -609,18 +616,41 @@ async def run_forever(
     roundtable_max_duration_seconds: int,
     roundtable_idle_timeout_seconds: int,
     roundtable_poll_seconds: int,
+    preset_claw_id: str | None = None,
+    preset_auth_token: str | None = None,
 ) -> None:
     room_tasks: dict[str, asyncio.Task] = {}
+    credentials_mode = bool(preset_claw_id and preset_auth_token)
     while True:
         roundtable_monitor: asyncio.Task | None = None
         try:
-            registration = client.register()
-            print(json.dumps({"event": "registered", "payload": registration}, ensure_ascii=False), flush=True)
+            if credentials_mode:
+                # CREDENTIALS MODE: identity was issued elsewhere (e.g. by
+                # sandpile-website's web registration flow). Adopt it
+                # locally without hitting POST /register.
+                registration = client.import_credentials(
+                    claw_id=preset_claw_id,
+                    auth_token=preset_auth_token,
+                )
+                print(
+                    json.dumps(
+                        {"event": "credentials_imported", "payload": registration},
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            else:
+                registration = client.register()
+                print(json.dumps({"event": "registered", "payload": registration}, ensure_ascii=False), flush=True)
             official_claw_id = None
             if isinstance(registration, dict):
                 official = registration.get("official_lobster") or {}
                 if isinstance(official, dict):
                     official_claw_id = str(official.get("claw_id") or "").strip().upper() or None
+            if credentials_mode and not official_claw_id:
+                # Credentials-mode import doesn't return official_lobster info.
+                # Fall back to the well-known seeded constant.
+                official_claw_id = OFFICIAL_LOBSTER_CLAW_ID_FALLBACK
 
             if autonomous_roundtables:
                 roundtable_monitor = asyncio.create_task(
@@ -691,7 +721,20 @@ def main() -> None:
     parser.add_argument("--official-lobster-policy")
     parser.add_argument("--session-limit-policy")
     parser.add_argument("--roundtable-notification-mode")
+    # Credentials mode: skip register() and adopt a pre-issued identity
+    # (e.g. one created via sandpile-website's web registration flow).
+    # If both are provided, the sidecar will NOT call POST /register and
+    # will use these credentials directly. Otherwise it falls back to the
+    # legacy auto-register behavior.
+    parser.add_argument("--claw-id", default=None,
+                        help="Pre-issued CLAW ID (use with --auth-token to skip auto-register)")
+    parser.add_argument("--auth-token", default=None,
+                        help="Pre-issued auth token (use with --claw-id to skip auto-register)")
     args = parser.parse_args()
+
+    # Validate credentials mode flags come as a pair
+    if bool(args.claw_id) != bool(args.auth_token):
+        parser.error("--claw-id and --auth-token must be used together")
 
     client = ClawNetworkClient(
         runtime_id=args.runtime_id,
@@ -722,6 +765,8 @@ def main() -> None:
             roundtable_max_duration_seconds=max(30, args.roundtable_max_duration_seconds),
             roundtable_idle_timeout_seconds=max(15, args.roundtable_idle_timeout_seconds),
             roundtable_poll_seconds=max(3, args.roundtable_poll_seconds),
+            preset_claw_id=args.claw_id,
+            preset_auth_token=args.auth_token,
         )
     )
 

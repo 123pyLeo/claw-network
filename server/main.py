@@ -12,11 +12,14 @@ from fastapi.responses import StreamingResponse
 
 from . import store
 from .models import (
+    AccountRow,
     ActiveRoomRow,
     BidCreateRequest,
     BidRow,
     BountyCreateRequest,
     BountyRow,
+    BountySettlementResponse,
+    InvocationRow,
     CollaborationRequestRespond,
     CollaborationRequestRow,
     DemoParticipantRow,
@@ -66,7 +69,13 @@ app.add_middleware(
 )
 
 _RATE_LIMIT_WINDOW = 60
-_RATE_LIMIT_MAX = 30
+# Rate limit per IP per minute. 120 = 2 req/sec average.
+# Tradeoffs:
+#   - Active users typically do 30-60 req/min (commands + polling + WebSocket)
+#   - 120 leaves 2x safety margin for legitimate bursts
+#   - Verification code brute-force is independently protected (5 attempts max)
+#   - Long-term should be per-token, not per-IP, but that's a refactor
+_RATE_LIMIT_MAX = 120
 _RATE_LIMIT_LIMIT = 50
 _rate_lock = Lock()
 _rate_buckets: dict[str, list[float]] = defaultdict(list)
@@ -102,6 +111,88 @@ def _check_ws_rate_limit(ip: str) -> bool:
     return True
 
 
+# ───────── Anti-abuse: dedicated /register rate limiter ─────────
+#
+# The general _check_rate_limit() above is per-IP at 120 req/min, which is
+# fine for normal API traffic but lets a single attacker create thousands of
+# anonymous lobsters per hour. /register specifically gets a much stricter
+# limit: 5 fresh registrations per IP per hour. Loopback (local dev) is
+# exempt so internal testing isn't blocked.
+#
+# This counter is in-memory (not persisted across restarts). For our threat
+# model that's acceptable: an attacker who can restart our server has bigger
+# problems than rate limiting.
+_REGISTER_RATE_WINDOW = 3600  # 1 hour
+_REGISTER_RATE_MAX = 5
+_register_lock = Lock()
+_register_buckets: dict[str, list[float]] = defaultdict(list)
+
+
+def _is_loopback_ip(ip: str) -> bool:
+    """Whitelist localhost so internal testing / cron / health-check probes
+    don't burn through the register quota."""
+    return ip in ("127.0.0.1", "::1", "localhost", "unknown")
+
+
+def _check_register_rate_limit(ip: str) -> bool:
+    """Returns True if this IP is still under its register quota.
+    Returns False if it has hit the cap and the request should be rejected."""
+    if _is_loopback_ip(ip):
+        return True
+    now = time.monotonic()
+    cutoff = now - _REGISTER_RATE_WINDOW
+    with _register_lock:
+        timestamps = [t for t in _register_buckets[ip] if t > cutoff]
+        if len(timestamps) >= _REGISTER_RATE_MAX:
+            _register_buckets[ip] = timestamps  # keep cleaned list
+            return False
+        timestamps.append(now)
+        _register_buckets[ip] = timestamps
+    return True
+
+
+def _record_register_audit(
+    ip: str,
+    user_agent: str,
+    payload_runtime_id: str,
+    payload_name: str,
+    payload_owner_name: str,
+    success: bool,
+    reason: str | None = None,
+) -> None:
+    """Append one row to the register_audit_log table.
+
+    Logged for EVERY /register attempt — including rejected ones — so that
+    after-the-fact forensics can answer "who tried to mass-register lobsters
+    yesterday at 3am?". The table is append-only; we never UPDATE or DELETE.
+    """
+    try:
+        with store.get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO register_audit_log (
+                    id, ts, ip, user_agent, runtime_id, name, owner_name, success, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    store.new_uuid(),
+                    store.utc_now(),
+                    ip,
+                    user_agent[:200],
+                    payload_runtime_id[:128],
+                    payload_name[:128],
+                    payload_owner_name[:128],
+                    1 if success else 0,
+                    (reason or "")[:200],
+                ),
+            )
+    except Exception:
+        # Audit logging is best-effort. If the DB is sick, we still want
+        # /register to work — losing one audit row is better than losing
+        # registration availability.
+        pass
+
+
 def _message_payload(row: dict) -> dict:
     payload = dict(row)
     payload["status_label"] = store.message_status_label(str(payload.get("status", "")))
@@ -122,9 +213,17 @@ def _bearer_token_from_request(request: Request) -> str | None:
 def _require_http_auth(request: Request, claw_id: str):
     token = _bearer_token_from_request(request)
     try:
-        return store.require_auth_token(token, claw_id)
+        lobster = store.require_auth_token(token, claw_id)
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+    # Refresh last_seen_at on every successful authenticated call. This is
+    # how the dashboard's online/idle/offline indicator works — no separate
+    # heartbeat endpoint, no client changes required.
+    try:
+        store.touch_last_seen(str(lobster["id"]))
+    except Exception:
+        pass  # don't fail the request if last_seen update fails
+    return lobster
 
 
 async def _require_signature(request: Request, lobster) -> None:
@@ -208,6 +307,29 @@ def on_startup() -> None:
     bp_init(_check_rate_limit, _require_http_auth, _require_signature_if_keyed)
     app.include_router(bp_router)
 
+    # Feature: Economy (owners + accounts + invocations)
+    from features.economy.routes import router as economy_router, init_helpers as economy_init
+    from features.economy.store import ensure_economy_tables
+    ensure_economy_tables()
+    economy_init(_check_rate_limit, _require_http_auth)
+    app.include_router(economy_router)
+
+    # Feature: Platform (trusted-frontend BFF interface for sandpile-website)
+    from features.platform.routes import router as platform_router, init_helpers as platform_init
+    from features.platform.store import ensure_platform_tables, register_platform_token
+    ensure_platform_tables()
+    platform_init(_check_rate_limit)
+    app.include_router(platform_router)
+    # Seed platform token from env var. Production deployments set
+    # PLATFORM_TOKEN to a long random string and never log it.
+    import os as _os
+    _platform_token = _os.environ.get("PLATFORM_TOKEN", "").strip()
+    if _platform_token:
+        register_platform_token(
+            _platform_token,
+            _os.environ.get("PLATFORM_TOKEN_NAME", "default"),
+        )
+
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -287,6 +409,27 @@ async def stats_overview() -> StatsOverview:
 @app.post("/register", response_model=RegisterResponse)
 def register(payload: RegisterRequest, request: Request) -> RegisterResponse:
     _check_rate_limit(request)
+
+    # Anti-abuse: dedicated stricter limit on /register specifically.
+    # 5 fresh registrations per IP per hour (loopback exempt).
+    ip = request.client.host if request.client else "unknown"
+    user_agent = str(request.headers.get("user-agent") or "")
+    if not _check_register_rate_limit(ip):
+        _record_register_audit(
+            ip=ip,
+            user_agent=user_agent,
+            payload_runtime_id=payload.runtime_id,
+            payload_name=payload.name,
+            payload_owner_name=payload.owner_name,
+            success=False,
+            reason="rate_limit",
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="注册频率超限。每个 IP 每小时最多注册 5 只龙虾，请稍后重试。",
+            headers={"Retry-After": str(_REGISTER_RATE_WINDOW)},
+        )
+
     onboarding = payload.onboarding
     try:
         lobster, auto_created, auth_token = store.register_lobster(
@@ -302,7 +445,26 @@ def register(payload: RegisterRequest, request: Request) -> RegisterResponse:
             public_key=payload.public_key,
         )
     except ValueError as exc:
+        _record_register_audit(
+            ip=ip,
+            user_agent=user_agent,
+            payload_runtime_id=payload.runtime_id,
+            payload_name=payload.name,
+            payload_owner_name=payload.owner_name,
+            success=False,
+            reason=str(exc)[:200],
+        )
         raise _http_error(exc) from exc
+
+    _record_register_audit(
+        ip=ip,
+        user_agent=user_agent,
+        payload_runtime_id=payload.runtime_id,
+        payload_name=payload.name,
+        payload_owner_name=payload.owner_name,
+        success=True,
+        reason=None,
+    )
     return RegisterResponse(
         lobster=LobsterRow(**dict(lobster)),
         official_lobster=LobsterRow(**dict(store.get_official_lobster())),
@@ -404,6 +566,63 @@ def resolve_did(did: str, request: Request) -> DIDDocumentResponse:
         raise HTTPException(status_code=404, detail="DID has no associated public key.")
     doc = build_did_document(did, pk)
     return DIDDocumentResponse(document=doc)
+
+
+# ---------------------------------------------------------------------------
+# Pairing code claim — lobster side of the "接入控制台" flow
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel as _PydanticBaseModel
+
+
+class ClaimByCodeRequest(_PydanticBaseModel):
+    code: str
+
+
+@app.post("/lobsters/{claw_id}/claim-by-code")
+def claim_by_code(
+    claw_id: str, payload: ClaimByCodeRequest, request: Request
+) -> dict:
+    """A lobster claims a pairing code, binding itself to the code's owner.
+
+    Auth: lobster's own auth_token (not a platform token).
+    Body: {code: "123456"}
+
+    The code was generated by the sandpile.io console for some owner X.
+    Successfully claiming the code sets this lobster's owner_id to X.
+
+    Errors:
+      404 — code not found / typed wrong
+      410 — code expired or already used
+      409 — this lobster is already bound to a DIFFERENT owner
+    """
+    _check_rate_limit(request)
+    lobster = _require_http_auth(request, claw_id)
+    from features.economy.store import (
+        LobsterAlreadyBound,
+        PairingCodeAlreadyUsed,
+        PairingCodeExpired,
+        PairingCodeNotFound,
+        claim_pairing_code,
+    )
+    try:
+        result = claim_pairing_code(payload.code, str(lobster["id"]))
+    except PairingCodeNotFound:
+        raise HTTPException(status_code=404, detail="配对码不存在或输入错误。")
+    except PairingCodeExpired:
+        raise HTTPException(status_code=410, detail="配对码已过期，请回控制台重新生成。")
+    except PairingCodeAlreadyUsed:
+        raise HTTPException(status_code=410, detail="配对码已被使用过了。")
+    except LobsterAlreadyBound:
+        raise HTTPException(status_code=409, detail="这只龙虾已经绑定到其他账户了。")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "ok": True,
+        "owner_id": result["owner_id"],
+        "claimed_at": result["claimed_at"],
+        "claw_id": claw_id,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +1120,7 @@ async def create_bounty(payload: BountyCreateRequest, request: Request, claw_id:
             description=payload.description,
             tags=payload.tags,
             bidding_window=payload.bidding_window,
+            credit_amount=payload.credit_amount,
         )
     except ValueError as exc:
         raise _http_error(exc) from exc
@@ -968,43 +1188,114 @@ async def select_bids(bounty_id: str, payload: SelectBidsRequest, request: Reque
     lobster = _require_http_auth(request, normalized_claw_id)
     await _require_signature_if_keyed(request, lobster)
     try:
-        bounty_row, selected_bids = store.select_bids(
+        bounty_row, selected_bid, _invocation = store.select_bids(
             bounty_id=bounty_id,
             poster_claw_id=normalized_claw_id,
             bid_ids=payload.bid_ids,
         )
     except ValueError as exc:
         raise _http_error(exc) from exc
-    for bid in selected_bids:
-        bidder_claw_id = str(bid["bidder_claw_id"])
-        await manager.send_to_agent(bidder_claw_id, {
-            "event": "bounty_assigned",
-            "payload": {**dict(bounty_row), "your_bid": dict(bid)},
-        })
+    bidder_claw_id = str(selected_bid["bidder_claw_id"])
+    await manager.send_to_agent(bidder_claw_id, {
+        "event": "bounty_assigned",
+        "payload": {**dict(bounty_row), "your_bid": dict(selected_bid)},
+    })
     await _notify_bounty_subscribers("bounty_assigned", dict(bounty_row))
     return BountyRow(**dict(bounty_row))
 
 
 @app.post("/bounties/{bounty_id}/fulfill", response_model=BountyRow)
 async def fulfill_bounty(bounty_id: str, request: Request, claw_id: str) -> BountyRow:
+    """Mark a bounty as fulfilled. Caller must be the **selected bidder**.
+
+    With escrow in place, the bidder declares "work is done" but cannot
+    settle on their own behalf. The poster then has to call
+    /bounties/{id}/settlement/confirm to release the escrowed funds.
+    """
     _check_rate_limit(request)
     normalized_claw_id = claw_id.strip().upper()
     lobster = _require_http_auth(request, normalized_claw_id)
     await _require_signature_if_keyed(request, lobster)
     try:
-        row = store.fulfill_bounty(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
+        row = store.fulfill_bounty(bounty_id=bounty_id, bidder_claw_id=normalized_claw_id)
     except ValueError as exc:
         raise _http_error(exc) from exc
     bounty_dict = dict(row)
-    selected_bids = store.list_bids(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
-    for bid in selected_bids:
-        if str(bid["status"]) == "selected":
-            await manager.send_to_agent(str(bid["bidder_claw_id"]), {
-                "event": "bounty_fulfilled",
-                "payload": bounty_dict,
-            })
+    # Notify the poster they need to confirm settlement.
+    await manager.send_to_agent(str(bounty_dict["poster_claw_id"]), {
+        "event": "bounty_fulfilled",
+        "payload": bounty_dict,
+    })
     await _notify_bounty_subscribers("bounty_fulfilled", bounty_dict)
     return BountyRow(**bounty_dict)
+
+
+@app.post("/bounties/{bounty_id}/settlement/confirm", response_model=BountySettlementResponse)
+async def confirm_bounty_settlement(bounty_id: str, request: Request, claw_id: str) -> BountySettlementResponse:
+    """Poster confirms delivery and releases escrowed funds to the bidder."""
+    _check_rate_limit(request)
+    normalized_claw_id = claw_id.strip().upper()
+    lobster = _require_http_auth(request, normalized_claw_id)
+    await _require_signature_if_keyed(request, lobster)
+    try:
+        bounty_row, invocation = store.confirm_bounty_settlement(
+            bounty_id=bounty_id,
+            poster_claw_id=normalized_claw_id,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    bounty_dict = dict(bounty_row)
+    # Notify both sides that the money has moved.
+    if invocation is not None:
+        try:
+            with store.get_conn() as _conn:
+                payee_lobster = _conn.execute(
+                    "SELECT claw_id FROM lobsters WHERE owner_id = ? LIMIT 1",
+                    (invocation["callee_owner_id"],),
+                ).fetchone()
+            if payee_lobster is not None:
+                await manager.send_to_agent(str(payee_lobster["claw_id"]), {
+                    "event": "bounty_settled",
+                    "payload": bounty_dict,
+                })
+        except Exception:
+            pass
+    await manager.send_to_agent(normalized_claw_id, {
+        "event": "bounty_settled",
+        "payload": bounty_dict,
+    })
+    await _notify_bounty_subscribers("bounty_settled", bounty_dict)
+    return BountySettlementResponse(
+        bounty=BountyRow(**bounty_dict),
+        invocation=InvocationRow(**invocation) if invocation is not None else None,
+    )
+
+
+@app.get("/lobsters/{claw_id}/bounties/pending-confirmation", response_model=list[BountyRow])
+def list_pending_confirmation_bounties(claw_id: str, request: Request) -> list[BountyRow]:
+    """Bounties posted by this lobster that are awaiting settlement confirmation."""
+    _check_rate_limit(request)
+    normalized = claw_id.strip().upper()
+    _require_http_auth(request, normalized)
+    try:
+        rows = store.list_bounties_pending_confirmation_for_poster(normalized)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return [BountyRow(**dict(row)) for row in rows]
+
+
+@app.get("/lobsters/{claw_id}/account", response_model=AccountRow)
+def get_lobster_account(claw_id: str, request: Request) -> AccountRow:
+    """Read the credit account state for a lobster's owner."""
+    _check_rate_limit(request)
+    normalized = claw_id.strip().upper()
+    _require_http_auth(request, normalized)
+    from features.economy.store import get_account_state_by_claw_id
+    try:
+        state = get_account_state_by_claw_id(normalized)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return AccountRow(**state)
 
 
 @app.post("/bounties/{bounty_id}/cancel", response_model=BountyRow)
@@ -1152,10 +1443,18 @@ async def websocket_connect(websocket: WebSocket, claw_id: str) -> None:
         return
     token = auth_msg.get("token")
     try:
-        store.require_auth_token(token, claw_id.strip().upper())
+        ws_lobster = store.require_auth_token(token, claw_id.strip().upper())
     except ValueError as exc:
         await websocket.close(code=4401, reason=str(exc))
         return
+    # Same last_seen behavior as HTTP middleware: every successful WS auth
+    # marks the lobster as recently active. Without this, sidecar-driven
+    # lobsters that only ever hold a WS connection (no REST calls) would
+    # appear permanently offline on the dashboard.
+    try:
+        store.touch_last_seen(str(ws_lobster["id"]))
+    except Exception:
+        pass
 
     claw_id = claw_id.strip().upper()
     await manager.connect(claw_id, websocket)

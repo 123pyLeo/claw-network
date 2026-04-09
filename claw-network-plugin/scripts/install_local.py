@@ -186,7 +186,32 @@ def main() -> None:
         "--sidecar-script",
         default=str(_project_dir / "claw-network-plugin" / "scripts" / "sidecar_runner.py"),
     )
+    # ─── Credentials mode ───────────────────────────────────────────────
+    # If both are provided, install_local skips the onboarding flow entirely
+    # and writes the supplied identity into the plugin config. The generated
+    # next_step also includes --claw-id / --auth-token so the sidecar boots
+    # in credentials mode (sidecar_runner.py supports them since 2026-04-08).
+    # Used by sandpile-website's web-registration path.
+    parser.add_argument("--claw-id", default=None,
+                        help="Pre-issued CLAW ID. Use with --auth-token to adopt an identity created elsewhere instead of registering a new one.")
+    parser.add_argument("--auth-token", default=None,
+                        help="Pre-issued auth token. See --claw-id.")
     args = parser.parse_args()
+
+    # Credentials mode validation: both args must come together,
+    # and require explicit identity (no auto-generation, no prompts).
+    if bool(args.claw_id) != bool(args.auth_token):
+        parser.error("--claw-id and --auth-token must be used together")
+    credentials_mode = bool(args.claw_id and args.auth_token)
+    if credentials_mode:
+        if not args.runtime_id:
+            parser.error("--runtime-id is required in credentials mode (use the runtime_id you got from sandpile-website)")
+        if not args.name or not args.owner_name:
+            parser.error("--name and --owner-name are required in credentials mode")
+        # Force --no-onboarding semantics: identity is already settled,
+        # the lobster row already exists on the server, prompting would
+        # be confusing and the answers would be ignored anyway.
+        args.no_onboarding = True
 
     openclaw_home = Path(args.openclaw_home).expanduser().resolve()
     source_dir = Path(args.source_dir).resolve()
@@ -296,59 +321,119 @@ def main() -> None:
     plugin_config["ownerName"] = resolved_owner_name
     if "onboarding" in plugin_config:
         plugin_config["onboarding"] = onboarding
+    # In credentials mode, persist the pre-issued identity into the plugin
+    # config too. This is mainly for transparency / debugging — the actual
+    # auth path goes through the local profile DB that the sidecar populates
+    # via import_credentials().
+    if credentials_mode:
+        plugin_config["clawId"] = args.claw_id
+        plugin_config["authToken"] = args.auth_token
     write_json(config_path, config)
 
     print()
-    print("已完成你的入网设置：")
-    print()
-    print(f"- 谁可以加你：{summarize_choice(onboarding.get('connectionRequestPolicy', '未设置'), connection_policy_labels)}")
-    print(f"- 协作授权：{summarize_choice(onboarding.get('collaborationPolicy', '未设置'), collaboration_policy_labels)}")
-    print(f"- 官方龙虾权限：{summarize_choice(onboarding.get('officialLobsterPolicy', '未设置'), official_policy_labels)}")
-    print(f"- 单次协作限制：{summarize_choice(onboarding.get('sessionLimitPolicy', '未设置'), session_limit_labels)}")
-    print()
-    print("默认安全规则已启用：")
-    print("- 高风险能力默认禁止")
-    print("- 敏感请求自动拦截")
-    print("- 最小数据原则默认开启")
-    print("- 异常会话自动中止")
-    print()
-    print(f"你的龙虾 ID：安装完成并首次连网后生成")
-    print("你已连接官方龙虾：零动涌现的龙虾")
-    print()
-    print("推荐固定触发词：")
-    print("- 我的龙虾ID")
-    print("- 加龙虾 XXX")
-    print("- 问龙虾 XXX：YYY")
-    print("- 审批时直接回复 1 / 2 / 3")
-    print()
-    print("数字审批说明：")
-    print("- 1 = 本次允许")
-    print("- 2 = 长期允许")
-    print("- 3 = 拒绝")
-    print()
-    print(
-        json.dumps(
-            {
-                "installed_plugin_dir": str(plugin_dir),
-                "updated_config": str(config_path),
-                "runtime_id": resolved_runtime_id,
-                "name": resolved_name,
-                "owner_name": resolved_owner_name,
-                "onboarding": onboarding,
-                "next_step": (
-                    f"{args.python_bin} {args.sidecar_script} --endpoint {args.endpoint}"
-                    f" --runtime-id {resolved_runtime_id} --name {resolved_name}"
-                    f" --owner-name {resolved_owner_name} --data-dir {args.data_dir}"
-                    f" --connection-request-policy {onboarding.get('connectionRequestPolicy', 'known_name_or_id_only')}"
-                    f" --collaboration-policy {onboarding.get('collaborationPolicy', 'confirm_every_time')}"
-                    f" --official-lobster-policy {onboarding.get('officialLobsterPolicy', 'low_risk_auto_allow')}"
-                    f" --session-limit-policy {onboarding.get('sessionLimitPolicy', '10_turns_3_minutes')}"
-                ),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
+    if credentials_mode:
+        print("已完成凭证模式安装：")
+        print()
+        print(f"- CLAW ID：{args.claw_id}")
+        print(f"- 龙虾名称：{resolved_name}")
+        print(f"- 主人名称：{resolved_owner_name}")
+        print(f"- 接入地址：{args.endpoint}")
+        print()
+        print("无需重新注册——sidecar 启动后会用这组凭证直接接入。")
+        print("这只 agent 已经绑定到你的 sandpile.io 账户，登录控制台即可看到。")
+        print()
+    else:
+        print("已完成你的入网设置：")
+        print()
+        print(f"- 谁可以加你：{summarize_choice(onboarding.get('connectionRequestPolicy', '未设置'), connection_policy_labels)}")
+        print(f"- 协作授权：{summarize_choice(onboarding.get('collaborationPolicy', '未设置'), collaboration_policy_labels)}")
+        print(f"- 官方龙虾权限：{summarize_choice(onboarding.get('officialLobsterPolicy', '未设置'), official_policy_labels)}")
+        print(f"- 单次协作限制：{summarize_choice(onboarding.get('sessionLimitPolicy', '未设置'), session_limit_labels)}")
+        print()
+        print("默认安全规则已启用：")
+        print("- 高风险能力默认禁止")
+        print("- 敏感请求自动拦截")
+        print("- 最小数据原则默认开启")
+        print("- 异常会话自动中止")
+        print()
+        print(f"你的龙虾 ID：安装完成并首次连网后生成")
+        print("你已连接官方龙虾：零动涌现的龙虾")
+        print()
+        print("推荐固定触发词：")
+        print("- 我的龙虾ID")
+        print("- 加龙虾 XXX")
+        print("- 问龙虾 XXX：YYY")
+        print("- 审批时直接回复 1 / 2 / 3")
+        print()
+        print("数字审批说明：")
+        print("- 1 = 本次允许")
+        print("- 2 = 长期允许")
+        print("- 3 = 拒绝")
+        print()
+        print("───────────────────────────────────────────────────────")
+        print("💡 想在网页控制台管理这只龙虾？")
+        print("───────────────────────────────────────────────────────")
+        print("这只龙虾现在是「匿名」状态——网络里能用,但 sandpile.io")
+        print("控制台暂时看不到它(因为还没绑定到你的账户)。")
+        print()
+        print("接入步骤(任选其一):")
+        print()
+        print("【方式 A:控制台一键接入】(推荐,不依赖短信)")
+        print("  1. 登录 https://www.sandpile.io")
+        print("  2. 点 dashboard 的「我已经在 OpenClaw 有龙虾」按钮")
+        print("  3. 复制弹出的 6 位配对码")
+        print("  4. 回到 OpenClaw 对话框,说:")
+        print("       沙堆 接入控制台 XXXXXX")
+        print("  5. 控制台立刻就能看到这只龙虾")
+        print()
+        print("【方式 B:对话框直接验证手机号】(需要短信)")
+        print("  1. 在 OpenClaw 对话框说:")
+        print("       沙堆 验证手机 13800001111")
+        print("  2. 等收到验证码后说:")
+        print("       沙堆 验证码 13800001111 XXXXXX")
+        print()
+
+    # Build the next_step command. Always common: endpoint, runtime, name,
+    # owner, data dir. In credentials mode add --claw-id/--auth-token (so
+    # sidecar imports the identity instead of registering). Otherwise add
+    # the onboarding policy flags.
+    next_step_parts = [
+        f"{args.python_bin} {args.sidecar_script}",
+        f"--endpoint {args.endpoint}",
+        f"--runtime-id {resolved_runtime_id}",
+        f"--name {resolved_name}",
+        f"--owner-name {resolved_owner_name}",
+        f"--data-dir {args.data_dir}",
+    ]
+    if credentials_mode:
+        next_step_parts.append(f"--claw-id {args.claw_id}")
+        next_step_parts.append(f"--auth-token {args.auth_token}")
+    else:
+        next_step_parts.extend([
+            f"--connection-request-policy {onboarding.get('connectionRequestPolicy', 'known_name_or_id_only')}",
+            f"--collaboration-policy {onboarding.get('collaborationPolicy', 'confirm_every_time')}",
+            f"--official-lobster-policy {onboarding.get('officialLobsterPolicy', 'low_risk_auto_allow')}",
+            f"--session-limit-policy {onboarding.get('sessionLimitPolicy', '10_turns_3_minutes')}",
+        ])
+    next_step = " ".join(next_step_parts)
+
+    result_payload = {
+        "installed_plugin_dir": str(plugin_dir),
+        "updated_config": str(config_path),
+        "runtime_id": resolved_runtime_id,
+        "name": resolved_name,
+        "owner_name": resolved_owner_name,
+        "onboarding": onboarding,
+        "credentials_mode": credentials_mode,
+        "next_step": next_step,
+    }
+    if credentials_mode:
+        # Surface the CLAW ID at the top level too — it's the most
+        # useful piece of info for downstream tooling, and in credentials
+        # mode we already know it without waiting for sidecar to register.
+        result_payload["claw_id"] = args.claw_id
+
+    print(json.dumps(result_payload, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

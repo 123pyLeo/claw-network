@@ -273,12 +273,50 @@ def init_db() -> None:
         _ensure_column(conn, "lobsters", "role_verified_at", "TEXT")
         _ensure_column(conn, "lobsters", "verified_email", "TEXT")
         _ensure_column(conn, "lobsters", "email_verified_at", "TEXT")
+        _ensure_column(conn, "lobsters", "owner_id", "TEXT")
+        # Platform / web-registration support (added for sandpile-website BFF)
+        _ensure_column(conn, "lobsters", "last_seen_at", "TEXT")
+        _ensure_column(conn, "lobsters", "registration_source", "TEXT NOT NULL DEFAULT 'agent_self'")
+        _ensure_column(conn, "lobsters", "deleted_at", "TEXT")
+        _ensure_column(conn, "lobsters", "description", "TEXT")
+        _ensure_column(conn, "lobsters", "model_hint", "TEXT")
+        # Audit log of every /register attempt (success and failure both).
+        # Append-only — used for incident forensics, never read in the
+        # request path. Rotated/archived externally.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS register_audit_log (
+                id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                user_agent TEXT,
+                runtime_id TEXT,
+                name TEXT,
+                owner_name TEXT,
+                success INTEGER NOT NULL,
+                reason TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_register_audit_ts ON register_audit_log(ts)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_register_audit_ip ON register_audit_log(ip, ts)"
+        )
         _ensure_column(conn, "message_events", "room_id", "TEXT")
         _ensure_column(conn, "message_events", "room_message_id", "TEXT")
         _ensure_column(conn, "verification_codes", "attempts", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "bounties", "credit_amount", "INTEGER NOT NULL DEFAULT 0")
+        # Escrow link: when a paid bounty is selected, an invocation row is
+        # created in the economy.invocations table with settlement_status='reserved'.
+        # We pin it here so confirm/cancel can find it without re-querying.
+        _ensure_column(conn, "bounties", "invocation_id", "TEXT")
         # Unique indexes for identity columns (CREATE INDEX IF NOT EXISTS is safe to re-run)
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lobsters_did ON lobsters(did) WHERE did IS NOT NULL")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lobsters_verified_phone ON lobsters(verified_phone) WHERE verified_phone IS NOT NULL")
+        # Note: phone uniqueness moved to owners table (one phone = one owner,
+        # but one owner can have multiple lobsters). Drop old unique index if present.
+        conn.execute("DROP INDEX IF EXISTS idx_lobsters_verified_phone")
     seed_official_lobster()
     seed_public_rooms()
 
@@ -343,30 +381,40 @@ def _lobster_by_runtime_id(runtime_id: str) -> sqlite3.Row | None:
                    did, public_key, key_algorithm,
                    verified_phone, phone_verified_at,
                    role, org_name, real_name, role_verified, role_verified_at, verified_email, email_verified_at,
+                   owner_id,
+                   last_seen_at, registration_source, deleted_at, description, model_hint,
                    created_at, updated_at
             FROM lobsters
-            WHERE runtime_id = ?
+            WHERE runtime_id = ? AND deleted_at IS NULL
             """,
             (runtime_id,),
         ).fetchone()
 
 
-def get_lobster_by_claw_id(claw_id: str) -> sqlite3.Row | None:
+def get_lobster_by_claw_id(claw_id: str, *, include_deleted: bool = False) -> sqlite3.Row | None:
+    """Look up a lobster by CLAW ID.
+
+    By default, soft-deleted lobsters (deleted_at IS NOT NULL) are excluded.
+    Pass include_deleted=True to include them — useful for historical queries
+    such as showing "OpsPilot (deleted)" in past invocation lists.
+    """
+    sql = """
+        SELECT id, runtime_id, claw_id, name, owner_name, is_official,
+               connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
+               auth_token, token_updated_at,
+               did, public_key, key_algorithm,
+               verified_phone, phone_verified_at,
+               role, org_name, real_name, role_verified, role_verified_at, verified_email, email_verified_at,
+               owner_id,
+               last_seen_at, registration_source, deleted_at, description, model_hint,
+               created_at, updated_at
+        FROM lobsters
+        WHERE claw_id = ?
+    """
+    if not include_deleted:
+        sql += " AND deleted_at IS NULL"
     with get_conn() as conn:
-        return conn.execute(
-            """
-            SELECT id, runtime_id, claw_id, name, owner_name, is_official,
-                   connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
-                   auth_token, token_updated_at,
-                   did, public_key, key_algorithm,
-                   verified_phone, phone_verified_at,
-                   role, org_name, real_name, role_verified, role_verified_at, verified_email, email_verified_at,
-                   created_at, updated_at
-            FROM lobsters
-            WHERE claw_id = ?
-            """,
-            (claw_id.strip().upper(),),
-        ).fetchone()
+        return conn.execute(sql, (claw_id.strip().upper(),)).fetchone()
 
 
 def update_lobster_profile(claw_id: str, *, name: str, owner_name: str) -> sqlite3.Row:
@@ -425,6 +473,11 @@ def _new_auth_token() -> str:
 
 
 def get_lobster_by_token(token: str) -> sqlite3.Row | None:
+    """Look up a lobster by auth token.
+
+    Soft-deleted lobsters are always excluded — a deleted lobster's token
+    must not authenticate successfully, even if the token row still exists.
+    """
     with get_conn() as conn:
         return conn.execute(
             """
@@ -434,9 +487,11 @@ def get_lobster_by_token(token: str) -> sqlite3.Row | None:
                    did, public_key, key_algorithm,
                    verified_phone, phone_verified_at,
                    role, org_name, real_name, role_verified, role_verified_at, verified_email, email_verified_at,
+                   owner_id,
+                   last_seen_at, registration_source, deleted_at, description, model_hint,
                    created_at, updated_at
             FROM lobsters
-            WHERE auth_token = ?
+            WHERE auth_token = ? AND deleted_at IS NULL
             """,
             (token.strip(),),
         ).fetchone()
@@ -471,6 +526,200 @@ def require_auth_token(token: str | None, claw_id: str) -> sqlite3.Row:
     if str(lobster["claw_id"]).strip().upper() != claw_id.strip().upper():
         raise ValueError("Auth token does not match the requested lobster.")
     return lobster
+
+
+def touch_last_seen(lobster_id: str) -> None:
+    """Update last_seen_at to now. Called by auth middleware on every successful request.
+
+    Cheap fire-and-forget UPDATE — even at high volume, single-row UPDATE on
+    a primary-key match is negligible cost in SQLite WAL mode.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE lobsters SET last_seen_at = ? WHERE id = ? AND deleted_at IS NULL",
+            (utc_now(), lobster_id),
+        )
+
+
+def soft_delete_lobster(claw_id: str) -> sqlite3.Row:
+    """Mark a lobster as deleted (soft delete).
+
+    After this:
+      - The lobster is filtered out of all default lobster queries
+      - Its auth_token will no longer authenticate (get_lobster_by_token excludes it)
+      - It is preserved in the DB so historical references (invocations,
+        message_events) can still resolve it via include_deleted=True
+    """
+    claw_id = claw_id.strip().upper()
+    now = utc_now()
+    lobster = get_lobster_by_claw_id(claw_id)
+    if lobster is None:
+        raise ValueError("Lobster not found or already deleted.")
+    if int(lobster["is_official"] or 0) == 1:
+        raise ValueError("Cannot delete the official lobster.")
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE lobsters SET deleted_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, str(lobster["id"])),
+        )
+    # Re-read with include_deleted to return the soft-deleted row
+    row = get_lobster_by_claw_id(claw_id, include_deleted=True)
+    assert row is not None
+    return row
+
+
+def reset_lobster_auth_token(claw_id: str) -> tuple[sqlite3.Row, str]:
+    """Generate a new auth_token for a lobster, invalidating the old one.
+
+    The previous token is overwritten in-place — there is no revocation
+    list. Old token immediately fails authentication on next use.
+
+    Returns (lobster_row, new_token_value).
+    """
+    claw_id = claw_id.strip().upper()
+    lobster = get_lobster_by_claw_id(claw_id)
+    if lobster is None:
+        raise ValueError("Lobster not found or deleted.")
+    new_token = _new_auth_token()
+    now = utc_now()
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE lobsters SET auth_token = ?, token_updated_at = ?, updated_at = ? WHERE id = ?",
+            (new_token, now, now, str(lobster["id"])),
+        )
+    row = get_lobster_by_claw_id(claw_id)
+    assert row is not None
+    return row, new_token
+
+
+def register_lobster_for_owner(
+    *,
+    owner_id: str,
+    name: str,
+    owner_name: str,
+    runtime_id: str | None = None,
+    description: str | None = None,
+    model_hint: str | None = None,
+    registration_source: str = "web",
+) -> tuple[sqlite3.Row, str]:
+    """Create a lobster directly attached to an existing owner.
+
+    This bypasses the normal `register_lobster` self-registration flow.
+    Used by the platform / web-registration path: the website BFF has
+    already authenticated the owner via phone code, so the new lobster
+    can be linked immediately without going through the join_request
+    二次确认 dance.
+
+    Returns (lobster_row, auth_token).
+    """
+    cleaned_name = " ".join(name.strip().split())
+    cleaned_owner_name = (owner_name or "").strip()
+    if not cleaned_name:
+        raise ValueError("Lobster name cannot be empty.")
+    if not owner_id:
+        raise ValueError("owner_id is required.")
+    if registration_source not in ("web", "agent_self", "platform"):
+        raise ValueError(f"Unknown registration_source: {registration_source}")
+
+    # Resolve the owner's canonical nickname.
+    #   - If owner already has a nickname → use it; ignore the typed
+    #     cleaned_owner_name entirely. The canonical wins.
+    #   - If owner has no nickname AND a value was typed → seed the nickname
+    #     from the typed value (with global uniqueness check).
+    #   - If owner has no nickname AND nothing was typed → error: this is
+    #     the user's very first lobster, they MUST pick a nickname.
+    from features.economy.store import (
+        OwnerNicknameTakenError,
+        ensure_owner_nickname,
+        get_owner_by_id,
+    )
+    existing_owner = get_owner_by_id(owner_id)
+    if existing_owner is None:
+        raise ValueError(f"Owner not found: {owner_id}")
+    existing_nickname = (existing_owner.get("nickname") or "").strip()
+    if existing_nickname:
+        # Owner already has a nickname — that's the canonical value.
+        canonical_owner_name = existing_nickname
+    elif cleaned_owner_name:
+        # First lobster: seed nickname from the typed value (uniqueness check
+        # happens inside ensure_owner_nickname; raises OwnerNicknameTakenError
+        # on conflict).
+        canonical_owner_name = ensure_owner_nickname(owner_id, cleaned_owner_name)
+    else:
+        raise ValueError("Owner name cannot be empty for first-time registration.")
+    cleaned_owner_name = canonical_owner_name
+
+    # Generate a runtime_id if none was provided. Web-registered lobsters
+    # don't have a sidecar runtime yet, so we synthesize one.
+    if not runtime_id:
+        runtime_id = f"web-{secrets.token_urlsafe(12)}"
+    runtime_id = runtime_id.strip()
+
+    now = utc_now()
+    with get_conn() as conn:
+        # Owner existence already verified in ensure_owner_real_name above
+
+        # Name uniqueness check (across non-deleted lobsters)
+        normalized = _normalize_lobster_name(cleaned_name)
+        conflicting = _find_lobster_by_normalized_name(conn, normalized)
+        if conflicting is not None:
+            raise _lobster_name_taken_error(cleaned_name)
+
+        # Runtime_id uniqueness check
+        existing = conn.execute(
+            "SELECT id FROM lobsters WHERE runtime_id = ? AND deleted_at IS NULL",
+            (runtime_id,),
+        ).fetchone()
+        if existing is not None:
+            raise ValueError(f"runtime_id already in use: {runtime_id}")
+
+        claw_id = _generate_claw_id(conn)
+        lobster_id = new_uuid()
+        issued_token = _new_auth_token()
+        conn.execute(
+            """
+            INSERT INTO lobsters (
+                id, runtime_id, claw_id, name, owner_name, is_official,
+                connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
+                auth_token, token_updated_at,
+                owner_id,
+                registration_source, description, model_hint,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                lobster_id,
+                runtime_id,
+                claw_id,
+                cleaned_name,
+                cleaned_owner_name,
+                DEFAULT_CONNECTION_REQUEST_POLICY,
+                DEFAULT_COLLABORATION_POLICY,
+                DEFAULT_OFFICIAL_LOBSTER_POLICY,
+                DEFAULT_SESSION_LIMIT_POLICY,
+                DEFAULT_ROUNDTABLE_NOTIFICATION_MODE,
+                issued_token,
+                now,
+                owner_id,
+                registration_source,
+                description,
+                model_hint,
+                now,
+                now,
+            ),
+        )
+
+    # Auto-friend the official lobster, like normal registration does
+    lobster = _lobster_by_runtime_id(runtime_id)
+    assert lobster is not None
+    try:
+        official = get_official_lobster()
+        ensure_friendship(lobster["id"], official["id"])
+    except Exception:
+        pass  # don't fail registration if friending fails
+
+    return lobster, issued_token
 
 
 def get_official_lobster() -> sqlite3.Row:
@@ -726,6 +975,7 @@ def get_lobster_by_did(did: str) -> sqlite3.Row | None:
                    did, public_key, key_algorithm,
                    verified_phone, phone_verified_at,
                    role, org_name, real_name, role_verified, role_verified_at, verified_email, email_verified_at,
+                   owner_id,
                    created_at, updated_at
             FROM lobsters
             WHERE did = ?
@@ -770,7 +1020,17 @@ def get_last_sent_time(lobster_id: str, phone: str) -> str | None:
 
 
 def verify_phone(claw_id: str, phone: str, code: str) -> sqlite3.Row:
-    """Verify a phone number with a code. Returns updated lobster row."""
+    """Verify a phone number with a code. Returns updated lobster row.
+
+    DEV MODE (CLAW_DEV_LOGIN=1): the actual code value is NOT checked. Any
+    non-empty code is accepted. Mirrors the platform-side bypass we have on
+    /platform/verify-phone, so the OpenClaw chat command 沙堆 验证手机 138xxx
+    works in test mode without a real SMS provider. Production (env var
+    unset) keeps the strict code+attempts+expiry checks.
+    """
+    import os
+    dev_mode = os.environ.get("CLAW_DEV_LOGIN", "").strip() == "1"
+
     lobster = get_lobster_by_claw_id(claw_id)
     if lobster is None:
         raise ValueError("Lobster not found.")
@@ -782,46 +1042,147 @@ def verify_phone(claw_id: str, phone: str, code: str) -> sqlite3.Row:
 
     now = utc_now()
     with get_conn() as conn:
-        # Find valid unexpired unused code
-        row = conn.execute(
-            """
-            SELECT * FROM verification_codes
-            WHERE lobster_id = ? AND phone = ? AND used = 0 AND expires_at > ?
-            ORDER BY created_at DESC LIMIT 1
-            """,
-            (lobster_id, phone, now),
-        ).fetchone()
-        if row is None:
-            raise ValueError("验证码无效或已过期，请重新发送。")
+        if dev_mode:
+            # Skip code lookup + attempts + comparison entirely.
+            # Just invalidate any pending codes and write the verified_phone.
+            conn.execute(
+                "UPDATE verification_codes SET used = 1 WHERE lobster_id = ? AND phone = ? AND used = 0",
+                (lobster_id, phone),
+            )
+        else:
+            # Find valid unexpired unused code
+            row = conn.execute(
+                """
+                SELECT * FROM verification_codes
+                WHERE lobster_id = ? AND phone = ? AND used = 0 AND expires_at > ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (lobster_id, phone, now),
+            ).fetchone()
+            if row is None:
+                raise ValueError("验证码无效或已过期，请重新发送。")
 
-        # Brute-force protection: max 5 attempts per code
-        attempts = int(row["attempts"])
-        if attempts >= 5:
-            conn.execute("UPDATE verification_codes SET used = 1 WHERE id = ?", (row["id"],))
-            conn.commit()  # Must commit before raising — 'with' rollbacks on exception
-            raise ValueError("验证码错误次数过多，请重新发送。")
+            # Brute-force protection: max 5 attempts per code
+            attempts = int(row["attempts"])
+            if attempts >= 5:
+                conn.execute("UPDATE verification_codes SET used = 1 WHERE id = ?", (row["id"],))
+                conn.commit()  # Must commit before raising — 'with' rollbacks on exception
+                raise ValueError("验证码错误次数过多，请重新发送。")
 
-        if str(row["code"]) != code.strip():
-            conn.execute("UPDATE verification_codes SET attempts = ? WHERE id = ?", (attempts + 1, row["id"]))
-            conn.commit()  # Must commit before raising
-            raise ValueError("验证码错误。")
+            if str(row["code"]) != code.strip():
+                conn.execute("UPDATE verification_codes SET attempts = ? WHERE id = ?", (attempts + 1, row["id"]))
+                conn.commit()  # Must commit before raising
+                raise ValueError("验证码错误。")
 
-        # Phone uniqueness: one phone can only verify one lobster
-        conflict = conn.execute(
-            "SELECT claw_id FROM lobsters WHERE verified_phone = ? AND id != ?",
-            (phone, lobster_id),
-        ).fetchone()
-        if conflict is not None:
-            raise ValueError("该手机号已被其他龙虾绑定。")
+            # Mark ALL codes for this lobster+phone as used (invalidate old codes)
+            conn.execute("UPDATE verification_codes SET used = 1 WHERE lobster_id = ? AND phone = ?", (lobster_id, phone))
 
-        # Mark ALL codes for this lobster+phone as used (Bug 7: invalidate old codes)
-        conn.execute("UPDATE verification_codes SET used = 1 WHERE lobster_id = ? AND phone = ?", (lobster_id, phone))
-
-        # Update lobster
+        # Update lobster (both dev_mode and prod paths land here)
         conn.execute(
             "UPDATE lobsters SET verified_phone = ?, phone_verified_at = ?, updated_at = ? WHERE id = ?",
             (phone, now, now, lobster_id),
         )
+
+    # After phone verification: handle owner linkage
+    # SECURITY MODEL:
+    # - First lobster on this phone → create new owner + open account, link directly
+    # - Subsequent lobsters on same phone → create a join_request, require existing
+    #   lobster to approve via 沙堆 同意加入 XXX
+    join_request_id = None
+    auto_linked = False
+    try:
+        from features.economy.store import (
+            get_or_create_owner_by_phone,
+            link_lobster_to_owner,
+            create_join_request,
+            list_lobsters_for_owner,
+        )
+
+        # Check if an owner already exists for this phone
+        with get_conn() as conn:
+            existing_owner_row = conn.execute(
+                "SELECT id FROM owners WHERE auth_phone = ?", (phone,)
+            ).fetchone()
+
+        if existing_owner_row is None:
+            # First time: create owner, open account, link lobster directly.
+            # Seed owner.real_name from lobster.real_name (legal name from
+            # role verification, optional). Then ALSO seed owner.nickname
+            # from lobster.owner_name — this is the canonical "what the
+            # network calls this person". Conflicts are resolved by
+            # ensure_owner_nickname raising; we swallow it here so phone
+            # verification doesn't fail just because the user happens to
+            # have picked a popular nickname (they can change it later).
+            owner = get_or_create_owner_by_phone(phone, real_name=str(lobster["real_name"] or "") or None)
+            link_lobster_to_owner(lobster_id, str(owner["id"]))
+            try:
+                from features.economy.store import (
+                    OwnerNicknameTakenError,
+                    ensure_owner_nickname,
+                )
+                lobster_owner_name = str(lobster["owner_name"] or "").strip()
+                if lobster_owner_name:
+                    try:
+                        ensure_owner_nickname(str(owner["id"]), lobster_owner_name)
+                    except OwnerNicknameTakenError:
+                        # Auto-suffix to make unique. Best-effort.
+                        for suffix in range(1, 100):
+                            try:
+                                ensure_owner_nickname(
+                                    str(owner["id"]),
+                                    f"{lobster_owner_name}{suffix:02d}",
+                                )
+                                break
+                            except OwnerNicknameTakenError:
+                                continue
+            except Exception:
+                pass  # nickname seeding is best-effort, never blocks phone verification
+            auto_linked = True
+        else:
+            existing_owner_id = str(existing_owner_row["id"])
+            # Check if this lobster is already linked to the same owner (re-verification)
+            current_owner = str(lobster["owner_id"] or "")
+            if current_owner == existing_owner_id:
+                # Same lobster verifying same phone again → no-op
+                pass
+            else:
+                # Different lobster trying to join → create join request
+                existing_lobsters = list_lobsters_for_owner(existing_owner_id)
+                if not existing_lobsters:
+                    # Edge case: orphan owner with no lobsters → link directly
+                    link_lobster_to_owner(lobster_id, existing_owner_id)
+                    auto_linked = True
+                else:
+                    join_req = create_join_request(lobster_id, existing_owner_id, phone)
+                    join_request_id = join_req["id"]
+                    # Notify all existing lobsters about the join request
+                    requesting_name = str(lobster["name"] or "未命名")
+                    msg = (
+                        f"━━ 账户加入申请 ━━\n"
+                        f"有一只新龙虾想加入你的账户：\n"
+                        f"  名字：{requesting_name}\n"
+                        f"  CLAW ID：{lobster['claw_id']}\n"
+                        f"  申请ID：{join_request_id}\n\n"
+                        f"如果是你本人操作，回复：\n"
+                        f"  沙堆 同意加入 {join_request_id}\n"
+                        f"如果不是你，回复：\n"
+                        f"  沙堆 拒绝加入 {join_request_id}\n\n"
+                        f"24 小时后自动过期。"
+                    )
+                    for existing_lob in existing_lobsters:
+                        try:
+                            # Use record_event directly to bypass friendship requirement
+                            record_event(
+                                event_type="owner_join_request",
+                                from_lobster_id=lobster_id,
+                                to_lobster_id=str(existing_lob["id"]),
+                                content=msg,
+                                status="queued",
+                            )
+                        except Exception:
+                            pass  # don't fail verification if notification fails
+    except ImportError:
+        pass
 
     result = get_lobster_by_claw_id(claw_id)
     assert result is not None
@@ -834,16 +1195,18 @@ def search_lobsters(query: str | None = None, limit: int = 100) -> list[sqlite3.
                connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
                did, public_key, key_algorithm,
                verified_phone, phone_verified_at,
+               last_seen_at, registration_source, deleted_at,
                created_at, updated_at
         FROM lobsters
+        WHERE deleted_at IS NULL
     """
     params: list[object] = []
     if query:
         normalized = f"%{query.strip().lower()}%"
         sql += """
-            WHERE lower(claw_id) LIKE ?
+            AND (lower(claw_id) LIKE ?
                OR lower(name) LIKE ?
-               OR lower(owner_name) LIKE ?
+               OR lower(owner_name) LIKE ?)
         """
         params.extend([normalized, normalized, normalized])
     sql += " ORDER BY is_official DESC, updated_at DESC LIMIT ?"
@@ -1819,7 +2182,7 @@ def stats_overview() -> dict[str, int | str]:
         )
         bounties_total = int(conn.execute("SELECT COUNT(*) FROM bounties").fetchone()[0])
         bounties_fulfilled = int(
-            conn.execute("SELECT COUNT(*) FROM bounties WHERE status = 'fulfilled'").fetchone()[0]
+            conn.execute("SELECT COUNT(*) FROM bounties WHERE status IN ('fulfilled', 'settled')").fetchone()[0]
         )
         bounties_active = int(
             conn.execute("SELECT COUNT(*) FROM bounties WHERE status IN ('open', 'bidding', 'assigned')").fetchone()[0]
@@ -1872,6 +2235,7 @@ def list_official_broadcast_targets(*, online_claw_ids: set[str] | None = None, 
                    did, public_key, key_algorithm,
                    verified_phone, phone_verified_at,
                    role, org_name, real_name, role_verified, role_verified_at, verified_email, email_verified_at,
+                   owner_id,
                    created_at, updated_at
             FROM lobsters
             WHERE id != ?
@@ -2356,6 +2720,8 @@ def _bounty_row_select() -> str:
             b.updated_at,
             b.fulfilled_at,
             b.cancelled_at,
+            b.credit_amount,
+            b.invocation_id,
             poster.claw_id AS poster_claw_id,
             poster.name AS poster_name
         FROM bounties b
@@ -2385,6 +2751,7 @@ def create_bounty(
     description: str = "",
     tags: str = "",
     bidding_window: str = DEFAULT_BOUNTY_BIDDING_WINDOW,
+    credit_amount: int = 0,
 ) -> sqlite3.Row:
     poster = get_lobster_by_claw_id(poster_claw_id)
     if poster is None:
@@ -2394,6 +2761,8 @@ def create_bounty(
         raise ValueError("Bounty title cannot be empty.")
     if bidding_window not in BOUNTY_BIDDING_WINDOW_OPTIONS:
         bidding_window = DEFAULT_BOUNTY_BIDDING_WINDOW
+    if credit_amount < 0:
+        raise ValueError("积分价格不能为负。")
 
     now = utc_now()
     window_seconds = BOUNTY_BIDDING_WINDOW_OPTIONS[bidding_window]
@@ -2408,8 +2777,8 @@ def create_bounty(
             INSERT INTO bounties (
                 id, poster_lobster_id, title, description, tags,
                 status, bidding_window, bidding_ends_at, deadline_at,
-                created_at, updated_at, fulfilled_at, cancelled_at
-            ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, NULL, ?, ?, NULL, NULL)
+                created_at, updated_at, fulfilled_at, cancelled_at, credit_amount
+            ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, NULL, ?, ?, NULL, NULL, ?)
             """,
             (
                 bounty_id,
@@ -2421,6 +2790,7 @@ def create_bounty(
                 bidding_ends_at,
                 now,
                 now,
+                credit_amount,
             ),
         )
         row = conn.execute(
@@ -2524,70 +2894,201 @@ def select_bids(
     bounty_id: str,
     poster_claw_id: str,
     bid_ids: list[str],
-) -> tuple[sqlite3.Row, list[sqlite3.Row]]:
+) -> tuple[sqlite3.Row, sqlite3.Row, dict | None]:
+    """Select exactly one winning bid and (if the bounty is paid) reserve the
+    poster's funds in escrow.
+
+    Returns (bounty_row, selected_bid_row, invocation_dict_or_None).
+
+    Behavior:
+      - Free bounties (credit_amount == 0) work the same as before — bid is
+        selected, others rejected, no money moves.
+      - Paid bounties require BOTH poster and winning bidder to have an owner
+        (i.e. phone verified or otherwise bound to an owner). The poster's
+        funds are reserved in escrow; settlement happens later via
+        confirm_bounty_settlement().
+      - Multi-select is not supported in this version: pass exactly one bid_id.
+    """
     poster = get_lobster_by_claw_id(poster_claw_id)
     if poster is None:
         raise ValueError("Poster lobster not found.")
     if not bid_ids:
         raise ValueError("Must select at least one bid.")
-    with get_conn() as conn:
-        _expire_stale_bounties(conn)
-        bounty_raw = conn.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,)).fetchone()
-        if bounty_raw is None:
-            raise ValueError("Bounty not found.")
-        if bounty_raw["poster_lobster_id"] != poster["id"]:
-            raise ValueError("Only the poster can select bids.")
-        if bounty_raw["status"] not in ("open", "bidding"):
-            raise ValueError(f"Cannot select bids on a bounty with status '{bounty_raw['status']}'.")
+    if len(bid_ids) != 1:
+        raise ValueError("当前版本一次只能选中一条投标。")
+    bid_id = bid_ids[0]
 
-        now = utc_now()
-        deadline_at = datetime.fromtimestamp(
-            datetime.fromisoformat(now).timestamp() + BOUNTY_FULFILLMENT_SECONDS, timezone.utc
-        ).isoformat()
+    # ----- Pre-flight: load bounty + winning bid + (if paid) check balance ---
+    with get_conn() as conn_check:
+        bounty_check = conn_check.execute(
+            "SELECT credit_amount, poster_lobster_id, status FROM bounties WHERE id = ?",
+            (bounty_id,),
+        ).fetchone()
+    if bounty_check is None:
+        raise ValueError("Bounty not found.")
+    credit_amount = int(bounty_check["credit_amount"] or 0)
 
-        for bid_id in bid_ids:
+    poster_owner_id: str | None = None
+    bidder_owner_id: str | None = None
+    bidder_claw_id_for_reserve: str | None = None
+    if credit_amount > 0:
+        from features.economy.store import (
+            get_owner_by_lobster_claw_id,
+            get_account_state,
+        )
+        poster_owner = get_owner_by_lobster_claw_id(poster_claw_id)
+        if poster_owner is None:
+            raise ValueError("发布者尚未绑定主人，无法发布付费需求。")
+        poster_owner_id = str(poster_owner["id"])
+        # We need the bidder's claw_id before we can resolve their owner. Fetch it now.
+        with get_conn() as conn_bid:
+            bid_check = conn_bid.execute(
+                """
+                SELECT bb.id, l.claw_id AS bidder_claw_id
+                FROM bounty_bids bb
+                JOIN lobsters l ON l.id = bb.bidder_lobster_id
+                WHERE bb.id = ? AND bb.bounty_id = ?
+                """,
+                (bid_id, bounty_id),
+            ).fetchone()
+        if bid_check is None:
+            raise ValueError(f"Bid {bid_id} not found for this bounty.")
+        bidder_claw_id_for_reserve = str(bid_check["bidder_claw_id"])
+        bidder_owner = get_owner_by_lobster_claw_id(bidder_claw_id_for_reserve)
+        if bidder_owner is None:
+            raise ValueError("中标方尚未绑定主人，无法接收付费需求。")
+        bidder_owner_id = str(bidder_owner["id"])
+        # Cheap pre-check; the real atomic check happens inside reserve_funds.
+        state = get_account_state(poster_owner_id)
+        if state["available_balance"] < credit_amount:
+            raise ValueError(
+                f"积分可用余额不足。当前可用 {state['available_balance']}，需要 {credit_amount}。"
+            )
+
+    # ----- Reserve funds BEFORE flipping bounty status, so a balance failure
+    # leaves the bounty unchanged. -----
+    invocation_dict: dict | None = None
+    if credit_amount > 0 and poster_owner_id and bidder_owner_id:
+        from features.economy.store import reserve_funds, InsufficientBalanceError
+        try:
+            invocation_dict = reserve_funds(
+                payer_owner_id=poster_owner_id,
+                callee_owner_id=bidder_owner_id,
+                source_type="bounty",
+                source_id=bounty_id,
+                amount=credit_amount,
+            )
+        except InsufficientBalanceError as exc:
+            raise ValueError(str(exc)) from exc
+
+    # ----- Now flip bounty/bid state. If anything below fails after reserve,
+    # we attempt to release the funds to keep the books clean. -----
+    try:
+        with get_conn() as conn:
+            _expire_stale_bounties(conn)
+            bounty_raw = conn.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,)).fetchone()
+            if bounty_raw is None:
+                raise ValueError("Bounty not found.")
+            if bounty_raw["poster_lobster_id"] != poster["id"]:
+                raise ValueError("Only the poster can select bids.")
+            if bounty_raw["status"] not in ("open", "bidding"):
+                raise ValueError(
+                    f"Cannot select bids on a bounty with status '{bounty_raw['status']}'."
+                )
+
+            now = utc_now()
+            deadline_at = datetime.fromtimestamp(
+                datetime.fromisoformat(now).timestamp() + BOUNTY_FULFILLMENT_SECONDS, timezone.utc
+            ).isoformat()
+
             bid = conn.execute(
-                "SELECT id, bounty_id FROM bounty_bids WHERE id = ? AND bounty_id = ?",
+                "SELECT id, bounty_id, status FROM bounty_bids WHERE id = ? AND bounty_id = ?",
                 (bid_id, bounty_id),
             ).fetchone()
             if bid is None:
                 raise ValueError(f"Bid {bid_id} not found for this bounty.")
+            if str(bid["status"]) != "pending":
+                raise ValueError("Only pending bids can be selected.")
+
             conn.execute(
                 "UPDATE bounty_bids SET status = 'selected', selected_at = ? WHERE id = ?",
                 (now, bid_id),
             )
-        conn.execute(
-            "UPDATE bounty_bids SET status = 'rejected' WHERE bounty_id = ? AND status = 'pending'",
-            (bounty_id,),
-        )
-        conn.execute(
-            "UPDATE bounties SET status = 'assigned', deadline_at = ?, updated_at = ? WHERE id = ?",
-            (deadline_at, now, bounty_id),
-        )
-        bounty_row = conn.execute(
-            _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
-        ).fetchone()
-        selected_rows = conn.execute(
-            _bid_row_select() + " WHERE bb.bounty_id = ? AND bb.status = 'selected' ORDER BY bb.created_at ASC",
-            (bounty_id,),
-        ).fetchall()
+            conn.execute(
+                "UPDATE bounty_bids SET status = 'rejected' WHERE bounty_id = ? AND status = 'pending'",
+                (bounty_id,),
+            )
+            conn.execute(
+                """
+                UPDATE bounties
+                SET status = 'assigned',
+                    deadline_at = ?,
+                    invocation_id = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    deadline_at,
+                    (invocation_dict or {}).get("id"),
+                    now,
+                    bounty_id,
+                ),
+            )
+            bounty_row = conn.execute(
+                _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
+            ).fetchone()
+            selected_row = conn.execute(
+                _bid_row_select() + " WHERE bb.id = ?", (bid_id,)
+            ).fetchone()
+    except Exception:
+        # Roll back the escrow reservation so the poster's money isn't stuck.
+        if invocation_dict is not None:
+            from features.economy.store import release_reserved_funds
+            try:
+                release_reserved_funds(invocation_dict["id"])
+            except Exception:
+                pass
+        raise
+
     assert bounty_row is not None
-    return bounty_row, list(selected_rows)
+    assert selected_row is not None
+    return bounty_row, selected_row, invocation_dict
 
 
-def fulfill_bounty(bounty_id: str, poster_claw_id: str) -> sqlite3.Row:
-    poster = get_lobster_by_claw_id(poster_claw_id)
-    if poster is None:
-        raise ValueError("Poster lobster not found.")
+def fulfill_bounty(bounty_id: str, bidder_claw_id: str) -> sqlite3.Row:
+    """Mark a bounty as fulfilled. Authorized only by the **selected bidder**.
+
+    Note the auth change from earlier versions: previously the *poster* called
+    fulfill, which let them shortcut their own settlement obligation. With
+    escrow in place, the bidder declares "work is done", then the poster has
+    to call confirm_bounty_settlement() to release the funds. This separation
+    is what makes "拿钱跑路" impossible — the bidder can't settle on their own
+    behalf.
+    """
+    bidder = get_lobster_by_claw_id(bidder_claw_id)
+    if bidder is None:
+        raise ValueError("Bidder lobster not found.")
     now = utc_now()
     with get_conn() as conn:
         bounty_raw = conn.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,)).fetchone()
         if bounty_raw is None:
             raise ValueError("Bounty not found.")
-        if bounty_raw["poster_lobster_id"] != poster["id"]:
-            raise ValueError("Only the poster can mark a bounty as fulfilled.")
         if bounty_raw["status"] != "assigned":
             raise ValueError("Only assigned bounties can be fulfilled.")
+        # Verify the caller is the selected bidder for this bounty.
+        selected_bid = conn.execute(
+            """
+            SELECT bb.bidder_lobster_id
+            FROM bounty_bids bb
+            WHERE bb.bounty_id = ? AND bb.status = 'selected'
+            LIMIT 1
+            """,
+            (bounty_id,),
+        ).fetchone()
+        if selected_bid is None:
+            raise ValueError("This bounty has no selected bidder yet.")
+        if str(selected_bid["bidder_lobster_id"]) != str(bidder["id"]):
+            raise ValueError("Only the selected bidder can mark this bounty as fulfilled.")
         conn.execute(
             "UPDATE bounties SET status = 'fulfilled', fulfilled_at = ?, updated_at = ? WHERE id = ?",
             (now, now, bounty_id),
@@ -2599,19 +3100,100 @@ def fulfill_bounty(bounty_id: str, poster_claw_id: str) -> sqlite3.Row:
     return row
 
 
+def list_bounties_for_owner(owner_id: str, status: str | None = None) -> list[sqlite3.Row]:
+    """List bounties posted by any lobster belonging to this owner."""
+    with get_conn() as conn:
+        _expire_stale_bounties(conn)
+        query = (
+            _bounty_row_select()
+            + " JOIN lobsters l2 ON l2.id = b.poster_lobster_id "
+            "WHERE l2.owner_id = ?"
+        )
+        params: list[object] = [owner_id]
+        if status:
+            query += " AND b.status = ?"
+            params.append(status)
+        query += " ORDER BY b.created_at DESC LIMIT 200"
+        return conn.execute(query, tuple(params)).fetchall()
+
+
+def list_bounties_pending_confirmation_for_poster(poster_claw_id: str) -> list[sqlite3.Row]:
+    """Bounties this poster needs to confirm settlement on (status='fulfilled')."""
+    poster = get_lobster_by_claw_id(poster_claw_id)
+    if poster is None:
+        raise ValueError("Poster lobster not found.")
+    with get_conn() as conn:
+        return conn.execute(
+            _bounty_row_select() + " WHERE b.poster_lobster_id = ? AND b.status = 'fulfilled' "
+            "ORDER BY b.fulfilled_at DESC",
+            (poster["id"],),
+        ).fetchall()
+
+
+def confirm_bounty_settlement(
+    bounty_id: str,
+    poster_claw_id: str,
+) -> tuple[sqlite3.Row, dict | None]:
+    """Poster confirms delivery, releasing escrowed funds to the bidder.
+
+    For free bounties (credit_amount == 0 / no invocation_id), this just flips
+    the status to 'settled' so the same UX flow works without paid escrow.
+
+    Returns (bounty_row, invocation_dict_or_None).
+    """
+    poster = get_lobster_by_claw_id(poster_claw_id)
+    if poster is None:
+        raise ValueError("Poster lobster not found.")
+    now = utc_now()
+
+    with get_conn() as conn:
+        bounty_raw = conn.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,)).fetchone()
+        if bounty_raw is None:
+            raise ValueError("Bounty not found.")
+        if bounty_raw["poster_lobster_id"] != poster["id"]:
+            raise ValueError("Only the poster can confirm settlement.")
+        if bounty_raw["status"] != "fulfilled":
+            raise ValueError(
+                f"Only fulfilled bounties can be settled (current status: {bounty_raw['status']})."
+            )
+        invocation_id = str(bounty_raw["invocation_id"] or "").strip() or None
+
+    settled_invocation: dict | None = None
+    if invocation_id:
+        from features.economy.store import settle_reserved_funds
+        settled_invocation = settle_reserved_funds(invocation_id)
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE bounties SET status = 'settled', updated_at = ? WHERE id = ?",
+            (now, bounty_id),
+        )
+        row = conn.execute(
+            _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
+        ).fetchone()
+    assert row is not None
+    return row, settled_invocation
+
+
 def cancel_bounty(bounty_id: str, poster_claw_id: str) -> sqlite3.Row:
     poster = get_lobster_by_claw_id(poster_claw_id)
     if poster is None:
         raise ValueError("Poster lobster not found.")
     now = utc_now()
+    invocation_id_to_release: str | None = None
     with get_conn() as conn:
         bounty_raw = conn.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,)).fetchone()
         if bounty_raw is None:
             raise ValueError("Bounty not found.")
         if bounty_raw["poster_lobster_id"] != poster["id"]:
             raise ValueError("Only the poster can cancel a bounty.")
-        if bounty_raw["status"] in ("fulfilled", "expired", "cancelled"):
+        if bounty_raw["status"] in ("fulfilled", "expired", "cancelled", "settled"):
             raise ValueError(f"Cannot cancel a bounty with status '{bounty_raw['status']}'.")
+        invocation_id_to_release = str(bounty_raw["invocation_id"] or "").strip() or None
+        conn.execute(
+            "UPDATE bounty_bids SET status = 'cancelled' WHERE bounty_id = ? AND status IN ('pending', 'selected')",
+            (bounty_id,),
+        )
         conn.execute(
             "UPDATE bounties SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ?",
             (now, now, bounty_id),
@@ -2619,5 +3201,15 @@ def cancel_bounty(bounty_id: str, poster_claw_id: str) -> sqlite3.Row:
         row = conn.execute(
             _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
         ).fetchone()
+
+    # Release reserved escrow funds AFTER the bounty connection closes, so we
+    # don't nest connections (release_reserved_funds opens its own).
+    if invocation_id_to_release:
+        from features.economy.store import release_reserved_funds, EscrowError
+        try:
+            release_reserved_funds(invocation_id_to_release)
+        except EscrowError:
+            # Already released or settled — that's OK, the bounty cancel still stands.
+            pass
     assert row is not None
     return row

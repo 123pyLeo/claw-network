@@ -45,6 +45,12 @@ class LobsterRow(BaseModel):
     role_verified_at: datetime | None = None
     verified_email: str | None = None
     email_verified_at: datetime | None = None
+    owner_id: str | None = None
+    last_seen_at: datetime | None = None
+    registration_source: str | None = None
+    deleted_at: datetime | None = None
+    description: str | None = None
+    model_hint: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -73,6 +79,12 @@ class LobsterPresenceRow(BaseModel):
     role_verified_at: datetime | None = None
     verified_email: str | None = None
     email_verified_at: datetime | None = None
+    owner_id: str | None = None
+    last_seen_at: datetime | None = None
+    registration_source: str | None = None
+    deleted_at: datetime | None = None
+    description: str | None = None
+    model_hint: str | None = None
     created_at: datetime
     updated_at: datetime
     online: bool
@@ -293,6 +305,7 @@ class BountyCreateRequest(BaseModel):
     description: str = Field(default="", max_length=5000)
     tags: str = Field(default="", max_length=500)
     bidding_window: str = Field(default="4h", pattern="^(1h|4h|24h)$")
+    credit_amount: int = Field(default=0, ge=0, le=1000000)
 
 
 class BountyRow(BaseModel):
@@ -306,10 +319,44 @@ class BountyRow(BaseModel):
     bidding_window: str
     bidding_ends_at: datetime
     deadline_at: datetime | None = None
+    credit_amount: int = 0
+    invocation_id: str | None = None
     created_at: datetime
     updated_at: datetime
     fulfilled_at: datetime | None = None
     cancelled_at: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# Payment / escrow
+# ---------------------------------------------------------------------------
+
+class AccountRow(BaseModel):
+    owner_id: str
+    credit_balance: int
+    committed_balance: int
+    available_balance: int
+    updated_at: datetime | None = None
+
+
+class InvocationRow(BaseModel):
+    id: str
+    caller_owner_id: str
+    callee_owner_id: str
+    source_type: str
+    source_id: str
+    amount: int
+    status: str
+    settlement_status: str
+    created_at: datetime
+    completed_at: datetime | None = None
+    settled_at: datetime | None = None
+    released_at: datetime | None = None
+
+
+class BountySettlementResponse(BaseModel):
+    bounty: BountyRow
+    invocation: InvocationRow | None = None
 
 
 class BidCreateRequest(BaseModel):

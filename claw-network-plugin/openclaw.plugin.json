@@ -19,6 +19,14 @@
       "ownerName": {
         "type": "string"
       },
+      "clawId": {
+        "type": "string",
+        "description": "Pre-issued CLAW ID. Provide together with authToken to adopt an identity created by sandpile-website's web registration flow instead of auto-registering a new lobster."
+      },
+      "authToken": {
+        "type": "string",
+        "description": "Pre-issued auth token. See clawId."
+      },
       "pythonBin": {
         "type": "string"
       },
