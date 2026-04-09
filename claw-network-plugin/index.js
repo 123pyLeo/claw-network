@@ -431,6 +431,9 @@ function detectNetworkIntent(text) {
   if (['我的好友', '好友列表', '我加了谁', '有哪些好友'].some((k) => v.includes(k))) {
     return { tool: 'list_lobster_friends', params: {} };
   }
+  if (['我的余额', '账户余额', '我的账户', '我还有多少钱'].some((k) => v.includes(k))) {
+    return { tool: 'get_account_balance', params: {} };
+  }
   if (['谁加了我', '待处理好友', '好友申请'].some((k) => v.includes(k))) {
     return { tool: 'list_lobster_friend_requests', params: {} };
   }
@@ -476,7 +479,14 @@ function detectNetworkIntent(text) {
   if (['发个需求', '发布需求', '挂个需求', '我需要', '找人帮', '谁能帮', '帮我做', '需要帮忙', '帮个忙'].some((k) => v.includes(k))) {
     // Extract title from common patterns
     const titleMatch = v.match(/(?:需求|帮忙|帮我|谁能帮)[：:]*\s*(.+)/) || v.match(/(?:发个需求|发布需求)[：:]*\s*(.+)/);
-    return { tool: 'post_bounty', params: { title: titleMatch ? titleMatch[1].trim() : '' } };
+    const rewardMatch = v.match(/(?:悬赏|赏金|预算)\s*(\d+)/);
+    return {
+      tool: 'post_bounty',
+      params: {
+        title: titleMatch ? titleMatch[1].trim() : '',
+        reward_amount: rewardMatch ? Number.parseInt(rewardMatch[1], 10) : 0,
+      }
+    };
   }
   if (['看看监听板', '监听板', '有什么需求', '需求列表', '看看需求'].some((k) => v.includes(k))) {
     return { tool: 'list_bounties', params: {} };
@@ -503,6 +513,10 @@ function detectNetworkIntent(text) {
   if (['做完了', '需求完成', '已完成', '交付了'].some((k) => v.includes(k))) {
     const fulfillMatch = v.match(/(?:做完了|需求完成|已完成|交付了)\s+(\S+)/);
     return { tool: 'fulfill_bounty', params: { bounty_id: fulfillMatch ? fulfillMatch[1].trim() : '' } };
+  }
+  if (['确认结算', '确认付款', '确认支付', '确认打款'].some((k) => v.includes(k))) {
+    const confirmMatch = v.match(/(?:确认结算|确认付款|确认支付|确认打款)\s+(\S+)/);
+    return { tool: 'confirm_bounty_settlement', params: { bounty_id: confirmMatch ? confirmMatch[1].trim() : '' } };
   }
   if (['撤回需求', '取消需求', '不要了', '算了不发了'].some((k) => v.includes(k))) {
     const cancelMatch = v.match(/(?:撤回需求|取消需求)\s+(\S+)/);
@@ -1448,9 +1462,32 @@ const plugin = {
     // ------------------------------------------------------------------
 
     api.registerTool({
+      name: 'get_account_balance',
+      label: 'Get Account Balance',
+      description: 'View your current account balance, including committed and available funds.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {}
+      },
+      async execute() {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['get-account']);
+          return toolTextResult(
+            `当前账户余额：总额 ${result.balance_total} ${result.asset_symbol}，冻结 ${result.balance_committed}，可用 ${result.balance_available}。`,
+            { success: true, result }
+          );
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
       name: 'post_bounty',
       label: 'Post Bounty',
-      description: 'Post a need/task to the bulletin board so other lobsters can see it and bid.',
+      description: 'Post a need/task to the bulletin board so other lobsters can see it and bid, optionally with a reward amount.',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -1459,7 +1496,8 @@ const plugin = {
           title: { type: 'string', description: 'One-line summary of what you need, e.g. "帮我翻译一段英文合同"' },
           description: { type: 'string', description: 'Detailed description of the task, context, constraints' },
           tags: { type: 'string', description: 'Comma-separated capability tags, e.g. "translation,english,legal"' },
-          bidding_window: { type: 'string', enum: ['1h', '4h', '24h'], description: 'How long the bounty stays open for bidding. Default 4h.' }
+          bidding_window: { type: 'string', enum: ['1h', '4h', '24h'], description: 'How long the bounty stays open for bidding. Default 4h.' },
+          reward_amount: { type: 'number', description: 'Optional reward amount for this bounty.' }
         }
       },
       async execute(_toolCallId, params) {
@@ -1469,9 +1507,12 @@ const plugin = {
           if (params.description) args.push('--description', String(params.description));
           if (params.tags) args.push('--tags', String(params.tags));
           if (params.bidding_window) args.push('--bidding-window', String(params.bidding_window));
+          if (typeof params.reward_amount === 'number' && Number.isFinite(params.reward_amount)) {
+            args.push('--reward-amount', String(Math.max(0, Math.trunc(params.reward_amount))));
+          }
           const result = await runClient(api, args);
           return toolTextResult(
-            `需求已发布到监听板：「${result.title || params.title}」\n竞标窗口：${result.bidding_window || params.bidding_window || '4h'}，截止时间：${result.bidding_ends_at || ''}`,
+            `需求已发布到监听板：「${result.title || params.title}」\n赏金：${result.reward_amount || 0} ${result.currency || 'CREDIT'}\n竞标窗口：${result.bidding_window || params.bidding_window || '4h'}，截止时间：${result.bidding_ends_at || ''}`,
             { success: true, result }
           );
         } catch (error) {
@@ -1488,7 +1529,7 @@ const plugin = {
         type: 'object',
         additionalProperties: false,
         properties: {
-          status: { type: 'string', enum: ['open', 'bidding', 'assigned', 'fulfilled', 'expired', 'cancelled'] },
+          status: { type: 'string', enum: ['open', 'bidding', 'assigned', 'fulfilled', 'settled', 'expired', 'cancelled'] },
           tag: { type: 'string', description: 'Filter by capability tag' },
           limit: { type: 'number' }
         }
@@ -1507,7 +1548,9 @@ const plugin = {
           const lines = result.map((item, idx) => {
             const tags = String(item.tags || '').split(',').filter(Boolean).join(', ');
             const tagsLabel = tags ? ` [${tags}]` : '';
-            return `${idx + 1}. 「${item.title}」${tagsLabel} · ${item.poster_name} · ${item.status} · 截止 ${item.bidding_ends_at || ''}`;
+            const rewardLabel = `${item.reward_amount || 0} ${item.currency || 'CREDIT'}`;
+            const settleLabel = item.settlement_status ? ` · ${item.settlement_status}` : '';
+            return `${idx + 1}. 「${item.title}」${tagsLabel} · ${item.poster_name} · ${item.status}${settleLabel} · ${rewardLabel} · 截止 ${item.bidding_ends_at || ''}`;
           });
           return toolTextResult(`监听板（${result.length} 条）：\n${lines.join('\n')}`, { success: true, result });
         } catch (error) {
@@ -1579,22 +1622,24 @@ const plugin = {
     api.registerTool({
       name: 'select_bids',
       label: 'Select Bids',
-      description: 'As the bounty poster, select one or more winning bids. Unselected bids are auto-rejected.',
+      description: 'As the bounty poster, select the winning bid. In the current MVP, exactly one bid can be selected.',
       parameters: {
         type: 'object',
         additionalProperties: false,
         required: ['bounty_id', 'bid_ids'],
         properties: {
           bounty_id: { type: 'string' },
-          bid_ids: { type: 'array', items: { type: 'string' }, description: 'IDs of bids to select' }
+          bid_ids: { type: 'array', items: { type: 'string' }, description: 'Exactly one bid ID to select in the current MVP.' }
         }
       },
       async execute(_toolCallId, params) {
         try {
           await runClient(api, ['register']);
           const result = await runClient(api, ['select-bids', params.bounty_id, ...params.bid_ids]);
+          const reward = Number(result.reward_amount || 0);
+          const payLine = reward > 0 ? `\n已冻结 ${reward} ${result.currency || 'CREDIT'}，等待任务完成后结算。` : '';
           return toolTextResult(
-            `已选标，需求状态变为 assigned。选中的龙虾已收到通知，可以开始协作。`,
+            `已选标，需求状态变为 assigned。选中的龙虾已收到通知，可以开始协作。${payLine}`,
             { success: true, result }
           );
         } catch (error) {
@@ -1606,7 +1651,7 @@ const plugin = {
     api.registerTool({
       name: 'fulfill_bounty',
       label: 'Fulfill Bounty',
-      description: 'Mark a bounty as fulfilled after the work is done.',
+      description: 'As the selected bidder, mark a bounty as fulfilled after the work is done.',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -1619,7 +1664,36 @@ const plugin = {
         try {
           await runClient(api, ['register']);
           const result = await runClient(api, ['fulfill-bounty', params.bounty_id]);
-          return toolTextResult('需求已标记为完成。', { success: true, result });
+          const settleLine = result.settlement_status === 'pending'
+            ? '\n任务已进入待结算，等待发布者确认。'
+            : '';
+          return toolTextResult(`需求已标记为完成。${settleLine}`, { success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'confirm_bounty_settlement',
+      label: 'Confirm Bounty Settlement',
+      description: 'As the bounty poster, confirm completion and settle the reward.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['bounty_id'],
+        properties: {
+          bounty_id: { type: 'string' }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['confirm-bounty-settlement', params.bounty_id]);
+          const summary = result?.invocation
+            ? `已完成结算：${result.invocation.amount} ${result.invocation.asset_symbol}。`
+            : '已完成结算。';
+          return toolTextResult(summary, { success: true, result });
         } catch (error) {
           return errorResult(error);
         }
@@ -1629,7 +1703,7 @@ const plugin = {
     api.registerTool({
       name: 'cancel_bounty',
       label: 'Cancel Bounty',
-      description: 'Cancel/withdraw a bounty you posted.',
+      description: 'Cancel/withdraw a bounty you posted. If funds were reserved, they will be released.',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -1642,7 +1716,10 @@ const plugin = {
         try {
           await runClient(api, ['register']);
           const result = await runClient(api, ['cancel-bounty', params.bounty_id]);
-          return toolTextResult('需求已撤回。', { success: true, result });
+          const releaseLine = result.settlement_status === 'released'
+            ? '\n已释放冻结金额。'
+            : '';
+          return toolTextResult(`需求已撤回。${releaseLine}`, { success: true, result });
         } catch (error) {
           return errorResult(error);
         }
