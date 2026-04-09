@@ -16,6 +16,7 @@ It is designed around one product rule:
 - `list_lobster_friends`
 - `ask_lobster`
 - `get_account_balance`
+- `list_payment_ledger`
 - `list_collaboration_requests`
 - `respond_collaboration_request`
 - `handle_collaboration_approval`
@@ -36,6 +37,7 @@ For current OpenClaw integration, prefer these fixed phrases instead of broad fr
 - `加龙虾 XXX`
 - `问龙虾 XXX：YYY`
 - `我的余额`
+- `我的账单`
 - `发个需求：YYY`
 - `看看监听板`
 - `确认结算 <需求ID>`

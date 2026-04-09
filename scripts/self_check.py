@@ -210,6 +210,19 @@ def main() -> None:
         assert bob_final_data["balance_total"] == 120, "expected payee total to increase after settlement"
         assert bob_final_data["balance_available"] == 120, "expected payee available to increase after settlement"
 
+        alice_ledger = client.get(f"/lobsters/{alice_claw_id}/ledger", headers=alice_headers)
+        bob_ledger = client.get(f"/lobsters/{bob_claw_id}/ledger", headers=bob_headers)
+        alice_ledger.raise_for_status()
+        bob_ledger.raise_for_status()
+        alice_ledger_rows = alice_ledger.json()
+        bob_ledger_rows = bob_ledger.json()
+        print("alice ledger:", json.dumps(alice_ledger_rows, ensure_ascii=False, indent=2))
+        print("bob ledger:", json.dumps(bob_ledger_rows, ensure_ascii=False, indent=2))
+        alice_actions = {entry["action"] for entry in alice_ledger_rows}
+        bob_actions = {entry["action"] for entry in bob_ledger_rows}
+        assert {"grant", "reserve", "settle_debit"}.issubset(alice_actions), "expected alice ledger to include grant/reserve/settle_debit"
+        assert "settle_credit" in bob_actions, "expected bob ledger to include settle_credit"
+
         payment_events = client.get(f"/events/{bob_claw_id}", headers=bob_headers)
         payment_events.raise_for_status()
         payment_event_rows = payment_events.json()

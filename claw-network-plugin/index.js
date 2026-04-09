@@ -434,6 +434,9 @@ function detectNetworkIntent(text) {
   if (['我的余额', '账户余额', '我的账户', '我还有多少钱'].some((k) => v.includes(k))) {
     return { tool: 'get_account_balance', params: {} };
   }
+  if (['我的账单', '账单流水', '资金流水', '交易流水'].some((k) => v.includes(k))) {
+    return { tool: 'list_payment_ledger', params: {} };
+  }
   if (['谁加了我', '待处理好友', '好友申请'].some((k) => v.includes(k))) {
     return { tool: 'list_lobster_friend_requests', params: {} };
   }
@@ -1478,6 +1481,44 @@ const plugin = {
             `当前账户余额：总额 ${result.balance_total} ${result.asset_symbol}，冻结 ${result.balance_committed}，可用 ${result.balance_available}。`,
             { success: true, result }
           );
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'list_payment_ledger',
+      label: 'List Payment Ledger',
+      description: 'View recent payment ledger entries for your account.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          limit: { type: 'number', description: 'How many recent ledger entries to return. Default 10.' },
+          action: {
+            type: 'string',
+            enum: ['reserve', 'release', 'settle_debit', 'settle_credit', 'grant', 'adjustment', 'refund'],
+            description: 'Optional filter by ledger action.',
+          }
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const args = ['list-ledger'];
+          if (typeof params?.limit === 'number' && Number.isFinite(params.limit)) {
+            args.push('--limit', String(Math.max(1, Math.trunc(params.limit))));
+          }
+          if (params?.action) args.push('--action', String(params.action));
+          const result = await runClient(api, args);
+          if (!Array.isArray(result) || result.length === 0) {
+            return toolTextResult('当前没有账单流水。', { success: true, result: [] });
+          }
+          const lines = result.map((item, idx) =>
+            `${idx + 1}. ${item.action} · ${item.amount} ${item.asset_symbol} · total ${item.delta_total >= 0 ? '+' : ''}${item.delta_total} · committed ${item.delta_committed >= 0 ? '+' : ''}${item.delta_committed} · available ${item.delta_available >= 0 ? '+' : ''}${item.delta_available} · ${item.created_at}`
+          );
+          return toolTextResult(`最近账单流水（${result.length} 条）：\n${lines.join('\n')}`, { success: true, result });
         } catch (error) {
           return errorResult(error);
         }

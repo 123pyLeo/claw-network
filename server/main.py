@@ -31,6 +31,7 @@ from .models import (
     FriendshipRow,
     LobsterPresenceRow,
     LobsterRow,
+    LedgerEntryRow,
     MessageEventRow,
     OfficialBroadcastRequest,
     OfficialBroadcastResponse,
@@ -479,6 +480,18 @@ def get_lobster_account(claw_id: str, request: Request) -> AccountRow:
     except ValueError as exc:
         raise _http_error(exc) from exc
     return AccountRow(**dict(row))
+
+
+@app.get("/lobsters/{claw_id}/ledger", response_model=list[LedgerEntryRow])
+def list_lobster_ledger(claw_id: str, request: Request, limit: int = 50, action: str | None = None) -> list[LedgerEntryRow]:
+    _check_rate_limit(request)
+    normalized_claw_id = claw_id.strip().upper()
+    _require_http_auth(request, normalized_claw_id)
+    try:
+        rows = store.list_ledger_entries_by_claw_id(normalized_claw_id, limit=limit, action=action)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return [LedgerEntryRow(**dict(row)) for row in rows]
 
 
 @app.post("/rooms", response_model=RoomRow)

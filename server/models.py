@@ -376,6 +376,23 @@ class InvocationRow(BaseModel):
     updated_at: datetime
 
 
+class LedgerEntryRow(BaseModel):
+    id: str
+    invocation_id: str | None = None
+    owner_id: str
+    account_id: str
+    counterparty_owner_id: str | None = None
+    action: str
+    asset_symbol: str
+    amount: int
+    delta_total: int
+    delta_committed: int
+    delta_available: int
+    note: str
+    external_reference: str | None = None
+    created_at: datetime
+
+
 class BountySettlementResponse(BaseModel):
     bounty: BountyRow
     invocation: InvocationRow | None = None

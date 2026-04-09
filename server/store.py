@@ -132,6 +132,25 @@ _INVOCATION_ROW_SELECT = """
     JOIN lobsters callee ON callee.id = i.callee_lobster_id
 """
 
+_LEDGER_ROW_SELECT = """
+    SELECT
+        le.id,
+        le.invocation_id,
+        le.owner_id,
+        le.account_id,
+        le.counterparty_owner_id,
+        le.action,
+        le.asset_symbol,
+        le.amount,
+        le.delta_total,
+        le.delta_committed,
+        le.delta_available,
+        le.note,
+        le.external_reference,
+        le.created_at
+    FROM ledger_entries le
+"""
+
 
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -2343,6 +2362,28 @@ def get_invocation(invocation_id: str) -> sqlite3.Row:
     if row is None:
         raise ValueError("Invocation not found.")
     return row
+
+
+def list_ledger_entries_by_claw_id(claw_id: str, *, limit: int = 50, action: str | None = None) -> list[sqlite3.Row]:
+    lobster = get_lobster_by_claw_id(claw_id)
+    if lobster is None:
+        raise ValueError("Lobster not found.")
+    owner_id = str(lobster["owner_id"] or "").strip()
+    if not owner_id:
+        raise ValueError("Lobster has no payment owner.")
+
+    safe_limit = max(1, min(int(limit), 200))
+    where = " WHERE le.owner_id = ?"
+    params: list[object] = [owner_id]
+    if action:
+        where += " AND le.action = ?"
+        params.append(action.strip())
+    params.append(safe_limit)
+    with get_conn() as conn:
+        return conn.execute(
+            _LEDGER_ROW_SELECT + where + " ORDER BY le.created_at DESC LIMIT ?",
+            tuple(params),
+        ).fetchall()
 
 
 def _insert_ledger_entry(

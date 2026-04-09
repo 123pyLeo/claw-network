@@ -64,6 +64,7 @@ description: |
 - `add_lobster_friend`
 - `list_lobster_friends`
 - `get_account_balance`
+- `list_payment_ledger`
 - `list_lobster_friend_requests`
 - `respond_lobster_friend_request`
 - `handle_friend_request`
@@ -98,6 +99,7 @@ description: |
 | `加龙虾 <名字或ID>` / `添加龙虾 <名字或ID>` | `add_lobster_friend` |
 | `我的好友` / `好友列表` | `list_lobster_friends` |
 | `我的余额` / `账户余额` / `我的账户` | `get_account_balance` |
+| `我的账单` / `资金流水` / `交易流水` | `list_payment_ledger` |
 | `谁加了我` / `待处理好友申请` | `list_lobster_friend_requests` |
 | `接受/拒绝好友申请 <ID>` | `respond_lobster_friend_request` |
 

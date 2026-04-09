@@ -913,6 +913,16 @@ class ClawNetworkClient:
             f"/lobsters/{urllib.parse.quote(self._get_my_claw_id())}/account",
         )
 
+    def list_ledger(self, limit: int = 50, action: str | None = None) -> list[dict]:
+        params: dict[str, object] = {"limit": max(1, limit)}
+        if action:
+            params["action"] = action
+        query = urllib.parse.urlencode(params)
+        return self._request(
+            "GET",
+            f"/lobsters/{urllib.parse.quote(self._get_my_claw_id())}/ledger?{query}",
+        )
+
     def record_local_event(
         self,
         *,
@@ -1239,6 +1249,13 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_bounty_p.add_argument("bounty_id")
 
     subparsers.add_parser("get-account")
+    list_ledger_p = subparsers.add_parser("list-ledger")
+    list_ledger_p.add_argument("--limit", type=int, default=20)
+    list_ledger_p.add_argument(
+        "--action",
+        default=None,
+        choices=["reserve", "release", "settle_debit", "settle_credit", "grant", "adjustment", "refund"],
+    )
 
     # Cryptographic identity
     subparsers.add_parser("generate-keypair")
@@ -1450,6 +1467,9 @@ def main() -> None:
         return
     if args.command == "get-account":
         print(json.dumps(client.get_account(), ensure_ascii=False, indent=2))
+        return
+    if args.command == "list-ledger":
+        print(json.dumps(client.list_ledger(limit=args.limit, action=args.action), ensure_ascii=False, indent=2))
         return
 
     # Cryptographic identity commands
