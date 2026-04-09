@@ -839,11 +839,24 @@ class ClawNetworkClient:
     # Bulletin Board (bounties + bids)
     # ------------------------------------------------------------------
 
-    def post_bounty(self, title: str, description: str = "", tags: str = "", bidding_window: str = "4h") -> dict:
+    def post_bounty(
+        self,
+        title: str,
+        description: str = "",
+        tags: str = "",
+        bidding_window: str = "4h",
+        reward_amount: int = 0,
+    ) -> dict:
         return self._request(
             "POST",
             f"/bounties?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
-            {"title": title, "description": description, "tags": tags, "bidding_window": bidding_window},
+            {
+                "title": title,
+                "description": description,
+                "tags": tags,
+                "bidding_window": bidding_window,
+                "reward_amount": max(0, int(reward_amount)),
+            },
         )
 
     def list_bounties(self, status: str = "open", tag: str | None = None, limit: int = 50) -> list[dict]:
@@ -886,6 +899,18 @@ class ClawNetworkClient:
         return self._request(
             "POST",
             f"/bounties/{urllib.parse.quote(bounty_id)}/cancel?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+        )
+
+    def confirm_bounty_settlement(self, bounty_id: str) -> dict:
+        return self._request(
+            "POST",
+            f"/bounties/{urllib.parse.quote(bounty_id)}/settlement/confirm?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+        )
+
+    def get_account(self) -> dict:
+        return self._request(
+            "GET",
+            f"/lobsters/{urllib.parse.quote(self._get_my_claw_id())}/account",
         )
 
     def record_local_event(
@@ -1183,6 +1208,7 @@ def build_parser() -> argparse.ArgumentParser:
     post_bounty.add_argument("--description", default="")
     post_bounty.add_argument("--tags", default="")
     post_bounty.add_argument("--bidding-window", default="4h", choices=["1h", "4h", "24h"])
+    post_bounty.add_argument("--reward-amount", type=int, default=0)
 
     list_bounties_p = subparsers.add_parser("list-bounties")
     list_bounties_p.add_argument("--status", default="open")
@@ -1206,8 +1232,13 @@ def build_parser() -> argparse.ArgumentParser:
     fulfill_bounty_p = subparsers.add_parser("fulfill-bounty")
     fulfill_bounty_p.add_argument("bounty_id")
 
+    confirm_bounty_settlement_p = subparsers.add_parser("confirm-bounty-settlement")
+    confirm_bounty_settlement_p.add_argument("bounty_id")
+
     cancel_bounty_p = subparsers.add_parser("cancel-bounty")
     cancel_bounty_p.add_argument("bounty_id")
+
+    subparsers.add_parser("get-account")
 
     # Cryptographic identity
     subparsers.add_parser("generate-keypair")
@@ -1390,6 +1421,7 @@ def main() -> None:
             description=args.description,
             tags=args.tags,
             bidding_window=args.bidding_window,
+            reward_amount=args.reward_amount,
         ), ensure_ascii=False, indent=2))
         return
     if args.command == "list-bounties":
@@ -1410,8 +1442,14 @@ def main() -> None:
     if args.command == "fulfill-bounty":
         print(json.dumps(client.fulfill_bounty(args.bounty_id), ensure_ascii=False, indent=2))
         return
+    if args.command == "confirm-bounty-settlement":
+        print(json.dumps(client.confirm_bounty_settlement(args.bounty_id), ensure_ascii=False, indent=2))
+        return
     if args.command == "cancel-bounty":
         print(json.dumps(client.cancel_bounty(args.bounty_id), ensure_ascii=False, indent=2))
+        return
+    if args.command == "get-account":
+        print(json.dumps(client.get_account(), ensure_ascii=False, indent=2))
         return
 
     # Cryptographic identity commands

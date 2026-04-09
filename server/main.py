@@ -12,11 +12,13 @@ from fastapi.responses import StreamingResponse
 
 from . import store
 from .models import (
+    AccountRow,
     ActiveRoomRow,
     BidCreateRequest,
     BidRow,
     BountyCreateRequest,
     BountyRow,
+    BountySettlementResponse,
     CollaborationRequestRespond,
     CollaborationRequestRow,
     DemoParticipantRow,
@@ -48,6 +50,7 @@ from .models import (
     BindKeyRequest,
     KeyInfoResponse,
     DIDDocumentResponse,
+    InvocationRow,
     SendPhoneCodeRequest,
     VerifyPhoneRequest,
     PhoneVerificationResponse,
@@ -464,6 +467,18 @@ def verify_phone(claw_id: str, payload: VerifyPhoneRequest, request: Request) ->
         verified=True,
         message="手机号验证成功。",
     )
+
+
+@app.get("/lobsters/{claw_id}/account", response_model=AccountRow)
+def get_lobster_account(claw_id: str, request: Request) -> AccountRow:
+    _check_rate_limit(request)
+    normalized_claw_id = claw_id.strip().upper()
+    _require_http_auth(request, normalized_claw_id)
+    try:
+        row = store.get_account_by_claw_id(normalized_claw_id)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return AccountRow(**dict(row))
 
 
 @app.post("/rooms", response_model=RoomRow)
@@ -901,6 +916,7 @@ async def create_bounty(payload: BountyCreateRequest, request: Request, claw_id:
             description=payload.description,
             tags=payload.tags,
             bidding_window=payload.bidding_window,
+            reward_amount=payload.reward_amount,
         )
     except ValueError as exc:
         raise _http_error(exc) from exc
@@ -968,19 +984,41 @@ async def select_bids(bounty_id: str, payload: SelectBidsRequest, request: Reque
     lobster = _require_http_auth(request, normalized_claw_id)
     await _require_signature_if_keyed(request, lobster)
     try:
-        bounty_row, selected_bids = store.select_bids(
+        bounty_row, selected_bid, invocation_row = store.select_bids(
             bounty_id=bounty_id,
             poster_claw_id=normalized_claw_id,
             bid_ids=payload.bid_ids,
         )
     except ValueError as exc:
         raise _http_error(exc) from exc
-    for bid in selected_bids:
-        bidder_claw_id = str(bid["bidder_claw_id"])
-        await manager.send_to_agent(bidder_claw_id, {
-            "event": "bounty_assigned",
-            "payload": {**dict(bounty_row), "your_bid": dict(bid)},
-        })
+    bidder_claw_id = str(selected_bid["bidder_claw_id"])
+    await manager.send_to_agent(bidder_claw_id, {
+        "event": "bounty_assigned",
+        "payload": {**dict(bounty_row), "your_bid": dict(selected_bid)},
+    })
+    if invocation_row is not None:
+        reserved_content = (
+            f"需求「{bounty_row['title']}」已锁定服务方，"
+            f"{int(invocation_row['amount'])} {invocation_row['asset_symbol']} 已冻结。"
+        )
+        poster_event = store.record_event(
+            event_type="payment_reserved",
+            from_lobster_id=None,
+            to_lobster_id=str(lobster["id"]),
+            content=reserved_content,
+            status="queued",
+        )
+        bidder_lobster = store.get_lobster_by_claw_id(bidder_claw_id)
+        if bidder_lobster is not None:
+            bidder_event = store.record_event(
+                event_type="payment_reserved",
+                from_lobster_id=None,
+                to_lobster_id=str(bidder_lobster["id"]),
+                content=reserved_content,
+                status="queued",
+            )
+            await _deliver_event(dict(bidder_event))
+        await _deliver_event(dict(poster_event))
     await _notify_bounty_subscribers("bounty_assigned", dict(bounty_row))
     return BountyRow(**dict(bounty_row))
 
@@ -992,19 +1030,82 @@ async def fulfill_bounty(bounty_id: str, request: Request, claw_id: str) -> Boun
     lobster = _require_http_auth(request, normalized_claw_id)
     await _require_signature_if_keyed(request, lobster)
     try:
-        row = store.fulfill_bounty(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
+        row, selected_bid, invocation_row = store.fulfill_bounty(bounty_id=bounty_id, bidder_claw_id=normalized_claw_id)
     except ValueError as exc:
         raise _http_error(exc) from exc
     bounty_dict = dict(row)
-    selected_bids = store.list_bids(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
-    for bid in selected_bids:
-        if str(bid["status"]) == "selected":
-            await manager.send_to_agent(str(bid["bidder_claw_id"]), {
-                "event": "bounty_fulfilled",
-                "payload": bounty_dict,
-            })
+    await manager.send_to_agent(str(bounty_dict["poster_claw_id"]), {
+        "event": "bounty_fulfilled",
+        "payload": {**bounty_dict, "selected_bid": dict(selected_bid)},
+    })
+    if invocation_row is not None:
+        pending_content = (
+            f"需求「{bounty_dict['title']}」已标记完成，"
+            f"等待发布者确认结算 {int(invocation_row['amount'])} {invocation_row['asset_symbol']}。"
+        )
+        poster_event = store.record_event(
+            event_type="payment_pending_settlement",
+            from_lobster_id=None,
+            to_lobster_id=str(store.get_lobster_by_claw_id(str(bounty_dict["poster_claw_id"]))["id"]),
+            content=pending_content,
+            status="queued",
+        )
+        bidder_event = store.record_event(
+            event_type="payment_pending_settlement",
+            from_lobster_id=None,
+            to_lobster_id=str(lobster["id"]),
+            content=pending_content,
+            status="queued",
+        )
+        await _deliver_event(dict(poster_event))
+        await _deliver_event(dict(bidder_event))
     await _notify_bounty_subscribers("bounty_fulfilled", bounty_dict)
     return BountyRow(**bounty_dict)
+
+
+@app.post("/bounties/{bounty_id}/settlement/confirm", response_model=BountySettlementResponse)
+async def confirm_bounty_settlement(bounty_id: str, request: Request, claw_id: str) -> BountySettlementResponse:
+    _check_rate_limit(request)
+    normalized_claw_id = claw_id.strip().upper()
+    lobster = _require_http_auth(request, normalized_claw_id)
+    await _require_signature_if_keyed(request, lobster)
+    try:
+        bounty_row, invocation_row, payer_account_row, payee_account_row = store.confirm_bounty_settlement(
+            bounty_id=bounty_id,
+            poster_claw_id=normalized_claw_id,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    bounty_dict = dict(bounty_row)
+    if invocation_row is not None:
+        settled_content = (
+            f"需求「{bounty_dict['title']}」已完成结算："
+            f"{int(invocation_row['amount'])} {invocation_row['asset_symbol']}。"
+        )
+        poster_event = store.record_event(
+            event_type="payment_settled",
+            from_lobster_id=None,
+            to_lobster_id=str(lobster["id"]),
+            content=settled_content,
+            status="queued",
+        )
+        callee = store.get_lobster_by_claw_id(str(invocation_row["callee_claw_id"]))
+        if callee is not None:
+            payee_event = store.record_event(
+                event_type="payment_settled",
+                from_lobster_id=None,
+                to_lobster_id=str(callee["id"]),
+                content=settled_content,
+                status="queued",
+            )
+            await _deliver_event(dict(payee_event))
+        await _deliver_event(dict(poster_event))
+    return BountySettlementResponse(
+        bounty=BountyRow(**bounty_dict),
+        invocation=InvocationRow(**dict(invocation_row)) if invocation_row is not None else None,
+        payer_account=AccountRow(**dict(payer_account_row)) if payer_account_row is not None else None,
+        payee_account=AccountRow(**dict(payee_account_row)) if payee_account_row is not None else None,
+    )
 
 
 @app.post("/bounties/{bounty_id}/cancel", response_model=BountyRow)
@@ -1014,21 +1115,43 @@ async def cancel_bounty(bounty_id: str, request: Request, claw_id: str) -> Bount
     lobster = _require_http_auth(request, normalized_claw_id)
     await _require_signature_if_keyed(request, lobster)
     try:
-        row = store.cancel_bounty(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
+        row, selected_bid, invocation_row = store.cancel_bounty(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
     except ValueError as exc:
         raise _http_error(exc) from exc
     bounty_dict = dict(row)
     await _notify_bounty_subscribers("bounty_cancelled", bounty_dict)
     try:
-        selected_bids = store.list_bids(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
-        for bid in selected_bids:
-            if str(bid["status"]) == "selected":
-                await manager.send_to_agent(str(bid["bidder_claw_id"]), {
-                    "event": "bounty_cancelled",
-                    "payload": bounty_dict,
-                })
+        if selected_bid is not None:
+            await manager.send_to_agent(str(selected_bid["bidder_claw_id"]), {
+                "event": "bounty_cancelled",
+                "payload": bounty_dict,
+            })
     except ValueError:
         pass
+    if invocation_row is not None:
+        release_content = (
+            f"需求「{bounty_dict['title']}」已取消，"
+            f"冻结的 {int(invocation_row['amount'])} {invocation_row['asset_symbol']} 已释放。"
+        )
+        poster_event = store.record_event(
+            event_type="payment_released",
+            from_lobster_id=None,
+            to_lobster_id=str(lobster["id"]),
+            content=release_content,
+            status="queued",
+        )
+        await _deliver_event(dict(poster_event))
+        if selected_bid is not None:
+            bidder_lobster = store.get_lobster_by_claw_id(str(selected_bid["bidder_claw_id"]))
+            if bidder_lobster is not None:
+                bidder_event = store.record_event(
+                    event_type="payment_released",
+                    from_lobster_id=None,
+                    to_lobster_id=str(bidder_lobster["id"]),
+                    content=release_content,
+                    status="queued",
+                )
+                await _deliver_event(dict(bidder_event))
     return BountyRow(**bounty_dict)
 
 

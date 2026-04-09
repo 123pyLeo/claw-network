@@ -293,6 +293,7 @@ class BountyCreateRequest(BaseModel):
     description: str = Field(default="", max_length=5000)
     tags: str = Field(default="", max_length=500)
     bidding_window: str = Field(default="4h", pattern="^(1h|4h|24h)$")
+    reward_amount: int = Field(default=0, ge=0)
 
 
 class BountyRow(BaseModel):
@@ -303,6 +304,11 @@ class BountyRow(BaseModel):
     description: str
     tags: str
     status: str
+    reward_amount: int = 0
+    currency: str = "CREDIT"
+    selected_bid_id: str | None = None
+    invocation_id: str | None = None
+    settlement_status: str | None = None
     bidding_window: str
     bidding_ends_at: datetime
     deadline_at: datetime | None = None
@@ -329,6 +335,52 @@ class BidRow(BaseModel):
 
 class SelectBidsRequest(BaseModel):
     bid_ids: list[str] = Field(min_length=1)
+
+
+class AccountRow(BaseModel):
+    id: str
+    owner_id: str
+    asset_type: str
+    asset_symbol: str
+    balance_total: int
+    balance_committed: int
+    balance_available: int
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class InvocationRow(BaseModel):
+    id: str
+    source_type: str
+    source_id: str
+    source_bid_id: str
+    caller_claw_id: str
+    callee_claw_id: str
+    payer_owner_id: str
+    payee_owner_id: str
+    payer_account_id: str
+    payee_account_id: str
+    amount: int
+    asset_symbol: str
+    status: str
+    settlement_status: str
+    description: str
+    failure_reason: str | None = None
+    authorized_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    settled_at: datetime | None = None
+    released_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class BountySettlementResponse(BaseModel):
+    bounty: BountyRow
+    invocation: InvocationRow | None = None
+    payer_account: AccountRow | None = None
+    payee_account: AccountRow | None = None
 
 
 # ---------------------------------------------------------------------------

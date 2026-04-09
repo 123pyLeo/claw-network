@@ -15,6 +15,8 @@ OFFICIAL_CLAW_ID = "CLAW-000001"
 OFFICIAL_NAME = "零动涌现的龙虾"
 OFFICIAL_OWNER = "OpenClaw Official"
 CLAW_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+DEFAULT_ASSET_TYPE = "internal_credit"
+DEFAULT_ASSET_SYMBOL = "CREDIT"
 MESSAGE_STATUS_LABELS = {
     "queued": "排队中",
     "delivered": "已送达",
@@ -83,6 +85,51 @@ _EVENT_ROW_SELECT = """
     LEFT JOIN lobsters lf ON lf.id = me.from_lobster_id
     LEFT JOIN lobsters lt ON lt.id = me.to_lobster_id
     LEFT JOIN rooms r ON r.id = me.room_id
+"""
+
+_ACCOUNT_ROW_SELECT = """
+    SELECT
+        a.id,
+        a.owner_id,
+        a.asset_type,
+        a.asset_symbol,
+        a.balance_total,
+        a.balance_committed,
+        a.balance_available,
+        a.status,
+        a.created_at,
+        a.updated_at
+    FROM accounts a
+"""
+
+_INVOCATION_ROW_SELECT = """
+    SELECT
+        i.id,
+        i.source_type,
+        i.source_id,
+        i.source_bid_id,
+        caller.claw_id AS caller_claw_id,
+        callee.claw_id AS callee_claw_id,
+        i.payer_owner_id,
+        i.payee_owner_id,
+        i.payer_account_id,
+        i.payee_account_id,
+        i.amount,
+        i.asset_symbol,
+        i.status,
+        i.settlement_status,
+        i.description,
+        i.failure_reason,
+        i.authorized_at,
+        i.started_at,
+        i.completed_at,
+        i.settled_at,
+        i.released_at,
+        i.created_at,
+        i.updated_at
+    FROM invocations i
+    JOIN lobsters caller ON caller.id = i.caller_lobster_id
+    JOIN lobsters callee ON callee.id = i.callee_lobster_id
 """
 
 
@@ -215,6 +262,72 @@ def init_db() -> None:
                 member_count INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS owners (
+                id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                owner_type TEXT NOT NULL DEFAULT 'individual',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS accounts (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                asset_type TEXT NOT NULL DEFAULT 'internal_credit',
+                asset_symbol TEXT NOT NULL DEFAULT 'CREDIT',
+                balance_total INTEGER NOT NULL DEFAULT 0,
+                balance_committed INTEGER NOT NULL DEFAULT 0,
+                balance_available INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_id, asset_symbol)
+            );
+
+            CREATE TABLE IF NOT EXISTS invocations (
+                id TEXT PRIMARY KEY,
+                source_type TEXT NOT NULL DEFAULT 'bounty',
+                source_id TEXT NOT NULL,
+                source_bid_id TEXT NOT NULL,
+                caller_lobster_id TEXT NOT NULL,
+                callee_lobster_id TEXT NOT NULL,
+                payer_owner_id TEXT NOT NULL,
+                payee_owner_id TEXT NOT NULL,
+                payer_account_id TEXT NOT NULL,
+                payee_account_id TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                asset_symbol TEXT NOT NULL DEFAULT 'CREDIT',
+                status TEXT NOT NULL DEFAULT 'created',
+                settlement_status TEXT NOT NULL DEFAULT 'none',
+                description TEXT NOT NULL DEFAULT '',
+                failure_reason TEXT,
+                authorized_at TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                settled_at TEXT,
+                released_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ledger_entries (
+                id TEXT PRIMARY KEY,
+                invocation_id TEXT,
+                owner_id TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                counterparty_owner_id TEXT,
+                action TEXT NOT NULL,
+                asset_symbol TEXT NOT NULL DEFAULT 'CREDIT',
+                amount INTEGER NOT NULL,
+                delta_total INTEGER NOT NULL DEFAULT 0,
+                delta_committed INTEGER NOT NULL DEFAULT 0,
+                delta_available INTEGER NOT NULL DEFAULT 0,
+                note TEXT NOT NULL DEFAULT '',
+                external_reference TEXT,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS bounties (
                 id TEXT PRIMARY KEY,
                 poster_lobster_id TEXT NOT NULL,
@@ -222,6 +335,10 @@ def init_db() -> None:
                 description TEXT NOT NULL DEFAULT '',
                 tags TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'open',
+                reward_amount INTEGER NOT NULL DEFAULT 0,
+                currency TEXT NOT NULL DEFAULT 'CREDIT',
+                selected_bid_id TEXT,
+                invocation_id TEXT,
                 bidding_window TEXT NOT NULL DEFAULT '4h',
                 bidding_ends_at TEXT NOT NULL,
                 deadline_at TEXT,
@@ -264,6 +381,9 @@ def init_db() -> None:
         _ensure_column(conn, "lobsters", "did", "TEXT")
         _ensure_column(conn, "lobsters", "public_key", "TEXT")
         _ensure_column(conn, "lobsters", "key_algorithm", "TEXT DEFAULT 'Ed25519'")
+        _ensure_column(conn, "lobsters", "owner_id", "TEXT")
+        _ensure_column(conn, "lobsters", "payment_enabled", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "lobsters", "pricing_model", "TEXT")
         _ensure_column(conn, "lobsters", "verified_phone", "TEXT")
         _ensure_column(conn, "lobsters", "phone_verified_at", "TEXT")
         _ensure_column(conn, "lobsters", "role", "TEXT")
@@ -275,18 +395,95 @@ def init_db() -> None:
         _ensure_column(conn, "lobsters", "email_verified_at", "TEXT")
         _ensure_column(conn, "message_events", "room_id", "TEXT")
         _ensure_column(conn, "message_events", "room_message_id", "TEXT")
+        _ensure_column(conn, "bounties", "reward_amount", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "bounties", "currency", f"TEXT NOT NULL DEFAULT '{DEFAULT_ASSET_SYMBOL}'")
+        _ensure_column(conn, "bounties", "selected_bid_id", "TEXT")
+        _ensure_column(conn, "bounties", "invocation_id", "TEXT")
         _ensure_column(conn, "verification_codes", "attempts", "INTEGER NOT NULL DEFAULT 0")
         # Unique indexes for identity columns (CREATE INDEX IF NOT EXISTS is safe to re-run)
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lobsters_did ON lobsters(did) WHERE did IS NOT NULL")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lobsters_verified_phone ON lobsters(verified_phone) WHERE verified_phone IS NOT NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_lobsters_owner_id ON lobsters(owner_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_invocations_source_id ON invocations(source_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_invocations_payer_owner_id ON invocations(payer_owner_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_invocations_payee_owner_id ON invocations(payee_owner_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_owner_id_created_at ON ledger_entries(owner_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_invocation_id ON ledger_entries(invocation_id)")
     seed_official_lobster()
     seed_public_rooms()
+    ensure_payment_accounts()
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_sql: str) -> None:
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_sql}")
+
+
+def _create_owner(conn: sqlite3.Connection, display_name: str) -> str:
+    owner_id = new_uuid()
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO owners (id, display_name, owner_type, status, created_at, updated_at)
+        VALUES (?, ?, 'individual', 'active', ?, ?)
+        """,
+        (owner_id, display_name.strip(), now, now),
+    )
+    return owner_id
+
+
+def _ensure_account_for_owner(conn: sqlite3.Connection, owner_id: str) -> str:
+    row = conn.execute(
+        "SELECT id FROM accounts WHERE owner_id = ? AND asset_symbol = ?",
+        (owner_id, DEFAULT_ASSET_SYMBOL),
+    ).fetchone()
+    if row is not None:
+        return str(row["id"])
+    account_id = new_uuid()
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO accounts (
+            id, owner_id, asset_type, asset_symbol,
+            balance_total, balance_committed, balance_available,
+            status, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, 0, 0, 0, 'active', ?, ?)
+        """,
+        (account_id, owner_id, DEFAULT_ASSET_TYPE, DEFAULT_ASSET_SYMBOL, now, now),
+    )
+    return account_id
+
+
+def _ensure_owner_and_account_for_lobster_id(conn: sqlite3.Connection, lobster_id: str, owner_name: str) -> tuple[str, str]:
+    row = conn.execute(
+        "SELECT owner_id FROM lobsters WHERE id = ?",
+        (lobster_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("Lobster not found.")
+    owner_id = str(row["owner_id"] or "").strip()
+    if not owner_id:
+        owner_id = _create_owner(conn, owner_name)
+        conn.execute(
+            "UPDATE lobsters SET owner_id = ?, updated_at = ? WHERE id = ?",
+            (owner_id, utc_now(), lobster_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE owners SET display_name = ?, updated_at = ? WHERE id = ?",
+            (owner_name.strip(), utc_now(), owner_id),
+        )
+    account_id = _ensure_account_for_owner(conn, owner_id)
+    return owner_id, account_id
+
+
+def ensure_payment_accounts() -> None:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT id, owner_name FROM lobsters ORDER BY created_at ASC").fetchall()
+        for row in rows:
+            _ensure_owner_and_account_for_lobster_id(conn, str(row["id"]), str(row["owner_name"]))
 
 
 def _normalize_lobster_name(value: str) -> str:
@@ -339,6 +536,7 @@ def _lobster_by_runtime_id(runtime_id: str) -> sqlite3.Row | None:
             """
             SELECT id, runtime_id, claw_id, name, owner_name, is_official,
                    connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
+                   owner_id, payment_enabled, pricing_model,
                    auth_token, token_updated_at,
                    did, public_key, key_algorithm,
                    verified_phone, phone_verified_at,
@@ -357,6 +555,7 @@ def get_lobster_by_claw_id(claw_id: str) -> sqlite3.Row | None:
             """
             SELECT id, runtime_id, claw_id, name, owner_name, is_official,
                    connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
+                   owner_id, payment_enabled, pricing_model,
                    auth_token, token_updated_at,
                    did, public_key, key_algorithm,
                    verified_phone, phone_verified_at,
@@ -366,6 +565,25 @@ def get_lobster_by_claw_id(claw_id: str) -> sqlite3.Row | None:
             WHERE claw_id = ?
             """,
             (claw_id.strip().upper(),),
+        ).fetchone()
+
+
+def get_lobster_by_id(lobster_id: str) -> sqlite3.Row | None:
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT id, runtime_id, claw_id, name, owner_name, is_official,
+                   connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
+                   owner_id, payment_enabled, pricing_model,
+                   auth_token, token_updated_at,
+                   did, public_key, key_algorithm,
+                   verified_phone, phone_verified_at,
+                   role, org_name, real_name, role_verified, role_verified_at, verified_email, email_verified_at,
+                   created_at, updated_at
+            FROM lobsters
+            WHERE id = ?
+            """,
+            (lobster_id,),
         ).fetchone()
 
 
@@ -430,6 +648,7 @@ def get_lobster_by_token(token: str) -> sqlite3.Row | None:
             """
             SELECT id, runtime_id, claw_id, name, owner_name, is_official,
                    connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
+                   owner_id, payment_enabled, pricing_model,
                    auth_token, token_updated_at,
                    did, public_key, key_algorithm,
                    verified_phone, phone_verified_at,
@@ -615,6 +834,7 @@ def register_lobster(
             elif validated_pk and existing["public_key"]:
                 if validated_pk != str(existing["public_key"]).strip():
                     raise ValueError("此龙虾已绑定密钥，不可更换。如需重置请联系平台管理员。")
+            _ensure_owner_and_account_for_lobster_id(conn, str(existing["id"]), cleaned_owner_name)
         lobster = _lobster_by_runtime_id(runtime_id)
     else:
         with get_conn() as conn:
@@ -657,6 +877,7 @@ def register_lobster(
                     now,
                 ),
             )
+            _ensure_owner_and_account_for_lobster_id(conn, lobster_id, cleaned_owner_name)
         lobster = _lobster_by_runtime_id(runtime_id)
 
     assert lobster is not None
@@ -722,6 +943,7 @@ def get_lobster_by_did(did: str) -> sqlite3.Row | None:
             """
             SELECT id, runtime_id, claw_id, name, owner_name, is_official,
                    connection_request_policy, collaboration_policy, official_lobster_policy, session_limit_policy, roundtable_notification_mode,
+                   owner_id, payment_enabled, pricing_model,
                    auth_token, token_updated_at,
                    did, public_key, key_algorithm,
                    verified_phone, phone_verified_at,
@@ -1819,7 +2041,7 @@ def stats_overview() -> dict[str, int | str]:
         )
         bounties_total = int(conn.execute("SELECT COUNT(*) FROM bounties").fetchone()[0])
         bounties_fulfilled = int(
-            conn.execute("SELECT COUNT(*) FROM bounties WHERE status = 'fulfilled'").fetchone()[0]
+            conn.execute("SELECT COUNT(*) FROM bounties WHERE status IN ('fulfilled', 'settled')").fetchone()[0]
         )
         bounties_active = int(
             conn.execute("SELECT COUNT(*) FROM bounties WHERE status IN ('open', 'bidding', 'assigned')").fetchone()[0]
@@ -2094,6 +2316,147 @@ def create_message(from_claw_id: str, to_claw_id: str, content: str, message_typ
     )
 
 
+def get_account_by_owner_id(owner_id: str) -> sqlite3.Row:
+    with get_conn() as conn:
+        row = conn.execute(
+            _ACCOUNT_ROW_SELECT + " WHERE a.owner_id = ? AND a.asset_symbol = ?",
+            (owner_id, DEFAULT_ASSET_SYMBOL),
+        ).fetchone()
+    if row is None:
+        raise ValueError("Account not found.")
+    return row
+
+
+def get_account_by_claw_id(claw_id: str) -> sqlite3.Row:
+    lobster = get_lobster_by_claw_id(claw_id)
+    if lobster is None:
+        raise ValueError("Lobster not found.")
+    owner_id = str(lobster["owner_id"] or "").strip()
+    if not owner_id:
+        raise ValueError("Lobster has no payment owner.")
+    return get_account_by_owner_id(owner_id)
+
+
+def get_invocation(invocation_id: str) -> sqlite3.Row:
+    with get_conn() as conn:
+        row = conn.execute(_INVOCATION_ROW_SELECT + " WHERE i.id = ?", (invocation_id,)).fetchone()
+    if row is None:
+        raise ValueError("Invocation not found.")
+    return row
+
+
+def _insert_ledger_entry(
+    conn: sqlite3.Connection,
+    *,
+    invocation_id: str | None,
+    owner_id: str,
+    account_id: str,
+    counterparty_owner_id: str | None,
+    action: str,
+    amount: int,
+    delta_total: int,
+    delta_committed: int,
+    delta_available: int,
+    note: str = "",
+    external_reference: str | None = None,
+) -> str:
+    entry_id = new_uuid()
+    conn.execute(
+        """
+        INSERT INTO ledger_entries (
+            id, invocation_id, owner_id, account_id, counterparty_owner_id,
+            action, asset_symbol, amount,
+            delta_total, delta_committed, delta_available,
+            note, external_reference, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            entry_id,
+            invocation_id,
+            owner_id,
+            account_id,
+            counterparty_owner_id,
+            action,
+            DEFAULT_ASSET_SYMBOL,
+            amount,
+            delta_total,
+            delta_committed,
+            delta_available,
+            note,
+            external_reference,
+            utc_now(),
+        ),
+    )
+    return entry_id
+
+
+def _apply_account_deltas(
+    conn: sqlite3.Connection,
+    *,
+    account_id: str,
+    delta_total: int = 0,
+    delta_committed: int = 0,
+    delta_available: int = 0,
+) -> sqlite3.Row:
+    row = conn.execute(_ACCOUNT_ROW_SELECT + " WHERE a.id = ?", (account_id,)).fetchone()
+    if row is None:
+        raise ValueError("Account not found.")
+    new_total = int(row["balance_total"]) + delta_total
+    new_committed = int(row["balance_committed"]) + delta_committed
+    new_available = int(row["balance_available"]) + delta_available
+    if new_total < 0 or new_committed < 0 or new_available < 0:
+        raise ValueError("Account balance cannot become negative.")
+    if new_total - new_committed != new_available:
+        raise ValueError("Account delta would violate balance invariants.")
+    conn.execute(
+        """
+        UPDATE accounts
+        SET balance_total = ?, balance_committed = ?, balance_available = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (new_total, new_committed, new_available, utc_now(), account_id),
+    )
+    updated = conn.execute(_ACCOUNT_ROW_SELECT + " WHERE a.id = ?", (account_id,)).fetchone()
+    assert updated is not None
+    return updated
+
+
+def grant_funds_by_claw_id(claw_id: str, amount: int, note: str = "") -> sqlite3.Row:
+    if amount <= 0:
+        raise ValueError("Grant amount must be positive.")
+    lobster = get_lobster_by_claw_id(claw_id)
+    if lobster is None:
+        raise ValueError("Lobster not found.")
+    owner_id = str(lobster["owner_id"] or "").strip()
+    if not owner_id:
+        raise ValueError("Lobster has no payment owner.")
+    with get_conn() as conn:
+        account = conn.execute(
+            _ACCOUNT_ROW_SELECT + " WHERE a.owner_id = ? AND a.asset_symbol = ?",
+            (owner_id, DEFAULT_ASSET_SYMBOL),
+        ).fetchone()
+        if account is None:
+            raise ValueError("Account not found.")
+        _apply_account_deltas(conn, account_id=str(account["id"]), delta_total=amount, delta_available=amount)
+        _insert_ledger_entry(
+            conn,
+            invocation_id=None,
+            owner_id=owner_id,
+            account_id=str(account["id"]),
+            counterparty_owner_id=None,
+            action="grant",
+            amount=amount,
+            delta_total=amount,
+            delta_committed=0,
+            delta_available=amount,
+            note=note or "Manual fund grant",
+        )
+        updated = conn.execute(_ACCOUNT_ROW_SELECT + " WHERE a.id = ?", (str(account["id"]),)).fetchone()
+    assert updated is not None
+    return updated
+
+
 def get_inbox(claw_id: str, after: str | None = None, limit: int = 100) -> list[sqlite3.Row]:
     lobster = get_lobster_by_claw_id(claw_id)
     if lobster is None:
@@ -2331,14 +2694,6 @@ def _expire_stale_bounties(conn: sqlite3.Connection) -> None:
         """,
         (now, now),
     )
-    conn.execute(
-        """
-        UPDATE bounties
-        SET status = 'expired', updated_at = ?
-        WHERE status = 'assigned' AND deadline_at IS NOT NULL AND deadline_at <= ?
-        """,
-        (now, now),
-    )
 
 
 def _bounty_row_select() -> str:
@@ -2349,6 +2704,11 @@ def _bounty_row_select() -> str:
             b.description,
             b.tags,
             b.status,
+            b.reward_amount,
+            b.currency,
+            b.selected_bid_id,
+            b.invocation_id,
+            i.settlement_status,
             b.bidding_window,
             b.bidding_ends_at,
             b.deadline_at,
@@ -2360,6 +2720,7 @@ def _bounty_row_select() -> str:
             poster.name AS poster_name
         FROM bounties b
         JOIN lobsters poster ON poster.id = b.poster_lobster_id
+        LEFT JOIN invocations i ON i.id = b.invocation_id
     """
 
 
@@ -2379,12 +2740,20 @@ def _bid_row_select() -> str:
     """
 
 
+def _selected_bid_for_bounty(conn: sqlite3.Connection, bounty_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        _bid_row_select() + " WHERE bb.bounty_id = ? AND bb.status = 'selected' ORDER BY bb.created_at ASC LIMIT 1",
+        (bounty_id,),
+    ).fetchone()
+
+
 def create_bounty(
     poster_claw_id: str,
     title: str,
     description: str = "",
     tags: str = "",
     bidding_window: str = DEFAULT_BOUNTY_BIDDING_WINDOW,
+    reward_amount: int = 0,
 ) -> sqlite3.Row:
     poster = get_lobster_by_claw_id(poster_claw_id)
     if poster is None:
@@ -2392,6 +2761,8 @@ def create_bounty(
     cleaned_title = title.strip()
     if not cleaned_title:
         raise ValueError("Bounty title cannot be empty.")
+    if reward_amount < 0:
+        raise ValueError("Reward amount cannot be negative.")
     if bidding_window not in BOUNTY_BIDDING_WINDOW_OPTIONS:
         bidding_window = DEFAULT_BOUNTY_BIDDING_WINDOW
 
@@ -2407,9 +2778,10 @@ def create_bounty(
             """
             INSERT INTO bounties (
                 id, poster_lobster_id, title, description, tags,
-                status, bidding_window, bidding_ends_at, deadline_at,
+                status, reward_amount, currency, selected_bid_id, invocation_id,
+                bidding_window, bidding_ends_at, deadline_at,
                 created_at, updated_at, fulfilled_at, cancelled_at
-            ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, NULL, ?, ?, NULL, NULL)
+            ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, NULL, NULL)
             """,
             (
                 bounty_id,
@@ -2417,6 +2789,8 @@ def create_bounty(
                 cleaned_title,
                 description.strip(),
                 ",".join(t.strip().lower() for t in tags.split(",") if t.strip()),
+                int(reward_amount),
+                DEFAULT_ASSET_SYMBOL,
                 bidding_window,
                 bidding_ends_at,
                 now,
@@ -2524,12 +2898,12 @@ def select_bids(
     bounty_id: str,
     poster_claw_id: str,
     bid_ids: list[str],
-) -> tuple[sqlite3.Row, list[sqlite3.Row]]:
+) -> tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row | None]:
     poster = get_lobster_by_claw_id(poster_claw_id)
     if poster is None:
         raise ValueError("Poster lobster not found.")
-    if not bid_ids:
-        raise ValueError("Must select at least one bid.")
+    if len(bid_ids) != 1:
+        raise ValueError("Exactly one bid must be selected in this version.")
     with get_conn() as conn:
         _expire_stale_bounties(conn)
         bounty_raw = conn.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,)).fetchone()
@@ -2544,38 +2918,185 @@ def select_bids(
         deadline_at = datetime.fromtimestamp(
             datetime.fromisoformat(now).timestamp() + BOUNTY_FULFILLMENT_SECONDS, timezone.utc
         ).isoformat()
+        bid_id = bid_ids[0]
+        bid = conn.execute(
+            "SELECT * FROM bounty_bids WHERE id = ? AND bounty_id = ?",
+            (bid_id, bounty_id),
+        ).fetchone()
+        if bid is None:
+            raise ValueError(f"Bid {bid_id} not found for this bounty.")
+        if str(bid["status"]) != "pending":
+            raise ValueError("Only pending bids can be selected.")
+        bidder = conn.execute(
+            "SELECT id, claw_id, name, owner_id FROM lobsters WHERE id = ?",
+            (bid["bidder_lobster_id"],),
+        ).fetchone()
+        if bidder is None:
+            raise ValueError("Bidder lobster not found.")
+        invocation_row: sqlite3.Row | None = None
 
-        for bid_id in bid_ids:
-            bid = conn.execute(
-                "SELECT id, bounty_id FROM bounty_bids WHERE id = ? AND bounty_id = ?",
-                (bid_id, bounty_id),
-            ).fetchone()
-            if bid is None:
-                raise ValueError(f"Bid {bid_id} not found for this bounty.")
-            conn.execute(
-                "UPDATE bounty_bids SET status = 'selected', selected_at = ? WHERE id = ?",
-                (now, bid_id),
-            )
+        conn.execute(
+            "UPDATE bounty_bids SET status = 'selected', selected_at = ? WHERE id = ?",
+            (now, bid_id),
+        )
         conn.execute(
             "UPDATE bounty_bids SET status = 'rejected' WHERE bounty_id = ? AND status = 'pending'",
             (bounty_id,),
         )
+
+        selected_bid_id = bid_id
+        invocation_id: str | None = None
+        reward_amount = int(bounty_raw["reward_amount"] or 0)
+        if reward_amount > 0:
+            payer_owner_id = str(poster["owner_id"] or "").strip()
+            payee_owner_id = str(bidder["owner_id"] or "").strip()
+            if not payer_owner_id or not payee_owner_id:
+                raise ValueError("Payment owner is missing for this bounty.")
+            payer_account = conn.execute(
+                _ACCOUNT_ROW_SELECT + " WHERE a.owner_id = ? AND a.asset_symbol = ?",
+                (payer_owner_id, DEFAULT_ASSET_SYMBOL),
+            ).fetchone()
+            payee_account = conn.execute(
+                _ACCOUNT_ROW_SELECT + " WHERE a.owner_id = ? AND a.asset_symbol = ?",
+                (payee_owner_id, DEFAULT_ASSET_SYMBOL),
+            ).fetchone()
+            if payer_account is None or payee_account is None:
+                raise ValueError("Payment account not found.")
+            if int(payer_account["balance_available"] or 0) < reward_amount:
+                raise ValueError("Insufficient available balance.")
+            _apply_account_deltas(
+                conn,
+                account_id=str(payer_account["id"]),
+                delta_committed=reward_amount,
+                delta_available=-reward_amount,
+            )
+            invocation_id = new_uuid()
+            conn.execute(
+                """
+                INSERT INTO invocations (
+                    id, source_type, source_id, source_bid_id,
+                    caller_lobster_id, callee_lobster_id,
+                    payer_owner_id, payee_owner_id,
+                    payer_account_id, payee_account_id,
+                    amount, asset_symbol, status, settlement_status,
+                    description, failure_reason,
+                    authorized_at, started_at, completed_at, settled_at, released_at,
+                    created_at, updated_at
+                )
+                VALUES (?, 'bounty', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'authorized', 'reserved', ?, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    invocation_id,
+                    bounty_id,
+                    bid_id,
+                    str(poster["id"]),
+                    str(bidder["id"]),
+                    payer_owner_id,
+                    payee_owner_id,
+                    str(payer_account["id"]),
+                    str(payee_account["id"]),
+                    reward_amount,
+                    DEFAULT_ASSET_SYMBOL,
+                    str(bounty_raw["title"]),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            _insert_ledger_entry(
+                conn,
+                invocation_id=invocation_id,
+                owner_id=payer_owner_id,
+                account_id=str(payer_account["id"]),
+                counterparty_owner_id=payee_owner_id,
+                action="reserve",
+                amount=reward_amount,
+                delta_total=0,
+                delta_committed=reward_amount,
+                delta_available=-reward_amount,
+                note=f"Reserved funds for bounty {bounty_id}",
+            )
+
         conn.execute(
-            "UPDATE bounties SET status = 'assigned', deadline_at = ?, updated_at = ? WHERE id = ?",
-            (deadline_at, now, bounty_id),
+            """
+            UPDATE bounties
+            SET status = 'assigned',
+                selected_bid_id = ?,
+                invocation_id = ?,
+                deadline_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (selected_bid_id, invocation_id, deadline_at, now, bounty_id),
         )
         bounty_row = conn.execute(
             _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
         ).fetchone()
-        selected_rows = conn.execute(
-            _bid_row_select() + " WHERE bb.bounty_id = ? AND bb.status = 'selected' ORDER BY bb.created_at ASC",
-            (bounty_id,),
-        ).fetchall()
+        selected_row = conn.execute(_bid_row_select() + " WHERE bb.id = ?", (bid_id,)).fetchone()
+        if invocation_id:
+            invocation_row = conn.execute(_INVOCATION_ROW_SELECT + " WHERE i.id = ?", (invocation_id,)).fetchone()
     assert bounty_row is not None
-    return bounty_row, list(selected_rows)
+    assert selected_row is not None
+    return bounty_row, selected_row, invocation_row
 
 
-def fulfill_bounty(bounty_id: str, poster_claw_id: str) -> sqlite3.Row:
+def fulfill_bounty(bounty_id: str, bidder_claw_id: str) -> tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row | None]:
+    bidder_actor = get_lobster_by_claw_id(bidder_claw_id)
+    if bidder_actor is None:
+        raise ValueError("Bidder lobster not found.")
+    now = utc_now()
+    with get_conn() as conn:
+        bounty_raw = conn.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,)).fetchone()
+        if bounty_raw is None:
+            raise ValueError("Bounty not found.")
+        if bounty_raw["status"] != "assigned":
+            raise ValueError("Only assigned bounties can be fulfilled.")
+        selected_bid = _selected_bid_for_bounty(conn, bounty_id)
+        if selected_bid is None:
+            raise ValueError("Assigned bounty has no selected bid.")
+        selected_bid_raw = conn.execute("SELECT bidder_lobster_id FROM bounty_bids WHERE id = ?", (str(selected_bid["id"]),)).fetchone()
+        if selected_bid_raw is None or str(selected_bid_raw["bidder_lobster_id"]) != str(bidder_actor["id"]):
+            raise ValueError("Only the selected bidder can mark this bounty as fulfilled.")
+
+        invocation_row: sqlite3.Row | None = None
+        invocation_id = str(bounty_raw["invocation_id"] or "").strip()
+        if invocation_id:
+            invocation = conn.execute("SELECT * FROM invocations WHERE id = ?", (invocation_id,)).fetchone()
+            if invocation is None:
+                raise ValueError("Invocation not found for this bounty.")
+            if str(invocation["status"]) not in {"authorized", "running", "created"}:
+                raise ValueError("Invocation is not in a fulfillable state.")
+            if str(invocation["settlement_status"]) != "reserved":
+                raise ValueError("Only reserved invocations can move to pending settlement.")
+            conn.execute(
+                """
+                UPDATE invocations
+                SET status = 'completed',
+                    settlement_status = 'pending',
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, invocation_id),
+            )
+            invocation_row = conn.execute(_INVOCATION_ROW_SELECT + " WHERE i.id = ?", (invocation_id,)).fetchone()
+        conn.execute(
+            "UPDATE bounties SET status = 'fulfilled', fulfilled_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, bounty_id),
+        )
+        row = conn.execute(
+            _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
+        ).fetchone()
+        selected_bid = conn.execute(_bid_row_select() + " WHERE bb.id = ?", (str(selected_bid["id"]),)).fetchone()
+    assert row is not None
+    assert selected_bid is not None
+    return row, selected_bid, invocation_row
+
+
+def confirm_bounty_settlement(
+    bounty_id: str,
+    poster_claw_id: str,
+) -> tuple[sqlite3.Row, sqlite3.Row | None, sqlite3.Row | None, sqlite3.Row | None]:
     poster = get_lobster_by_claw_id(poster_claw_id)
     if poster is None:
         raise ValueError("Poster lobster not found.")
@@ -2585,21 +3106,83 @@ def fulfill_bounty(bounty_id: str, poster_claw_id: str) -> sqlite3.Row:
         if bounty_raw is None:
             raise ValueError("Bounty not found.")
         if bounty_raw["poster_lobster_id"] != poster["id"]:
-            raise ValueError("Only the poster can mark a bounty as fulfilled.")
-        if bounty_raw["status"] != "assigned":
-            raise ValueError("Only assigned bounties can be fulfilled.")
+            raise ValueError("Only the poster can confirm settlement.")
+        if bounty_raw["status"] != "fulfilled":
+            raise ValueError("Only fulfilled bounties can be settled.")
+
+        invocation_row: sqlite3.Row | None = None
+        payer_account_row: sqlite3.Row | None = None
+        payee_account_row: sqlite3.Row | None = None
+        invocation_id = str(bounty_raw["invocation_id"] or "").strip()
+        if invocation_id:
+            invocation = conn.execute("SELECT * FROM invocations WHERE id = ?", (invocation_id,)).fetchone()
+            if invocation is None:
+                raise ValueError("Invocation not found for this bounty.")
+            if str(invocation["status"]) != "completed":
+                raise ValueError("Invocation must be completed before settlement.")
+            if str(invocation["settlement_status"]) != "pending":
+                raise ValueError("Invocation is not awaiting settlement.")
+            amount = int(invocation["amount"] or 0)
+            payer_account_row = _apply_account_deltas(
+                conn,
+                account_id=str(invocation["payer_account_id"]),
+                delta_total=-amount,
+                delta_committed=-amount,
+            )
+            payee_account_row = _apply_account_deltas(
+                conn,
+                account_id=str(invocation["payee_account_id"]),
+                delta_total=amount,
+                delta_available=amount,
+            )
+            _insert_ledger_entry(
+                conn,
+                invocation_id=invocation_id,
+                owner_id=str(invocation["payer_owner_id"]),
+                account_id=str(invocation["payer_account_id"]),
+                counterparty_owner_id=str(invocation["payee_owner_id"]),
+                action="settle_debit",
+                amount=amount,
+                delta_total=-amount,
+                delta_committed=-amount,
+                delta_available=0,
+                note=f"Settled payout for bounty {bounty_id}",
+            )
+            _insert_ledger_entry(
+                conn,
+                invocation_id=invocation_id,
+                owner_id=str(invocation["payee_owner_id"]),
+                account_id=str(invocation["payee_account_id"]),
+                counterparty_owner_id=str(invocation["payer_owner_id"]),
+                action="settle_credit",
+                amount=amount,
+                delta_total=amount,
+                delta_committed=0,
+                delta_available=amount,
+                note=f"Received payout for bounty {bounty_id}",
+            )
+            conn.execute(
+                """
+                UPDATE invocations
+                SET settlement_status = 'settled',
+                    settled_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, invocation_id),
+            )
+            invocation_row = conn.execute(_INVOCATION_ROW_SELECT + " WHERE i.id = ?", (invocation_id,)).fetchone()
+
         conn.execute(
-            "UPDATE bounties SET status = 'fulfilled', fulfilled_at = ?, updated_at = ? WHERE id = ?",
-            (now, now, bounty_id),
+            "UPDATE bounties SET status = 'settled', updated_at = ? WHERE id = ?",
+            (now, bounty_id),
         )
-        row = conn.execute(
-            _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
-        ).fetchone()
-    assert row is not None
-    return row
+        bounty_row = conn.execute(_bounty_row_select() + " WHERE b.id = ?", (bounty_id,)).fetchone()
+    assert bounty_row is not None
+    return bounty_row, invocation_row, payer_account_row, payee_account_row
 
 
-def cancel_bounty(bounty_id: str, poster_claw_id: str) -> sqlite3.Row:
+def cancel_bounty(bounty_id: str, poster_claw_id: str) -> tuple[sqlite3.Row, sqlite3.Row | None, sqlite3.Row | None]:
     poster = get_lobster_by_claw_id(poster_claw_id)
     if poster is None:
         raise ValueError("Poster lobster not found.")
@@ -2610,8 +3193,55 @@ def cancel_bounty(bounty_id: str, poster_claw_id: str) -> sqlite3.Row:
             raise ValueError("Bounty not found.")
         if bounty_raw["poster_lobster_id"] != poster["id"]:
             raise ValueError("Only the poster can cancel a bounty.")
-        if bounty_raw["status"] in ("fulfilled", "expired", "cancelled"):
+        if bounty_raw["status"] in ("fulfilled", "expired", "cancelled", "settled"):
             raise ValueError(f"Cannot cancel a bounty with status '{bounty_raw['status']}'.")
+        selected_bid = _selected_bid_for_bounty(conn, bounty_id)
+        invocation_row: sqlite3.Row | None = None
+        invocation_id = str(bounty_raw["invocation_id"] or "").strip()
+        if invocation_id:
+            invocation = conn.execute("SELECT * FROM invocations WHERE id = ?", (invocation_id,)).fetchone()
+            if invocation is None:
+                raise ValueError("Invocation not found for this bounty.")
+            if str(invocation["settlement_status"]) == "settled":
+                raise ValueError("Cannot cancel a settled bounty.")
+            if str(invocation["settlement_status"]) == "reserved":
+                amount = int(invocation["amount"] or 0)
+                _apply_account_deltas(
+                    conn,
+                    account_id=str(invocation["payer_account_id"]),
+                    delta_committed=-amount,
+                    delta_available=amount,
+                )
+                _insert_ledger_entry(
+                    conn,
+                    invocation_id=invocation_id,
+                    owner_id=str(invocation["payer_owner_id"]),
+                    account_id=str(invocation["payer_account_id"]),
+                    counterparty_owner_id=str(invocation["payee_owner_id"]),
+                    action="release",
+                    amount=amount,
+                    delta_total=0,
+                    delta_committed=-amount,
+                    delta_available=amount,
+                    note=f"Released funds for cancelled bounty {bounty_id}",
+                )
+            conn.execute(
+                """
+                UPDATE invocations
+                SET status = 'cancelled',
+                    settlement_status = 'released',
+                    released_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, invocation_id),
+            )
+            invocation_row = conn.execute(_INVOCATION_ROW_SELECT + " WHERE i.id = ?", (invocation_id,)).fetchone()
+
+        conn.execute(
+            "UPDATE bounty_bids SET status = 'cancelled' WHERE bounty_id = ? AND status IN ('pending', 'selected')",
+            (bounty_id,),
+        )
         conn.execute(
             "UPDATE bounties SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ?",
             (now, now, bounty_id),
@@ -2619,5 +3249,7 @@ def cancel_bounty(bounty_id: str, poster_claw_id: str) -> sqlite3.Row:
         row = conn.execute(
             _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
         ).fetchone()
+        if selected_bid is not None:
+            selected_bid = conn.execute(_bid_row_select() + " WHERE bb.id = ?", (str(selected_bid["id"]),)).fetchone()
     assert row is not None
-    return row
+    return row, selected_bid, invocation_row
