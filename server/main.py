@@ -82,7 +82,7 @@ _rate_buckets: dict[str, list[float]] = defaultdict(list)
 
 
 def _check_rate_limit(request: Request) -> None:
-    ip = request.client.host if request.client else "unknown"
+    ip = _real_client_ip(request)
     now = time.monotonic()
     cutoff = now - _RATE_LIMIT_WINDOW
     with _rate_lock:
@@ -132,6 +132,41 @@ def _is_loopback_ip(ip: str) -> bool:
     """Whitelist localhost so internal testing / cron / health-check probes
     don't burn through the register quota."""
     return ip in ("127.0.0.1", "::1", "localhost", "unknown")
+
+
+# IPs of front-end proxies whose X-Forwarded-For header we trust. Anything
+# else is treated as the real client (we ignore whatever XFF it claims).
+#
+# Currently:
+#   - 104.250.118.105 = sandpile-website's nginx (B). All api.sandpile.io
+#     traffic comes through it.
+#   - loopback for completeness (test scripts that hit /register directly).
+_TRUSTED_PROXIES = {"104.250.118.105", "127.0.0.1", "::1"}
+
+
+def _real_client_ip(request: Request) -> str:
+    """Resolve the true source IP, honoring X-Forwarded-For only when the
+    direct connection comes from a trusted proxy.
+
+    Without this, every request from sandpile.io's nginx looked like
+    104.250.118.105 → all real users shared a single 5/hour register bucket
+    → one stuck sidecar could lock everyone out.
+
+    Only the LAST hop in X-Forwarded-For is read (the IP nginx itself saw),
+    so a malicious client can't spoof its source by injecting earlier hops.
+    """
+    direct = request.client.host if request.client else "unknown"
+    if direct not in _TRUSTED_PROXIES:
+        return direct
+    xff = request.headers.get("x-forwarded-for") or ""
+    if not xff:
+        # Trusted proxy didn't set XFF — fall back to its own IP. Means we
+        # rate-limit per-proxy, which is the same broken behavior we had
+        # before. Better than blindly trusting random untrusted proxies.
+        return direct
+    # XFF is "client, proxy1, proxy2". The leftmost is the original client.
+    real = xff.split(",")[0].strip()
+    return real or direct
 
 
 def _check_register_rate_limit(ip: str) -> bool:
@@ -412,7 +447,7 @@ def register(payload: RegisterRequest, request: Request) -> RegisterResponse:
 
     # Anti-abuse: dedicated stricter limit on /register specifically.
     # 5 fresh registrations per IP per hour (loopback exempt).
-    ip = request.client.host if request.client else "unknown"
+    ip = _real_client_ip(request)
     user_agent = str(request.headers.get("user-agent") or "")
     if not _check_register_rate_limit(ip):
         _record_register_audit(
