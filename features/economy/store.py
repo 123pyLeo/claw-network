@@ -148,6 +148,8 @@ def ensure_economy_tables() -> None:
     backfill_owner_nicknames()
     # Ensure the pairing_codes table exists for the "claim my OpenClaw lobster" flow
     ensure_pairing_codes_table()
+    # Reputation stats tables
+    ensure_stats_tables()
 
 
 def _migrate_existing_lobsters() -> None:
@@ -880,7 +882,9 @@ def create_invocation(
             row = conn.execute(
                 "SELECT * FROM invocations WHERE id = ?", (invocation_id,)
             ).fetchone()
-            return dict(row)
+            instant_dict = dict(row)
+            update_stats_on_settle(instant_dict)
+            return instant_dict
         except sqlite3.Error as exc:
             raise ValueError(f"调用失败：{exc}") from exc
 
@@ -1126,7 +1130,9 @@ def settle_reserved_funds(invocation_id: str) -> dict:
         result = conn.execute(
             "SELECT * FROM invocations WHERE id = ?", (invocation_id,)
         ).fetchone()
-    return dict(result)
+    settled_dict = dict(result)
+    update_stats_on_settle(settled_dict)
+    return settled_dict
 
 
 def release_reserved_funds(invocation_id: str) -> dict:
@@ -1181,7 +1187,9 @@ def release_reserved_funds(invocation_id: str) -> dict:
         result = conn.execute(
             "SELECT * FROM invocations WHERE id = ?", (invocation_id,)
         ).fetchone()
-    return dict(result)
+    released_dict = dict(result)
+    update_stats_on_release(released_dict)
+    return released_dict
 
 
 def get_invocation(invocation_id: str) -> dict | None:
@@ -1190,3 +1198,327 @@ def get_invocation(invocation_id: str) -> dict | None:
             "SELECT * FROM invocations WHERE id = ?", (invocation_id,)
         ).fetchone()
     return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Reputation stats: agent_stats + pair_stats
+# ---------------------------------------------------------------------------
+#
+# Design principle (from product discussion):
+#   "信任是关系,不是属性。平台提供原材料,不做裁判。"
+#
+# agent_stats = network-level summary (what the crowd thinks of this agent)
+# pair_stats  = relationship-level summary (what THIS caller thinks of THAT callee)
+#
+# No scores. Only objective counts: completed, released, total, earned.
+# Verdict/rating dimensions come later when we add post-transaction reviews.
+
+def ensure_stats_tables() -> None:
+    """Idempotent — safe to call from ensure_economy_tables()."""
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_stats (
+                lobster_id TEXT PRIMARY KEY,
+                total_invocations INTEGER NOT NULL DEFAULT 0,
+                total_completed INTEGER NOT NULL DEFAULT 0,
+                total_released INTEGER NOT NULL DEFAULT 0,
+                active_callers INTEGER NOT NULL DEFAULT 0,
+                completion_rate REAL NOT NULL DEFAULT 0,
+                total_earned INTEGER NOT NULL DEFAULT 0,
+                last_completed_at TEXT,
+                last_computed TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pair_stats (
+                caller_lobster_id TEXT NOT NULL,
+                callee_lobster_id TEXT NOT NULL,
+                total_invocations INTEGER NOT NULL DEFAULT 0,
+                total_completed INTEGER NOT NULL DEFAULT 0,
+                total_released INTEGER NOT NULL DEFAULT 0,
+                total_spent INTEGER NOT NULL DEFAULT 0,
+                last_invocation_at TEXT,
+                last_computed TEXT NOT NULL,
+                PRIMARY KEY (caller_lobster_id, callee_lobster_id)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pair_stats_callee "
+            "ON pair_stats(callee_lobster_id)"
+        )
+    # Backfill from existing invocations
+    _backfill_stats()
+
+
+def _backfill_stats() -> None:
+    """Recompute all stats from the invocations table. Idempotent."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT
+                i.id,
+                i.caller_owner_id,
+                i.callee_owner_id,
+                i.amount,
+                i.settlement_status,
+                i.created_at,
+                i.settled_at,
+                caller_l.id AS caller_lobster_id,
+                callee_l.id AS callee_lobster_id
+            FROM invocations i
+            LEFT JOIN lobsters caller_l ON caller_l.owner_id = i.caller_owner_id
+            LEFT JOIN lobsters callee_l ON callee_l.owner_id = i.callee_owner_id
+            WHERE i.settlement_status IN ('settled', 'released', 'instant')
+        """).fetchall()
+
+    if not rows:
+        return
+
+    now = utc_now()
+
+    # Aggregate by callee (agent_stats)
+    agent_agg: dict[str, dict] = {}
+    pair_agg: dict[tuple[str, str], dict] = {}
+    callee_callers: dict[str, set] = {}
+
+    for row in rows:
+        callee_id = row["callee_lobster_id"]
+        caller_id = row["caller_lobster_id"]
+        if not callee_id:
+            continue
+        settled = row["settlement_status"] in ("settled", "instant")
+        released = row["settlement_status"] == "released"
+        amount = int(row["amount"] or 0)
+
+        # agent_stats aggregation
+        if callee_id not in agent_agg:
+            agent_agg[callee_id] = {
+                "total": 0, "completed": 0, "released": 0,
+                "earned": 0, "last_completed": None,
+            }
+        a = agent_agg[callee_id]
+        a["total"] += 1
+        if settled:
+            a["completed"] += 1
+            a["earned"] += amount
+            ts = row["settled_at"] or row["created_at"]
+            if not a["last_completed"] or (ts and ts > a["last_completed"]):
+                a["last_completed"] = ts
+        if released:
+            a["released"] += 1
+
+        if callee_id not in callee_callers:
+            callee_callers[callee_id] = set()
+        if caller_id:
+            callee_callers[callee_id].add(caller_id)
+
+        # pair_stats aggregation
+        if caller_id:
+            key = (caller_id, callee_id)
+            if key not in pair_agg:
+                pair_agg[key] = {
+                    "total": 0, "completed": 0, "released": 0,
+                    "spent": 0, "last_at": None,
+                }
+            p = pair_agg[key]
+            p["total"] += 1
+            if settled:
+                p["completed"] += 1
+                p["spent"] += amount
+            if released:
+                p["released"] += 1
+            ts = row["settled_at"] or row["created_at"]
+            if not p["last_at"] or (ts and ts > p["last_at"]):
+                p["last_at"] = ts
+
+    # Write
+    with get_conn() as conn:
+        for lid, a in agent_agg.items():
+            total = a["total"]
+            rate = a["completed"] / total if total > 0 else 0
+            conn.execute("""
+                INSERT INTO agent_stats
+                    (lobster_id, total_invocations, total_completed, total_released,
+                     active_callers, completion_rate, total_earned,
+                     last_completed_at, last_computed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(lobster_id) DO UPDATE SET
+                    total_invocations = excluded.total_invocations,
+                    total_completed = excluded.total_completed,
+                    total_released = excluded.total_released,
+                    active_callers = excluded.active_callers,
+                    completion_rate = excluded.completion_rate,
+                    total_earned = excluded.total_earned,
+                    last_completed_at = excluded.last_completed_at,
+                    last_computed = excluded.last_computed
+            """, (
+                lid, total, a["completed"], a["released"],
+                len(callee_callers.get(lid, set())),
+                round(rate, 4), a["earned"],
+                a["last_completed"], now,
+            ))
+
+        for (caller_id, callee_id), p in pair_agg.items():
+            conn.execute("""
+                INSERT INTO pair_stats
+                    (caller_lobster_id, callee_lobster_id,
+                     total_invocations, total_completed, total_released,
+                     total_spent, last_invocation_at, last_computed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(caller_lobster_id, callee_lobster_id) DO UPDATE SET
+                    total_invocations = excluded.total_invocations,
+                    total_completed = excluded.total_completed,
+                    total_released = excluded.total_released,
+                    total_spent = excluded.total_spent,
+                    last_invocation_at = excluded.last_invocation_at,
+                    last_computed = excluded.last_computed
+            """, (
+                caller_id, callee_id,
+                p["total"], p["completed"], p["released"],
+                p["spent"], p["last_at"], now,
+            ))
+
+
+def update_stats_on_settle(invocation: dict) -> None:
+    """Call after settle_reserved_funds / create_invocation to update stats."""
+    _update_stats_for_invocation(invocation, settled=True)
+
+
+def update_stats_on_release(invocation: dict) -> None:
+    """Call after release_reserved_funds to update stats."""
+    _update_stats_for_invocation(invocation, settled=False)
+
+
+def _update_stats_for_invocation(invocation: dict, *, settled: bool) -> None:
+    caller_owner = str(invocation.get("caller_owner_id") or "")
+    callee_owner = str(invocation.get("callee_owner_id") or "")
+    amount = int(invocation.get("amount") or 0)
+    now = utc_now()
+
+    # Resolve lobster IDs from owner IDs
+    with get_conn() as conn:
+        caller_row = conn.execute(
+            "SELECT id FROM lobsters WHERE owner_id = ? LIMIT 1", (caller_owner,)
+        ).fetchone() if caller_owner else None
+        callee_row = conn.execute(
+            "SELECT id FROM lobsters WHERE owner_id = ? LIMIT 1", (callee_owner,)
+        ).fetchone() if callee_owner else None
+
+    caller_lid = str(caller_row["id"]) if caller_row else None
+    callee_lid = str(callee_row["id"]) if callee_row else None
+
+    if not callee_lid:
+        return
+
+    with get_conn() as conn:
+        # Upsert agent_stats for callee
+        existing = conn.execute(
+            "SELECT * FROM agent_stats WHERE lobster_id = ?", (callee_lid,)
+        ).fetchone()
+        if existing:
+            new_total = int(existing["total_invocations"]) + 1
+            new_completed = int(existing["total_completed"]) + (1 if settled else 0)
+            new_released = int(existing["total_released"]) + (0 if settled else 1)
+            new_earned = int(existing["total_earned"]) + (amount if settled else 0)
+            new_rate = new_completed / new_total if new_total > 0 else 0
+            # Count active callers
+            active = conn.execute(
+                "SELECT COUNT(DISTINCT caller_lobster_id) FROM pair_stats WHERE callee_lobster_id = ?",
+                (callee_lid,)
+            ).fetchone()[0]
+            if caller_lid:
+                active = max(active, 1)
+            conn.execute("""
+                UPDATE agent_stats SET
+                    total_invocations = ?, total_completed = ?, total_released = ?,
+                    active_callers = ?, completion_rate = ?, total_earned = ?,
+                    last_completed_at = CASE WHEN ? THEN ? ELSE last_completed_at END,
+                    last_computed = ?
+                WHERE lobster_id = ?
+            """, (
+                new_total, new_completed, new_released,
+                active, round(new_rate, 4), new_earned,
+                settled, now,
+                now, callee_lid,
+            ))
+        else:
+            conn.execute("""
+                INSERT INTO agent_stats
+                    (lobster_id, total_invocations, total_completed, total_released,
+                     active_callers, completion_rate, total_earned,
+                     last_completed_at, last_computed)
+                VALUES (?, 1, ?, ?, 1, ?, ?, ?, ?)
+            """, (
+                callee_lid,
+                1 if settled else 0,
+                0 if settled else 1,
+                1.0 if settled else 0.0,
+                amount if settled else 0,
+                now if settled else None,
+                now,
+            ))
+
+        # Upsert pair_stats
+        if caller_lid:
+            pair_existing = conn.execute(
+                "SELECT * FROM pair_stats WHERE caller_lobster_id = ? AND callee_lobster_id = ?",
+                (caller_lid, callee_lid),
+            ).fetchone()
+            if pair_existing:
+                conn.execute("""
+                    UPDATE pair_stats SET
+                        total_invocations = total_invocations + 1,
+                        total_completed = total_completed + ?,
+                        total_released = total_released + ?,
+                        total_spent = total_spent + ?,
+                        last_invocation_at = ?,
+                        last_computed = ?
+                    WHERE caller_lobster_id = ? AND callee_lobster_id = ?
+                """, (
+                    1 if settled else 0,
+                    0 if settled else 1,
+                    amount if settled else 0,
+                    now, now,
+                    caller_lid, callee_lid,
+                ))
+            else:
+                conn.execute("""
+                    INSERT INTO pair_stats
+                        (caller_lobster_id, callee_lobster_id,
+                         total_invocations, total_completed, total_released,
+                         total_spent, last_invocation_at, last_computed)
+                    VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                """, (
+                    caller_lid, callee_lid,
+                    1 if settled else 0,
+                    0 if settled else 1,
+                    amount if settled else 0,
+                    now, now,
+                ))
+
+
+def get_agent_stats(lobster_id: str) -> dict:
+    """Get reputation stats for a lobster. Returns zeros if no history."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM agent_stats WHERE lobster_id = ?", (lobster_id,)
+        ).fetchone()
+    if row is None:
+        return {
+            "lobster_id": lobster_id,
+            "total_invocations": 0,
+            "total_completed": 0,
+            "total_released": 0,
+            "active_callers": 0,
+            "completion_rate": 0,
+            "total_earned": 0,
+            "last_completed_at": None,
+        }
+    return dict(row)
+
+
+def get_agent_stats_by_claw_id(claw_id: str) -> dict:
+    """Same as get_agent_stats but resolves by claw_id."""
+    lobster = get_lobster_by_claw_id(claw_id)
+    if lobster is None:
+        return get_agent_stats("")
+    return get_agent_stats(str(lobster["id"]))

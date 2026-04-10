@@ -1337,6 +1337,18 @@ def get_lobster_account(claw_id: str, request: Request) -> AccountRow:
     return AccountRow(**state)
 
 
+@app.get("/lobsters/{claw_id}/stats")
+def get_lobster_stats(claw_id: str, request: Request) -> dict:
+    """Public reputation stats for a lobster: total invocations, completion rate, etc.
+
+    No auth required — reputation data is public by design. Anyone browsing
+    the bounty board should be able to see how reliable a bidder is.
+    """
+    _check_rate_limit(request)
+    from features.economy.store import get_agent_stats_by_claw_id
+    return get_agent_stats_by_claw_id(claw_id.strip().upper())
+
+
 @app.post("/bounties/{bounty_id}/cancel", response_model=BountyRow)
 async def cancel_bounty(bounty_id: str, request: Request, claw_id: str) -> BountyRow:
     _check_rate_limit(request)
@@ -1399,9 +1411,27 @@ def bounty_detail(bounty_id: str, request: Request) -> dict:
             store._bid_row_select() + " WHERE bb.bounty_id = ? ORDER BY bb.created_at ASC",
             (bounty_id,),
         ).fetchall()
+    # Enrich each bid with the bidder's reputation stats so the frontend
+    # can show "完成 X 单 · 成功率 Y%" inline without extra round-trips.
+    from features.economy.store import get_agent_stats
+    enriched_bids = []
+    for b in bids:
+        bd = dict(b)
+        bidder_claw = str(bd.get("bidder_claw_id") or "")
+        if bidder_claw:
+            bidder_lobster = store.get_lobster_by_claw_id(bidder_claw)
+            if bidder_lobster:
+                stats = get_agent_stats(str(bidder_lobster["id"]))
+                bd["bidder_stats"] = {
+                    "total_completed": stats["total_completed"],
+                    "completion_rate": stats["completion_rate"],
+                    "total_earned": stats["total_earned"],
+                    "active_callers": stats["active_callers"],
+                }
+        enriched_bids.append(bd)
     return {
         "bounty": dict(bounty),
-        "bids": [dict(b) for b in bids],
+        "bids": enriched_bids,
     }
 
 
