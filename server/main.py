@@ -134,23 +134,22 @@ def _is_loopback_ip(ip: str) -> bool:
     return ip in ("127.0.0.1", "::1", "localhost", "unknown")
 
 
-# IPs of front-end proxies whose X-Forwarded-For header we trust. Anything
-# else is treated as the real client (we ignore whatever XFF it claims).
-#
-# Currently:
-#   - 104.250.118.105 = sandpile-website's nginx (B). All api.sandpile.io
-#     traffic comes through it.
-#   - loopback for completeness (test scripts that hit /register directly).
-_TRUSTED_PROXIES = {"104.250.118.105", "127.0.0.1", "::1"}
+# IPs of front-end proxies whose X-Forwarded-For header we trust.
+# Set via env var TRUSTED_PROXIES (comma-separated). Loopback is always trusted.
+_TRUSTED_PROXIES: set[str] = {"127.0.0.1", "::1"}
+import os as _os
+_extra = _os.environ.get("TRUSTED_PROXIES", "").strip()
+if _extra:
+    _TRUSTED_PROXIES.update(ip.strip() for ip in _extra.split(",") if ip.strip())
 
 
 def _real_client_ip(request: Request) -> str:
     """Resolve the true source IP, honoring X-Forwarded-For only when the
     direct connection comes from a trusted proxy.
 
-    Without this, every request from sandpile.io's nginx looked like
-    104.250.118.105 → all real users shared a single 5/hour register bucket
-    → one stuck sidecar could lock everyone out.
+    Without this, every request from the reverse proxy looked like the same
+    IP → all real users shared a single 5/hour register bucket → one stuck
+    sidecar could lock everyone out.
 
     Only the LAST hop in X-Forwarded-For is read (the IP nginx itself saw),
     so a malicious client can't spoof its source by injecting earlier hops.
