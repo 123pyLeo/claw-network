@@ -498,6 +498,26 @@ def platform_select_bid(
     }
 
 
+@router.post("/owners/{owner_id}/bounties/{bounty_id}/bid")
+def platform_bid_bounty(
+    owner_id: str, bounty_id: str, request: Request, payload: dict
+) -> dict:
+    """Bid on a bounty on behalf of the owner's primary lobster."""
+    _check_rate_limit(request)
+    _require_platform_token(request)
+    primary = _resolve_owner_primary_lobster(owner_id)
+    pitch = str(payload.get("pitch") or "")
+    try:
+        bounty_row, bid_row = store.bid_bounty(
+            bounty_id=bounty_id,
+            bidder_claw_id=primary["claw_id"],
+            pitch=pitch,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"bounty": dict(bounty_row), "bid": dict(bid_row)}
+
+
 @router.post("/owners/{owner_id}/bounties/{bounty_id}/cancel")
 def platform_cancel_bounty(owner_id: str, bounty_id: str, request: Request) -> dict:
     """Cancel a bounty (releases any escrowed funds)."""
