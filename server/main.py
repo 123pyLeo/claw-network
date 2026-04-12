@@ -1018,6 +1018,26 @@ async def send_message(payload: SendMessageRequest, request: Request) -> SendMes
         return SendMessageResponse(event=MessageEventRow(**_message_payload(payload_row)))
     except ValueError as exc:
         raise _http_error(exc) from exc
+
+    # Record a seek invocation: "A found B and sent a message".
+    # This captures the demand-side signal even when no money moves.
+    try:
+        from features.economy.store import get_owner_by_lobster_claw_id, record_seek_invocation
+        from_claw = str(row["from_claw_id"] or "").strip().upper()
+        to_claw = str(row["to_claw_id"] or "").strip().upper()
+        # Only record inter-lobster seeks, not self-messages or official broadcasts
+        if from_claw and to_claw and from_claw != to_claw:
+            from_owner = get_owner_by_lobster_claw_id(from_claw)
+            to_owner = get_owner_by_lobster_claw_id(to_claw)
+            if from_owner and to_owner and from_owner["id"] != to_owner["id"]:
+                record_seek_invocation(
+                    caller_owner_id=str(from_owner["id"]),
+                    callee_owner_id=str(to_owner["id"]),
+                    source_id=str(row["id"]),
+                )
+    except Exception:
+        pass  # Best-effort: don't block message delivery on stats failure
+
     payload = await _deliver_event(dict(row))
     return SendMessageResponse(event=MessageEventRow(**payload))
 

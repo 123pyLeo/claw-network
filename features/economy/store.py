@@ -133,6 +133,14 @@ def ensure_economy_tables() -> None:
             conn.execute("ALTER TABLE invocations ADD COLUMN settled_at TEXT")
         if "released_at" not in inv_cols:
             conn.execute("ALTER TABLE invocations ADD COLUMN released_at TEXT")
+        # Competitive context: how many competitors were there when this
+        # invocation was created, and where did the selected agent rank.
+        if "competition_total_bids" not in inv_cols:
+            conn.execute("ALTER TABLE invocations ADD COLUMN competition_total_bids INTEGER")
+        if "competition_selected_rank" not in inv_cols:
+            conn.execute("ALTER TABLE invocations ADD COLUMN competition_selected_rank INTEGER")
+        if "competition_context" not in inv_cols:
+            conn.execute("ALTER TABLE invocations ADD COLUMN competition_context TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_invocations_caller "
             "ON invocations(caller_owner_id, created_at)"
@@ -976,6 +984,10 @@ def reserve_funds(
     source_type: str,
     source_id: str,
     amount: int,
+    *,
+    competition_total_bids: int | None = None,
+    competition_selected_rank: int | None = None,
+    competition_context: str | None = None,
 ) -> dict:
     """Lock `amount` of payer's available balance for a future settlement.
 
@@ -1038,13 +1050,15 @@ def reserve_funds(
                 id, caller_owner_id, callee_owner_id,
                 source_type, source_id, amount,
                 status, settlement_status,
-                created_at, completed_at, settled_at, released_at
+                created_at, completed_at, settled_at, released_at,
+                competition_total_bids, competition_selected_rank, competition_context
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'created', 'reserved', ?, NULL, NULL, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, 'created', 'reserved', ?, NULL, NULL, NULL, ?, ?, ?)
             """,
             (
                 invocation_id, payer_owner_id, callee_owner_id,
                 source_type, source_id, amount, now,
+                competition_total_bids, competition_selected_rank, competition_context,
             ),
         )
 
@@ -1190,6 +1204,55 @@ def release_reserved_funds(invocation_id: str) -> dict:
     released_dict = dict(result)
     update_stats_on_release(released_dict)
     return released_dict
+
+
+def record_seek_invocation(
+    caller_owner_id: str,
+    callee_owner_id: str,
+    source_id: str,
+) -> dict | None:
+    """Record a seek event: one agent actively found and messaged another.
+
+    source_type='seek', amount=0, status='completed', settlement_status='instant'.
+    This captures the demand-side "who gets found" signal without any payment.
+    Updates agent_stats + pair_stats via the settle hook.
+
+    Returns the invocation dict, or None if it fails silently.
+    """
+    if not caller_owner_id or not callee_owner_id:
+        return None
+    if caller_owner_id == callee_owner_id:
+        return None
+
+    invocation_id = new_uuid()
+    now = utc_now()
+
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO invocations (
+                    id, caller_owner_id, callee_owner_id,
+                    source_type, source_id, amount,
+                    status, settlement_status,
+                    created_at, completed_at, settled_at, released_at,
+                    competition_total_bids, competition_selected_rank, competition_context
+                )
+                VALUES (?, ?, ?, 'seek', ?, 0, 'completed', 'instant', ?, ?, NULL, NULL, NULL, NULL, 'direct_seek')
+                """,
+                (
+                    invocation_id, caller_owner_id, callee_owner_id,
+                    source_id, now, now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM invocations WHERE id = ?", (invocation_id,)
+            ).fetchone()
+        result = dict(row)
+        update_stats_on_settle(result)
+        return result
+    except Exception:
+        return None
 
 
 def get_invocation(invocation_id: str) -> dict | None:

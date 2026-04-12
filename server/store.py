@@ -2965,6 +2965,23 @@ def select_bids(
                 f"积分可用余额不足。当前可用 {state['available_balance']}，需要 {credit_amount}。"
             )
 
+    # ----- Gather competitive context before reserving -----
+    comp_total_bids: int | None = None
+    comp_selected_rank: int | None = None
+    comp_context: str | None = None
+    with get_conn() as conn_comp:
+        all_bids = conn_comp.execute(
+            "SELECT id FROM bounty_bids WHERE bounty_id = ? ORDER BY created_at ASC",
+            (bounty_id,),
+        ).fetchall()
+        comp_total_bids = len(all_bids)
+        for rank, row in enumerate(all_bids, 1):
+            if str(row["id"]) == bid_id:
+                comp_selected_rank = rank
+                break
+        if comp_total_bids > 1:
+            comp_context = f"selected from {comp_total_bids} bids"
+
     # ----- Reserve funds BEFORE flipping bounty status, so a balance failure
     # leaves the bounty unchanged. -----
     invocation_dict: dict | None = None
@@ -2977,6 +2994,9 @@ def select_bids(
                 source_type="bounty",
                 source_id=bounty_id,
                 amount=credit_amount,
+                competition_total_bids=comp_total_bids,
+                competition_selected_rank=comp_selected_rank,
+                competition_context=comp_context,
             )
         except InsufficientBalanceError as exc:
             raise ValueError(str(exc)) from exc
