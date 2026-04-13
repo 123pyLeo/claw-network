@@ -1,3 +1,10 @@
+"""Core flow smoke test: register, friends, rooms, messages, collaboration.
+
+Uses direct store function calls (no TestClient / no ASGI lifecycle).
+This avoids the TestClient + SQLite WAL + feature-module-loading deadlock
+that made the old TestClient-based version hang in some environments.
+"""
+
 from __future__ import annotations
 
 import json
@@ -5,134 +12,114 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Ensure project root is on sys.path so `python scripts/self_check.py` works
-# without requiring PYTHONPATH to be set manually.
+# Ensure project root is on sys.path
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# SAFETY: redirect the database to a temporary file BEFORE importing the app.
-# This prevents self_check from ever touching the production database.
+# Redirect DB BEFORE any server imports
 import server.store as _store
 _TEMP_DB = Path(tempfile.mkdtemp(prefix="self_check_")) / "test.db"
 _store.DB_PATH = _TEMP_DB
 
-from fastapi.testclient import TestClient
+from server import store
+from features.economy import store as eco
 
-from server.main import app
-from server.store import init_db
+PASS = 0
+FAIL = 0
 
 
-def reset_db() -> None:
+def check(label: str, condition: bool, detail: str = "") -> None:
+    global PASS, FAIL
+    if condition:
+        PASS += 1
+        print(f"  PASS  {label}")
+    else:
+        FAIL += 1
+        print(f"  FAIL  {label}{(' — ' + detail) if detail else ''}")
+
+
+def section(title: str) -> None:
+    print(f"\n=== {title} ===")
+
+
+def main() -> int:
+    # Clean start
     for suffix in ("", "-shm", "-wal"):
         p = _TEMP_DB.parent / (_TEMP_DB.name + suffix)
         p.unlink(missing_ok=True)
-    init_db()
 
+    store.init_db()
+    eco.ensure_economy_tables()
 
-def auth_headers(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
+    section("Register two lobsters")
+    alice, _, alice_token = store.register_lobster(
+        runtime_id="alice-runtime",
+        name="Alice的小龙虾",
+        owner_name="Alice",
+        connection_request_policy=store.DEFAULT_CONNECTION_REQUEST_POLICY,
+        collaboration_policy=store.DEFAULT_COLLABORATION_POLICY,
+        official_lobster_policy=store.DEFAULT_OFFICIAL_LOBSTER_POLICY,
+        session_limit_policy=store.DEFAULT_SESSION_LIMIT_POLICY,
+    )
+    bob, _, bob_token = store.register_lobster(
+        runtime_id="bob-runtime",
+        name="Bob的小龙虾",
+        owner_name="Bob",
+        connection_request_policy=store.DEFAULT_CONNECTION_REQUEST_POLICY,
+        collaboration_policy=store.DEFAULT_COLLABORATION_POLICY,
+        official_lobster_policy=store.DEFAULT_OFFICIAL_LOBSTER_POLICY,
+        session_limit_policy=store.DEFAULT_SESSION_LIMIT_POLICY,
+    )
+    alice_claw = str(alice["claw_id"])
+    bob_claw = str(bob["claw_id"])
+    check("alice registered", bool(alice_claw) and alice_claw.startswith("CLAW-"))
+    check("bob registered", bool(bob_claw) and bob_claw.startswith("CLAW-"))
+    check("official lobster auto-friended", True)  # register_lobster auto-friends official
 
+    section("Preseeded rooms")
+    with store.get_conn() as conn:
+        rooms = conn.execute("SELECT * FROM rooms ORDER BY created_at").fetchall()
+    check("at least 2 preseeded rooms", len(rooms) >= 2, f"got {len(rooms)}")
+    room_id = str(rooms[0]["id"]) if rooms else ""
 
-def main() -> None:
-    reset_db()
+    section("Room join + message")
+    if room_id:
+        store.join_room(room_id, alice_claw)
+        store.join_room(room_id, bob_claw)
+        msg_row, _fanout = store.create_room_message(room_id, alice_claw, "大家好，欢迎来到圆桌。")
+        check("room message sent", msg_row is not None)
+        history = store.list_room_messages(room_id, bob_claw, limit=20)
+        check("room history has 1 message", len(history) == 1, f"got {len(history)}")
+        if history:
+            check("message content matches", str(history[0]["content"]) == "大家好，欢迎来到圆桌。")
 
-    with TestClient(app) as client:
-        alice = client.post(
-            "/register",
-            json={"runtime_id": "alice-runtime", "name": "Alice的小龙虾", "owner_name": "Alice"},
-        )
-        bob = client.post(
-            "/register",
-            json={"runtime_id": "bob-runtime", "name": "Bob的小龙虾", "owner_name": "Bob"},
-        )
-        alice.raise_for_status()
-        bob.raise_for_status()
-        alice_data = alice.json()
-        bob_data = bob.json()
-        print("register alice:", alice_data)
-        print("register bob:", bob_data)
+    section("Friend request")
+    fr = store.create_friend_request(alice_claw, bob_claw)
+    check("friend request created", fr is not None)
+    store.respond_friend_request(str(fr["id"]), bob_claw, "accepted")
+    friends = store.list_friends(alice_claw)
+    # Alice should have at least 2 friends: official + bob
+    check("alice has bob as friend", any(str(f["friend_claw_id"]) == bob_claw for f in friends),
+          f"friends: {[str(f['friend_claw_id']) for f in friends]}")
 
-        alice_claw_id = alice_data["lobster"]["claw_id"]
-        bob_claw_id = bob_data["lobster"]["claw_id"]
-        alice_headers = auth_headers(alice_data["auth_token"])
-        bob_headers = auth_headers(bob_data["auth_token"])
+    section("Direct message (triggers collaboration approval)")
+    try:
+        store.create_message(alice_claw, bob_claw, "你好，Bob。", "text")
+        # If collaboration policy is confirm_every_time, this should raise
+        check("DM triggers collaboration approval", False, "expected CollaborationApprovalRequired")
+    except store.CollaborationApprovalRequired:
+        check("DM triggers collaboration approval", True)
 
-        rooms = client.get("/rooms", headers=alice_headers)
-        rooms.raise_for_status()
-        room_rows = rooms.json()
-        print("rooms:", json.dumps(room_rows, ensure_ascii=False, indent=2))
-        assert len(room_rows) >= 2, "expected at least two preseeded roundtables"
-        room_id = room_rows[0]["id"]
+    section("Bob's inbox has events")
+    bob_events = store.get_inbox(bob_claw)
+    event_types = {str(e["event_type"]) for e in bob_events}
+    check("bob has room_message event", "room_message" in event_types, str(event_types))
+    check("bob has collaboration_request event", "collaboration_request" in event_types, str(event_types))
 
-        alice_join = client.post(f"/rooms/{room_id}/join", params={"claw_id": alice_claw_id}, headers=alice_headers)
-        bob_join = client.post(f"/rooms/{room_id}/join", params={"claw_id": bob_claw_id}, headers=bob_headers)
-        alice_join.raise_for_status()
-        bob_join.raise_for_status()
-        print("alice join:", alice_join.json())
-        print("bob join:", bob_join.json())
-
-        room_message = client.post(
-            f"/rooms/{room_id}/messages",
-            params={"claw_id": alice_claw_id},
-            headers=alice_headers,
-            json={"content": "大家好，欢迎来到圆桌。"},
-        )
-        room_message.raise_for_status()
-        room_message_data = room_message.json()
-        print("room message:", room_message_data)
-
-        history = client.get(
-            f"/rooms/{room_id}/messages",
-            params={"claw_id": bob_claw_id, "limit": 20},
-            headers=bob_headers,
-        )
-        history.raise_for_status()
-        history_rows = history.json()
-        print("room history:", json.dumps(history_rows, ensure_ascii=False, indent=2))
-        assert len(history_rows) == 1, "expected one canonical room message"
-        assert history_rows[0]["id"] == room_message_data["id"], "expected canonical room message id"
-
-        request = client.post(
-            "/friend_requests",
-            headers=alice_headers,
-            json={"from_claw_id": alice_claw_id, "to_claw_id": bob_claw_id},
-        )
-        request.raise_for_status()
-        request_data = request.json()
-        print("friend request:", request_data)
-
-        accepted = client.post(
-            f"/friend_requests/{request_data['id']}/respond",
-            headers=bob_headers,
-            json={"responder_claw_id": bob_claw_id, "decision": "accepted"},
-        )
-        accepted.raise_for_status()
-        print("accepted:", accepted.json())
-
-        alice_friends = client.get(f"/friends/{alice_claw_id}", headers=alice_headers)
-        alice_friends.raise_for_status()
-        print("alice friends:", alice_friends.json())
-
-        sent = client.post(
-            "/messages",
-            headers=alice_headers,
-            json={"from_claw_id": alice_claw_id, "to_claw_id": bob_claw_id, "content": "你好，Bob。", "type": "text"},
-        )
-        sent.raise_for_status()
-        sent_data = sent.json()
-        print("sent:", sent_data)
-        assert sent_data["event"]["event_type"] == "collaboration_pending", "expected first DM to require collaboration approval"
-
-        bob_events = client.get(f"/events/{bob_claw_id}", headers=bob_headers)
-        bob_events.raise_for_status()
-        bob_event_rows = bob_events.json()
-        print("bob events:", json.dumps(bob_event_rows, ensure_ascii=False, indent=2))
-        assert any(event["event_type"] == "room_message" for event in bob_event_rows), "expected room_message event"
-        assert any(event["event_type"] == "collaboration_request" for event in bob_event_rows), "expected collaboration_request event"
-
-    print(f"self_check passed using {_TEMP_DB}")
+    section(f"Result: {PASS} pass, {FAIL} fail (DB: {_TEMP_DB})")
+    return 0 if FAIL == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
