@@ -160,6 +160,9 @@ def ensure_economy_tables() -> None:
     ensure_stats_tables()
     # Direct deal table
     ensure_deals_table()
+    # Verdict + skill tables
+    ensure_verdict_tables()
+    ensure_skill_tables()
 
 
 def _migrate_existing_lobsters() -> None:
@@ -1311,6 +1314,12 @@ def ensure_stats_tables() -> None:
             "CREATE INDEX IF NOT EXISTS idx_pair_stats_callee "
             "ON pair_stats(callee_lobster_id)"
         )
+        # Rating distribution (JSON string): {"1":0,"2":0,"3":1,"4":3,"5":8}
+        stats_cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_stats)").fetchall()}
+        if "rating_distribution" not in stats_cols:
+            conn.execute("ALTER TABLE agent_stats ADD COLUMN rating_distribution TEXT DEFAULT '{}'")
+        if "rating_count" not in stats_cols:
+            conn.execute("ALTER TABLE agent_stats ADD COLUMN rating_count INTEGER DEFAULT 0")
     # Backfill from existing invocations
     _backfill_stats()
 
@@ -1875,4 +1884,321 @@ def list_deals_for_lobster(claw_id: str) -> list[dict]:
             """,
             (lid, lid),
         ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Verdicts: post-transaction reviews
+# ---------------------------------------------------------------------------
+#
+# Philosophy: platform provides raw material, not judgments.
+# No avg_rating. Only rating_distribution in agent_stats.
+# Callers interpret the distribution however they want.
+
+def ensure_verdict_tables() -> None:
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS verdicts (
+                id TEXT PRIMARY KEY,
+                invocation_id TEXT,
+                reviewer_lobster_id TEXT NOT NULL,
+                reviewee_lobster_id TEXT NOT NULL,
+                rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+                comment TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_verdicts_reviewee "
+            "ON verdicts(reviewee_lobster_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_verdicts_invocation "
+            "ON verdicts(invocation_id)"
+        )
+
+
+def submit_verdict(
+    reviewer_claw_id: str,
+    source_type: str,
+    source_id: str,
+    rating: int,
+    comment: str = "",
+) -> dict:
+    """Submit a verdict after a settled deal or bounty.
+
+    Finds the invocation, determines who is the other party, creates the
+    verdict, and updates the reviewee's rating_distribution in agent_stats.
+    """
+    import json as _json
+
+    if rating < 1 or rating > 5:
+        raise ValueError("评分必须在 1-5 之间。")
+
+    reviewer = get_lobster_by_claw_id(reviewer_claw_id.strip().upper())
+    if reviewer is None:
+        raise ValueError("评价者不存在。")
+    reviewer_id = str(reviewer["id"])
+
+    # Find the transaction to determine the other party
+    reviewee_id: str | None = None
+    invocation_id: str | None = None
+
+    with get_conn() as conn:
+        if source_type == "direct_deal":
+            deal = conn.execute("SELECT * FROM deals WHERE id = ?", (source_id,)).fetchone()
+            if deal is None:
+                raise ValueError("订单不存在。")
+            if deal["status"] != "settled":
+                raise ValueError("只能评价已结算的订单。")
+            invocation_id = deal["invocation_id"]
+            if str(deal["caller_lobster_id"]) == reviewer_id:
+                reviewee_id = str(deal["callee_lobster_id"])
+            elif str(deal["callee_lobster_id"]) == reviewer_id:
+                reviewee_id = str(deal["caller_lobster_id"])
+            else:
+                raise ValueError("你不是这笔订单的参与方。")
+        elif source_type == "bounty":
+            bounty = conn.execute("SELECT * FROM bounties WHERE id = ?", (source_id,)).fetchone()
+            if bounty is None:
+                raise ValueError("需求不存在。")
+            if bounty["status"] != "settled":
+                raise ValueError("只能评价已结算的需求。")
+            invocation_id = bounty["invocation_id"]
+            poster_id = str(bounty["poster_lobster_id"])
+            selected_bid = conn.execute(
+                "SELECT bidder_lobster_id FROM bounty_bids WHERE bounty_id = ? AND status = 'selected' LIMIT 1",
+                (source_id,),
+            ).fetchone()
+            bidder_id = str(selected_bid["bidder_lobster_id"]) if selected_bid else None
+            if reviewer_id == poster_id:
+                reviewee_id = bidder_id
+            elif reviewer_id == bidder_id:
+                reviewee_id = poster_id
+            else:
+                raise ValueError("你不是这笔需求的参与方。")
+        else:
+            raise ValueError(f"不支持的 source_type: {source_type}")
+
+        if not reviewee_id:
+            raise ValueError("无法确定被评价方。")
+
+        # Check for duplicate verdict
+        existing = conn.execute(
+            "SELECT id FROM verdicts WHERE reviewer_lobster_id = ? AND source_type = ? AND source_id = ?",
+            (reviewer_id, source_type, source_id),
+        ).fetchone()
+        if existing:
+            raise ValueError("你已经评价过这笔交易了。")
+
+        verdict_id = new_uuid()
+        now = utc_now()
+        conn.execute("""
+            INSERT INTO verdicts (id, invocation_id, reviewer_lobster_id, reviewee_lobster_id,
+                                  rating, comment, source_type, source_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (verdict_id, invocation_id, reviewer_id, reviewee_id, rating, comment.strip(), source_type, source_id, now))
+
+        # Update rating_distribution in agent_stats
+        stats_row = conn.execute(
+            "SELECT rating_distribution, rating_count FROM agent_stats WHERE lobster_id = ?",
+            (reviewee_id,),
+        ).fetchone()
+        if stats_row:
+            try:
+                dist = _json.loads(stats_row["rating_distribution"] or "{}")
+            except Exception:
+                dist = {}
+            dist[str(rating)] = dist.get(str(rating), 0) + 1
+            new_count = int(stats_row["rating_count"] or 0) + 1
+            conn.execute(
+                "UPDATE agent_stats SET rating_distribution = ?, rating_count = ?, last_computed = ? WHERE lobster_id = ?",
+                (_json.dumps(dist), new_count, now, reviewee_id),
+            )
+        else:
+            dist = {str(rating): 1}
+            conn.execute("""
+                INSERT INTO agent_stats (lobster_id, total_invocations, total_completed, total_released,
+                    active_callers, completion_rate, total_earned, last_completed_at, last_computed,
+                    rating_distribution, rating_count)
+                VALUES (?, 0, 0, 0, 0, 0, 0, NULL, ?, ?, 1)
+            """, (reviewee_id, now, _json.dumps(dist)))
+
+        row = conn.execute("SELECT * FROM verdicts WHERE id = ?", (verdict_id,)).fetchone()
+    return dict(row)
+
+
+def list_verdicts_for_lobster(claw_id: str, as_reviewee: bool = True) -> list[dict]:
+    """List verdicts where this lobster is the reviewee (or reviewer)."""
+    lobster = get_lobster_by_claw_id(claw_id.strip().upper())
+    if lobster is None:
+        raise ValueError("龙虾不存在。")
+    lid = str(lobster["id"])
+    col = "reviewee_lobster_id" if as_reviewee else "reviewer_lobster_id"
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM verdicts WHERE {col} = ? ORDER BY created_at DESC LIMIT 100",
+            (lid,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Skill tags: agent capability labels
+# ---------------------------------------------------------------------------
+
+SKILL_EARNED_MIN_COUNT = 3
+SKILL_EARNED_MIN_MEDIAN_RATING = 3
+
+
+def ensure_skill_tables() -> None:
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_skills (
+                lobster_id TEXT NOT NULL,
+                skill_tag TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'self_declared',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (lobster_id, skill_tag)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_skills_tag "
+            "ON agent_skills(skill_tag)"
+        )
+
+
+def set_self_declared_skills(claw_id: str, tags: list[str]) -> list[dict]:
+    """Set self-declared skill tags. Overwrites previous self_declared tags."""
+    lobster = get_lobster_by_claw_id(claw_id.strip().upper())
+    if lobster is None:
+        raise ValueError("龙虾不存在。")
+    lid = str(lobster["id"])
+    now = utc_now()
+    cleaned = [t.strip().lower() for t in tags if t.strip()]
+    if not cleaned:
+        raise ValueError("至少提供一个技能标签。")
+
+    with get_conn() as conn:
+        # Remove old self_declared
+        conn.execute(
+            "DELETE FROM agent_skills WHERE lobster_id = ? AND source = 'self_declared'",
+            (lid,),
+        )
+        for tag in cleaned:
+            conn.execute(
+                "INSERT OR IGNORE INTO agent_skills (lobster_id, skill_tag, source, created_at) VALUES (?, ?, 'self_declared', ?)",
+                (lid, tag, now),
+            )
+        rows = conn.execute(
+            "SELECT * FROM agent_skills WHERE lobster_id = ? ORDER BY skill_tag",
+            (lid,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def check_and_award_earned_skills(callee_claw_id: str, tags: list[str]) -> list[str]:
+    """Check if callee has earned any skill tags based on completed+rated bounties/deals.
+
+    Called after a verdict is submitted. For each tag in `tags`:
+      - Count how many settled invocations the callee has for transactions
+        tagged with this skill
+      - Check if median rating for those >= SKILL_EARNED_MIN_MEDIAN_RATING
+      - If count >= SKILL_EARNED_MIN_COUNT and median good enough → award
+
+    Returns list of newly awarded tags.
+    """
+    import statistics
+
+    lobster = get_lobster_by_claw_id(callee_claw_id.strip().upper())
+    if lobster is None:
+        return []
+    lid = str(lobster["id"])
+    awarded: list[str] = []
+    now = utc_now()
+
+    with get_conn() as conn:
+        for tag in tags:
+            tag = tag.strip().lower()
+            if not tag:
+                continue
+            # Already earned?
+            existing = conn.execute(
+                "SELECT source FROM agent_skills WHERE lobster_id = ? AND skill_tag = ?",
+                (lid, tag),
+            ).fetchone()
+            if existing and existing["source"] == "earned":
+                continue
+
+            # Count settled bounties/deals with this tag where this lobster was callee
+            # For bounties: check bounty.tags contains this tag
+            # For deals: check deal.description contains this tag (rough heuristic)
+            ratings = []
+            # Bounty path: find verdicts where reviewee = this lobster,
+            # source_type = bounty, and the bounty had this tag
+            verdict_rows = conn.execute("""
+                SELECT v.rating
+                FROM verdicts v
+                JOIN bounties b ON b.id = v.source_id AND v.source_type = 'bounty'
+                WHERE v.reviewee_lobster_id = ?
+                  AND (',' || b.tags || ',') LIKE ?
+            """, (lid, f"%,{tag},%")).fetchall()
+            ratings.extend(int(r["rating"]) for r in verdict_rows)
+
+            # Deal path
+            deal_verdict_rows = conn.execute("""
+                SELECT v.rating
+                FROM verdicts v
+                JOIN deals d ON d.id = v.source_id AND v.source_type = 'direct_deal'
+                WHERE v.reviewee_lobster_id = ?
+                  AND lower(d.description) LIKE ?
+            """, (lid, f"%{tag}%")).fetchall()
+            ratings.extend(int(r["rating"]) for r in deal_verdict_rows)
+
+            if len(ratings) < SKILL_EARNED_MIN_COUNT:
+                continue
+            median = statistics.median(ratings)
+            if median < SKILL_EARNED_MIN_MEDIAN_RATING:
+                continue
+
+            # Award!
+            conn.execute("""
+                INSERT INTO agent_skills (lobster_id, skill_tag, source, created_at)
+                VALUES (?, ?, 'earned', ?)
+                ON CONFLICT(lobster_id, skill_tag) DO UPDATE SET source = 'earned', created_at = excluded.created_at
+            """, (lid, tag, now))
+            awarded.append(tag)
+
+    return awarded
+
+
+def get_skills_for_lobster(claw_id: str) -> list[dict]:
+    lobster = get_lobster_by_claw_id(claw_id.strip().upper())
+    if lobster is None:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM agent_skills WHERE lobster_id = ? ORDER BY source DESC, skill_tag",
+            (str(lobster["id"]),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def search_lobsters_by_skill(skill_tag: str, limit: int = 20) -> list[dict]:
+    """Find lobsters that have a specific skill tag. Earned first, then self_declared."""
+    tag = skill_tag.strip().lower()
+    if not tag:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT s.lobster_id, s.skill_tag, s.source, l.claw_id, l.name, l.owner_name
+            FROM agent_skills s
+            JOIN lobsters l ON l.id = s.lobster_id
+            WHERE s.skill_tag = ?
+              AND (l.deleted_at IS NULL OR l.deleted_at = '')
+            ORDER BY CASE s.source WHEN 'earned' THEN 0 ELSE 1 END, l.name
+            LIMIT ?
+        """, (tag, limit)).fetchall()
     return [dict(r) for r in rows]

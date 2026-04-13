@@ -588,6 +588,42 @@ function detectNetworkIntent(text) {
     return { tool: 'list_deals', params: {} };
   }
 
+  // --- Verdicts + skills ---
+  if (['评价', '打分', '给评价'].some((k) => v.includes(k))) {
+    // 「沙堆 评价 <id> 5 很快」
+    const rateMatch = v.match(/(?:评价|打分|给评价)\s+(\S+)\s+([1-5])\s*(.*)/);
+    return {
+      tool: 'submit_verdict',
+      params: {
+        source_id: rateMatch ? rateMatch[1].trim() : '',
+        rating: rateMatch ? Number.parseInt(rateMatch[2], 10) : 0,
+        comment: rateMatch ? rateMatch[3].trim() : '',
+      },
+    };
+  }
+  if (['我的技能', '设置技能', '我会什么'].some((k) => v.includes(k))) {
+    // 「沙堆 我的技能 翻译,编程,数据分析」
+    const skillMatch = v.match(/(?:我的技能|设置技能|我会什么)\s+(.*)/);
+    return {
+      tool: 'set_skills',
+      params: { tags: skillMatch ? skillMatch[1].trim() : '' },
+    };
+  }
+  if (['查看技能', '技能列表'].some((k) => v.includes(k))) {
+    const skillQuery = v.match(/(?:查看技能|技能列表)\s+(\S+)/);
+    return {
+      tool: 'get_skills',
+      params: { target: skillQuery ? skillQuery[1].trim() : '' },
+    };
+  }
+  if (['找会', '谁会', '搜索技能'].some((k) => v.includes(k))) {
+    const searchMatch = v.match(/(?:找会|谁会|搜索技能)\s+(\S+)/);
+    return {
+      tool: 'search_by_skill',
+      params: { tag: searchMatch ? searchMatch[1].trim() : '' },
+    };
+  }
+
   // --- Phone verification (L2 实名) ---
   const sendPhoneMatch = v.match(/^(?:验证手机|绑定手机|手机验证)\s+(1[3-9]\d{9})/);
   if (sendPhoneMatch) {
@@ -2137,6 +2173,150 @@ const plugin = {
             return `${i + 1}. ${d.description || '(无描述)'} · ${d.amount} 积分 · ${d.status} · ${role}`;
           });
           return toolTextResult(`你的订单（${result.length} 条）：\n${lines.join('\n')}`, { success: true, result });
+        } catch (error) { return errorResult(error); }
+      }
+    });
+
+    // ============================================================
+    // Verdicts + Skill Tags
+    // ============================================================
+
+    api.registerTool({
+      name: 'submit_verdict',
+      label: 'Submit Verdict',
+      description: 'Rate a completed deal or bounty (1-5 stars).',
+      parameters: {
+        type: 'object', additionalProperties: false,
+        required: ['source_id', 'rating'],
+        properties: {
+          source_id: { type: 'string', description: 'Deal ID or Bounty ID' },
+          rating: { type: 'number', description: '1-5 stars' },
+          comment: { type: 'string', description: 'Optional comment' },
+          source_type: { type: 'string', description: 'direct_deal or bounty. Auto-detected if omitted.' },
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const myId = (await runClient(api, ['my-id']));
+          const claw = myId?.claw_id || '';
+          // Try to detect source_type by checking if it's a deal or bounty
+          let sourceType = params.source_type || '';
+          if (!sourceType) {
+            // Try deal first, then bounty
+            try {
+              const deal = await runClient(api, ['list-deals']);
+              if (Array.isArray(deal) && deal.some(d => d.id === params.source_id)) {
+                sourceType = 'direct_deal';
+              }
+            } catch { /* ignore */ }
+            if (!sourceType) sourceType = 'bounty'; // fallback
+          }
+          const payload = {
+            reviewer_claw_id: claw,
+            source_type: sourceType,
+            source_id: params.source_id,
+            rating: Math.max(1, Math.min(5, Math.trunc(Number(params.rating) || 3))),
+            comment: String(params.comment || ''),
+          };
+          const url = `/verdicts`;
+          const result = await runClient(api, ['register']); // ensure token
+          // Use raw HTTP since we don't have a CLI command yet
+          const response = await fetch(
+            `${api.getConfig?.()?.endpoint || 'https://api.sandpile.io'}${url}`,
+            {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${result?.auth_token || ''}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(payload),
+            }
+          );
+          if (!response.ok) {
+            const err = await response.json().catch(() => ({}));
+            throw new Error(err.detail || response.statusText);
+          }
+          const data = await response.json();
+          return toolTextResult(`评价已提交！${payload.rating} 星${payload.comment ? ' · ' + payload.comment : ''}`, { success: true, result: data });
+        } catch (error) { return errorResult(error); }
+      }
+    });
+
+    api.registerTool({
+      name: 'set_skills',
+      label: 'Set My Skills',
+      description: 'Declare your skill tags (comma-separated).',
+      parameters: {
+        type: 'object', additionalProperties: false,
+        required: ['tags'],
+        properties: { tags: { type: 'string', description: 'Comma-separated skill tags, e.g. "翻译,编程,数据分析"' } }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const myId = (await runClient(api, ['my-id']));
+          const claw = myId?.claw_id || '';
+          const result = await runClient(api, ['register']);
+          const response = await fetch(
+            `${api.getConfig?.()?.endpoint || 'https://api.sandpile.io'}/lobsters/${claw}/skills`,
+            {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${result?.auth_token || ''}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ tags: String(params.tags) }),
+            }
+          );
+          if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error(err.detail || response.statusText); }
+          const data = await response.json();
+          const tags = Array.isArray(data) ? data.map(s => `${s.skill_tag} (${s.source})`).join(', ') : '';
+          return toolTextResult(`技能已设置：${tags}`, { success: true, result: data });
+        } catch (error) { return errorResult(error); }
+      }
+    });
+
+    api.registerTool({
+      name: 'get_skills',
+      label: 'View Skills',
+      description: 'View skill tags for a lobster.',
+      parameters: {
+        type: 'object', additionalProperties: false,
+        properties: { target: { type: 'string', description: 'CLAW ID or name. Omit for self.' } }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          let claw = params?.target?.trim().toUpperCase() || '';
+          if (!claw || !claw.startsWith('CLAW-')) {
+            const myId = await runClient(api, ['my-id']);
+            claw = myId?.claw_id || '';
+          }
+          const response = await fetch(`${api.getConfig?.()?.endpoint || 'https://api.sandpile.io'}/lobsters/${claw}/skills`);
+          if (!response.ok) throw new Error('Failed to fetch skills');
+          const data = await response.json();
+          if (!Array.isArray(data) || data.length === 0) return toolTextResult('没有技能标签。', { success: true, result: [] });
+          const lines = data.map(s => `  ${s.skill_tag} (${s.source})`).join('\n');
+          return toolTextResult(`技能标签：\n${lines}`, { success: true, result: data });
+        } catch (error) { return errorResult(error); }
+      }
+    });
+
+    api.registerTool({
+      name: 'search_by_skill',
+      label: 'Search Agents by Skill',
+      description: 'Find agents that have a specific skill tag.',
+      parameters: {
+        type: 'object', additionalProperties: false,
+        required: ['tag'],
+        properties: { tag: { type: 'string', description: 'Skill tag to search for' } }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          const response = await fetch(`${api.getConfig?.()?.endpoint || 'https://api.sandpile.io'}/skills/search?tag=${encodeURIComponent(params.tag)}`);
+          if (!response.ok) throw new Error('Search failed');
+          const data = await response.json();
+          if (!Array.isArray(data) || data.length === 0) return toolTextResult(`没找到会「${params.tag}」的龙虾。`, { success: true, result: [] });
+          const lines = data.map((r, i) => `${i + 1}. ${r.name} (${r.claw_id}) · ${r.source}`).join('\n');
+          return toolTextResult(`会「${params.tag}」的龙虾：\n${lines}`, { success: true, result: data });
         } catch (error) { return errorResult(error); }
       }
     });

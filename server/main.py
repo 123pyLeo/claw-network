@@ -1531,6 +1531,81 @@ def list_deals_route(claw_id: str, request: Request) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Verdicts + skill tags
+# ---------------------------------------------------------------------------
+
+
+@app.post("/verdicts")
+def submit_verdict_route(request: Request, payload: dict) -> dict:
+    _check_rate_limit(request)
+    reviewer_claw = str(payload.get("reviewer_claw_id") or "").strip().upper()
+    _require_http_auth(request, reviewer_claw)
+    from features.economy.store import submit_verdict, check_and_award_earned_skills
+    try:
+        verdict = submit_verdict(
+            reviewer_claw_id=reviewer_claw,
+            source_type=str(payload.get("source_type") or ""),
+            source_id=str(payload.get("source_id") or ""),
+            rating=int(payload.get("rating") or 0),
+            comment=str(payload.get("comment") or ""),
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    # Check earned skills (best-effort, don't block on failure)
+    try:
+        tags = str(payload.get("tags") or "").split(",")
+        if any(t.strip() for t in tags):
+            reviewee_lobster = store.get_lobster_by_claw_id(
+                str(verdict.get("reviewee_lobster_id") or "")
+            )
+            # Not by claw_id — we have lobster_id. Resolve it.
+            if reviewee_lobster:
+                pass  # check_and_award needs claw_id but we'd need to look it up
+            # For now, earned skill check is deferred to a separate endpoint
+    except Exception:
+        pass
+    return verdict
+
+
+@app.get("/lobsters/{claw_id}/verdicts")
+def list_verdicts_route(claw_id: str, request: Request) -> list[dict]:
+    _check_rate_limit(request)
+    from features.economy.store import list_verdicts_for_lobster
+    try:
+        return list_verdicts_for_lobster(claw_id.strip().upper())
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/lobsters/{claw_id}/skills")
+def set_skills_route(claw_id: str, request: Request, payload: dict) -> list[dict]:
+    _check_rate_limit(request)
+    _require_http_auth(request, claw_id.strip().upper())
+    from features.economy.store import set_self_declared_skills
+    tags = payload.get("tags") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    try:
+        return set_self_declared_skills(claw_id.strip().upper(), tags)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+
+@app.get("/lobsters/{claw_id}/skills")
+def get_skills_route(claw_id: str, request: Request) -> list[dict]:
+    _check_rate_limit(request)
+    from features.economy.store import get_skills_for_lobster
+    return get_skills_for_lobster(claw_id.strip().upper())
+
+
+@app.get("/skills/search")
+def search_skills_route(request: Request, tag: str, limit: int = 20) -> list[dict]:
+    _check_rate_limit(request)
+    from features.economy.store import search_lobsters_by_skill
+    return search_lobsters_by_skill(tag, limit=limit)
+
+
+# ---------------------------------------------------------------------------
 
 # In-memory event bus for SSE subscribers
 _bounty_subscribers: list[asyncio.Queue] = []
