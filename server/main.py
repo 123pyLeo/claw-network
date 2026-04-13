@@ -1375,22 +1375,28 @@ async def cancel_bounty(bounty_id: str, request: Request, claw_id: str) -> Bount
     normalized_claw_id = claw_id.strip().upper()
     lobster = _require_http_auth(request, normalized_claw_id)
     await _require_signature_if_keyed(request, lobster)
+    # Grab the selected bidder BEFORE cancelling, because cancel_bounty()
+    # changes bid status to 'cancelled' and we'd lose the reference.
+    selected_bidder_claw: str | None = None
+    try:
+        pre_cancel_bids = store.list_bids(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
+        for bid in pre_cancel_bids:
+            if str(bid["status"]) == "selected":
+                selected_bidder_claw = str(bid["bidder_claw_id"])
+                break
+    except ValueError:
+        pass
     try:
         row = store.cancel_bounty(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
     except ValueError as exc:
         raise _http_error(exc) from exc
     bounty_dict = dict(row)
     await _notify_bounty_subscribers("bounty_cancelled", bounty_dict)
-    try:
-        selected_bids = store.list_bids(bounty_id=bounty_id, poster_claw_id=normalized_claw_id)
-        for bid in selected_bids:
-            if str(bid["status"]) == "selected":
-                await manager.send_to_agent(str(bid["bidder_claw_id"]), {
-                    "event": "bounty_cancelled",
-                    "payload": bounty_dict,
-                })
-    except ValueError:
-        pass
+    if selected_bidder_claw:
+        await manager.send_to_agent(selected_bidder_claw, {
+            "event": "bounty_cancelled",
+            "payload": bounty_dict,
+        })
     return BountyRow(**bounty_dict)
 
 
@@ -1406,7 +1412,8 @@ async def create_deal_route(request: Request, payload: dict) -> dict:
     _check_rate_limit(request)
     caller_claw = str(payload.get("caller_claw_id") or "").strip().upper()
     callee_claw = str(payload.get("callee_claw_id") or "").strip().upper()
-    _require_http_auth(request, caller_claw)
+    lobster = _require_http_auth(request, caller_claw)
+    await _require_signature_if_keyed(request, lobster)
     from features.economy.store import create_deal
     try:
         deal = create_deal(
@@ -1431,7 +1438,8 @@ async def create_deal_route(request: Request, payload: dict) -> dict:
 @app.post("/deals/{deal_id}/accept")
 async def accept_deal_route(deal_id: str, request: Request, claw_id: str) -> dict:
     _check_rate_limit(request)
-    _require_http_auth(request, claw_id.strip().upper())
+    lobster = _require_http_auth(request, claw_id.strip().upper())
+    await _require_signature_if_keyed(request, lobster)
     from features.economy.store import accept_deal
     try:
         deal = accept_deal(deal_id, claw_id.strip().upper())
@@ -1448,7 +1456,8 @@ async def accept_deal_route(deal_id: str, request: Request, claw_id: str) -> dic
 @app.post("/deals/{deal_id}/reject")
 async def reject_deal_route(deal_id: str, request: Request, claw_id: str) -> dict:
     _check_rate_limit(request)
-    _require_http_auth(request, claw_id.strip().upper())
+    lobster = _require_http_auth(request, claw_id.strip().upper())
+    await _require_signature_if_keyed(request, lobster)
     from features.economy.store import reject_deal
     try:
         deal = reject_deal(deal_id, claw_id.strip().upper())
@@ -1464,7 +1473,8 @@ async def reject_deal_route(deal_id: str, request: Request, claw_id: str) -> dic
 @app.post("/deals/{deal_id}/fulfill")
 async def fulfill_deal_route(deal_id: str, request: Request, claw_id: str) -> dict:
     _check_rate_limit(request)
-    _require_http_auth(request, claw_id.strip().upper())
+    lobster = _require_http_auth(request, claw_id.strip().upper())
+    await _require_signature_if_keyed(request, lobster)
     from features.economy.store import fulfill_deal
     try:
         deal = fulfill_deal(deal_id, claw_id.strip().upper())
@@ -1480,7 +1490,8 @@ async def fulfill_deal_route(deal_id: str, request: Request, claw_id: str) -> di
 @app.post("/deals/{deal_id}/confirm")
 async def confirm_deal_route(deal_id: str, request: Request, claw_id: str) -> dict:
     _check_rate_limit(request)
-    _require_http_auth(request, claw_id.strip().upper())
+    lobster = _require_http_auth(request, claw_id.strip().upper())
+    await _require_signature_if_keyed(request, lobster)
     from features.economy.store import confirm_deal
     try:
         deal = confirm_deal(deal_id, claw_id.strip().upper())
@@ -1496,7 +1507,8 @@ async def confirm_deal_route(deal_id: str, request: Request, claw_id: str) -> di
 @app.post("/deals/{deal_id}/cancel")
 async def cancel_deal_route(deal_id: str, request: Request, claw_id: str) -> dict:
     _check_rate_limit(request)
-    _require_http_auth(request, claw_id.strip().upper())
+    lobster = _require_http_auth(request, claw_id.strip().upper())
+    await _require_signature_if_keyed(request, lobster)
     from features.economy.store import cancel_deal
     try:
         deal = cancel_deal(deal_id, claw_id.strip().upper())

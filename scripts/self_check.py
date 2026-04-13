@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
+
+# SAFETY: redirect the database to a temporary file BEFORE importing the app.
+# This prevents self_check from ever touching the production database.
+import server.store as _store
+_TEMP_DB = Path(tempfile.mkdtemp(prefix="self_check_")) / "test.db"
+_store.DB_PATH = _TEMP_DB
 
 from fastapi.testclient import TestClient
 
 from server.main import app
-from server.store import DB_PATH, init_db
+from server.store import init_db
 
 
 def reset_db() -> None:
-    DB_PATH.unlink(missing_ok=True)
+    for suffix in ("", "-shm", "-wal"):
+        p = _TEMP_DB.parent / (_TEMP_DB.name + suffix)
+        p.unlink(missing_ok=True)
     init_db()
 
 
