@@ -158,6 +158,8 @@ def ensure_economy_tables() -> None:
     ensure_pairing_codes_table()
     # Reputation stats tables
     ensure_stats_tables()
+    # Direct deal table
+    ensure_deals_table()
 
 
 def _migrate_existing_lobsters() -> None:
@@ -1585,3 +1587,292 @@ def get_agent_stats_by_claw_id(claw_id: str) -> dict:
     if lobster is None:
         return get_agent_stats("")
     return get_agent_stats(str(lobster["id"]))
+
+
+# ---------------------------------------------------------------------------
+# Direct deals: point-to-point transactions without the bounty board
+# ---------------------------------------------------------------------------
+#
+# Flow: caller says "下单 大厦虾 50 翻译合同"
+#   → deal created, caller's funds reserved in escrow
+#   → callee notified, can accept or reject
+#   → callee does the work → marks fulfilled
+#   → caller confirms → funds settle to callee
+#
+# Key difference from bounty: no public posting, no bidding, no competition.
+# The "who" is already known — this is a relationship-based transaction.
+
+DEAL_ACCEPT_TIMEOUT_HOURS = 24  # auto-cancel if callee doesn't respond
+
+
+def ensure_deals_table() -> None:
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS deals (
+                id TEXT PRIMARY KEY,
+                caller_lobster_id TEXT NOT NULL,
+                callee_lobster_id TEXT NOT NULL,
+                caller_owner_id TEXT,
+                callee_owner_id TEXT,
+                amount INTEGER NOT NULL DEFAULT 0,
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'created',
+                invocation_id TEXT,
+                referral_seek_id TEXT,
+                created_at TEXT NOT NULL,
+                accepted_at TEXT,
+                fulfilled_at TEXT,
+                settled_at TEXT,
+                cancelled_at TEXT,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deals_caller ON deals(caller_lobster_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deals_callee ON deals(callee_lobster_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deals_status ON deals(status)"
+        )
+
+
+def create_deal(
+    caller_claw_id: str,
+    callee_claw_id: str,
+    amount: int,
+    description: str = "",
+    referral_seek_id: str | None = None,
+) -> dict:
+    """Create a direct deal and reserve the caller's funds in escrow.
+
+    Returns the deal dict. Raises ValueError on invalid input or
+    InsufficientBalanceError if the caller can't cover the amount.
+    """
+    caller_claw = caller_claw_id.strip().upper()
+    callee_claw = callee_claw_id.strip().upper()
+    if caller_claw == callee_claw:
+        raise ValueError("不能跟自己下单。")
+    if amount < 0:
+        raise ValueError("金额不能为负。")
+
+    caller = get_lobster_by_claw_id(caller_claw)
+    callee = get_lobster_by_claw_id(callee_claw)
+    if caller is None:
+        raise ValueError("付款方龙虾不存在。")
+    if callee is None:
+        raise ValueError("收款方龙虾不存在。")
+
+    caller_owner_id = str(caller["owner_id"] or "").strip()
+    callee_owner_id = str(callee["owner_id"] or "").strip()
+
+    # Reserve funds if amount > 0
+    invocation_dict: dict | None = None
+    if amount > 0:
+        if not caller_owner_id:
+            raise ValueError("付款方尚未绑定主人,无法发起付费订单。")
+        if not callee_owner_id:
+            raise ValueError("收款方尚未绑定主人,无法接收付费订单。")
+        invocation_dict = reserve_funds(
+            payer_owner_id=caller_owner_id,
+            callee_owner_id=callee_owner_id,
+            source_type="direct_deal",
+            source_id="",  # will be updated after deal creation
+            amount=amount,
+            competition_total_bids=1,
+            competition_selected_rank=1,
+            competition_context="direct_deal",
+        )
+
+    deal_id = new_uuid()
+    now = utc_now()
+
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO deals (
+                id, caller_lobster_id, callee_lobster_id,
+                caller_owner_id, callee_owner_id,
+                amount, description, status,
+                invocation_id, referral_seek_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'created', ?, ?, ?, ?)
+        """, (
+            deal_id, str(caller["id"]), str(callee["id"]),
+            caller_owner_id or None, callee_owner_id or None,
+            amount, description.strip(),
+            (invocation_dict or {}).get("id"),
+            referral_seek_id,
+            now, now,
+        ))
+
+        # Update the invocation's source_id to point back to this deal
+        if invocation_dict:
+            conn.execute(
+                "UPDATE invocations SET source_id = ? WHERE id = ?",
+                (deal_id, invocation_dict["id"]),
+            )
+
+        row = conn.execute("SELECT * FROM deals WHERE id = ?", (deal_id,)).fetchone()
+    return dict(row)
+
+
+def accept_deal(deal_id: str, callee_claw_id: str) -> dict:
+    """Callee accepts the deal. Work can now begin."""
+    callee = get_lobster_by_claw_id(callee_claw_id.strip().upper())
+    if callee is None:
+        raise ValueError("龙虾不存在。")
+    now = utc_now()
+    with get_conn() as conn:
+        deal = conn.execute("SELECT * FROM deals WHERE id = ?", (deal_id,)).fetchone()
+        if deal is None:
+            raise ValueError("订单不存在。")
+        if str(deal["callee_lobster_id"]) != str(callee["id"]):
+            raise ValueError("只有收款方能接受订单。")
+        if deal["status"] != "created":
+            raise ValueError(f"订单状态为 {deal['status']},无法接受。")
+        conn.execute(
+            "UPDATE deals SET status = 'accepted', accepted_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, deal_id),
+        )
+        return dict(conn.execute("SELECT * FROM deals WHERE id = ?", (deal_id,)).fetchone())
+
+
+def reject_deal(deal_id: str, callee_claw_id: str) -> dict:
+    """Callee rejects the deal. Escrow is released."""
+    callee = get_lobster_by_claw_id(callee_claw_id.strip().upper())
+    if callee is None:
+        raise ValueError("龙虾不存在。")
+    now = utc_now()
+    with get_conn() as conn:
+        deal = conn.execute("SELECT * FROM deals WHERE id = ?", (deal_id,)).fetchone()
+        if deal is None:
+            raise ValueError("订单不存在。")
+        if str(deal["callee_lobster_id"]) != str(callee["id"]):
+            raise ValueError("只有收款方能拒绝订单。")
+        if deal["status"] != "created":
+            raise ValueError(f"订单状态为 {deal['status']},无法拒绝。")
+        conn.execute(
+            "UPDATE deals SET status = 'rejected', cancelled_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, deal_id),
+        )
+        result = dict(conn.execute("SELECT * FROM deals WHERE id = ?", (deal_id,)).fetchone())
+
+    # Release escrow
+    invocation_id = str(deal["invocation_id"] or "").strip()
+    if invocation_id:
+        try:
+            release_reserved_funds(invocation_id)
+        except EscrowError:
+            pass
+    return result
+
+
+def fulfill_deal(deal_id: str, callee_claw_id: str) -> dict:
+    """Callee marks the deal as fulfilled (work done)."""
+    callee = get_lobster_by_claw_id(callee_claw_id.strip().upper())
+    if callee is None:
+        raise ValueError("龙虾不存在。")
+    now = utc_now()
+    with get_conn() as conn:
+        deal = conn.execute("SELECT * FROM deals WHERE id = ?", (deal_id,)).fetchone()
+        if deal is None:
+            raise ValueError("订单不存在。")
+        if str(deal["callee_lobster_id"]) != str(callee["id"]):
+            raise ValueError("只有收款方能标记完成。")
+        if deal["status"] != "accepted":
+            raise ValueError(f"订单状态为 {deal['status']},只有已接受的订单能标记完成。")
+        conn.execute(
+            "UPDATE deals SET status = 'fulfilled', fulfilled_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, deal_id),
+        )
+        return dict(conn.execute("SELECT * FROM deals WHERE id = ?", (deal_id,)).fetchone())
+
+
+def confirm_deal(deal_id: str, caller_claw_id: str) -> dict:
+    """Caller confirms delivery, settling the escrow."""
+    caller = get_lobster_by_claw_id(caller_claw_id.strip().upper())
+    if caller is None:
+        raise ValueError("龙虾不存在。")
+    now = utc_now()
+    with get_conn() as conn:
+        deal = conn.execute("SELECT * FROM deals WHERE id = ?", (deal_id,)).fetchone()
+        if deal is None:
+            raise ValueError("订单不存在。")
+        if str(deal["caller_lobster_id"]) != str(caller["id"]):
+            raise ValueError("只有付款方能确认结算。")
+        if deal["status"] != "fulfilled":
+            raise ValueError(f"订单状态为 {deal['status']},只有已完成的订单能确认结算。")
+
+    # Settle escrow
+    settled_invocation: dict | None = None
+    invocation_id = str(deal["invocation_id"] or "").strip()
+    if invocation_id:
+        settled_invocation = settle_reserved_funds(invocation_id)
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE deals SET status = 'settled', settled_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, deal_id),
+        )
+        result = dict(conn.execute("SELECT * FROM deals WHERE id = ?", (deal_id,)).fetchone())
+    return result
+
+
+def cancel_deal(deal_id: str, caller_claw_id: str) -> dict:
+    """Caller cancels the deal. Escrow is released."""
+    caller = get_lobster_by_claw_id(caller_claw_id.strip().upper())
+    if caller is None:
+        raise ValueError("龙虾不存在。")
+    now = utc_now()
+    with get_conn() as conn:
+        deal = conn.execute("SELECT * FROM deals WHERE id = ?", (deal_id,)).fetchone()
+        if deal is None:
+            raise ValueError("订单不存在。")
+        if str(deal["caller_lobster_id"]) != str(caller["id"]):
+            raise ValueError("只有付款方能取消订单。")
+        if deal["status"] in ("settled", "rejected"):
+            raise ValueError(f"订单状态为 {deal['status']},无法取消。")
+        conn.execute(
+            "UPDATE deals SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, deal_id),
+        )
+        result = dict(conn.execute("SELECT * FROM deals WHERE id = ?", (deal_id,)).fetchone())
+
+    invocation_id = str(deal["invocation_id"] or "").strip()
+    if invocation_id:
+        try:
+            release_reserved_funds(invocation_id)
+        except EscrowError:
+            pass
+    return result
+
+
+def get_deal(deal_id: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM deals WHERE id = ?", (deal_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_deals_for_lobster(claw_id: str) -> list[dict]:
+    """List all deals where this lobster is caller or callee."""
+    lobster = get_lobster_by_claw_id(claw_id.strip().upper())
+    if lobster is None:
+        raise ValueError("龙虾不存在。")
+    lid = str(lobster["id"])
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT d.*,
+                   caller.claw_id AS caller_claw_id, caller.name AS caller_name,
+                   callee.claw_id AS callee_claw_id, callee.name AS callee_name
+            FROM deals d
+            JOIN lobsters caller ON caller.id = d.caller_lobster_id
+            JOIN lobsters callee ON callee.id = d.callee_lobster_id
+            WHERE d.caller_lobster_id = ? OR d.callee_lobster_id = ?
+            ORDER BY d.created_at DESC
+            LIMIT 100
+            """,
+            (lid, lid),
+        ).fetchall()
+    return [dict(r) for r in rows]

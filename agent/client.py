@@ -1114,6 +1114,39 @@ class ClawNetworkClient:
             f"/lobsters/{urllib.parse.quote(self._get_my_claw_id())}/account",
         )
 
+    # ------------------------------------------------------------------
+    # Direct deals — point-to-point transactions
+    # ------------------------------------------------------------------
+
+    def create_deal(self, callee_claw_id: str, amount: int, description: str = "", referral_seek_id: str | None = None) -> dict:
+        payload: dict = {
+            "caller_claw_id": self._get_my_claw_id(),
+            "callee_claw_id": callee_claw_id.strip().upper(),
+            "amount": max(0, int(amount)),
+            "description": description.strip(),
+        }
+        if referral_seek_id:
+            payload["referral_seek_id"] = referral_seek_id
+        return self._request("POST", "/deals", payload)
+
+    def accept_deal(self, deal_id: str) -> dict:
+        return self._request("POST", f"/deals/{urllib.parse.quote(deal_id)}/accept?claw_id={urllib.parse.quote(self._get_my_claw_id())}")
+
+    def reject_deal(self, deal_id: str) -> dict:
+        return self._request("POST", f"/deals/{urllib.parse.quote(deal_id)}/reject?claw_id={urllib.parse.quote(self._get_my_claw_id())}")
+
+    def fulfill_deal(self, deal_id: str) -> dict:
+        return self._request("POST", f"/deals/{urllib.parse.quote(deal_id)}/fulfill?claw_id={urllib.parse.quote(self._get_my_claw_id())}")
+
+    def confirm_deal(self, deal_id: str) -> dict:
+        return self._request("POST", f"/deals/{urllib.parse.quote(deal_id)}/confirm?claw_id={urllib.parse.quote(self._get_my_claw_id())}")
+
+    def cancel_deal(self, deal_id: str) -> dict:
+        return self._request("POST", f"/deals/{urllib.parse.quote(deal_id)}/cancel?claw_id={urllib.parse.quote(self._get_my_claw_id())}")
+
+    def list_deals(self) -> list[dict]:
+        return self._request("GET", f"/lobsters/{urllib.parse.quote(self._get_my_claw_id())}/deals")
+
     def record_local_event(
         self,
         *,
@@ -1444,6 +1477,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("get-account")
 
+    # Direct deals
+    create_deal_p = subparsers.add_parser("create-deal")
+    create_deal_p.add_argument("callee_claw_id")
+    create_deal_p.add_argument("amount", type=int)
+    create_deal_p.add_argument("--description", default="")
+    create_deal_p.add_argument("--referral-seek-id", default=None)
+
+    accept_deal_p = subparsers.add_parser("accept-deal")
+    accept_deal_p.add_argument("deal_id")
+
+    reject_deal_p = subparsers.add_parser("reject-deal")
+    reject_deal_p.add_argument("deal_id")
+
+    fulfill_deal_p = subparsers.add_parser("fulfill-deal")
+    fulfill_deal_p.add_argument("deal_id")
+
+    confirm_deal_p = subparsers.add_parser("confirm-deal")
+    confirm_deal_p.add_argument("deal_id")
+
+    cancel_deal_p = subparsers.add_parser("cancel-deal")
+    cancel_deal_p.add_argument("deal_id")
+
+    subparsers.add_parser("list-deals")
+
     # Cryptographic identity
     subparsers.add_parser("generate-keypair")
     bind_key_p = subparsers.add_parser("bind-key")
@@ -1725,6 +1782,34 @@ def main() -> None:
         return
     if args.command == "get-account":
         print(json.dumps(client.get_account(), ensure_ascii=False, indent=2))
+        return
+
+    # Direct deals
+    if args.command == "create-deal":
+        print(json.dumps(client.create_deal(
+            callee_claw_id=args.callee_claw_id,
+            amount=args.amount,
+            description=args.description,
+            referral_seek_id=args.referral_seek_id,
+        ), ensure_ascii=False, indent=2))
+        return
+    if args.command == "accept-deal":
+        print(json.dumps(client.accept_deal(args.deal_id), ensure_ascii=False, indent=2))
+        return
+    if args.command == "reject-deal":
+        print(json.dumps(client.reject_deal(args.deal_id), ensure_ascii=False, indent=2))
+        return
+    if args.command == "fulfill-deal":
+        print(json.dumps(client.fulfill_deal(args.deal_id), ensure_ascii=False, indent=2))
+        return
+    if args.command == "confirm-deal":
+        print(json.dumps(client.confirm_deal(args.deal_id), ensure_ascii=False, indent=2))
+        return
+    if args.command == "cancel-deal":
+        print(json.dumps(client.cancel_deal(args.deal_id), ensure_ascii=False, indent=2))
+        return
+    if args.command == "list-deals":
+        print(json.dumps(client.list_deals(), ensure_ascii=False, indent=2))
         return
 
     # Cryptographic identity commands

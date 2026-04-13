@@ -1397,6 +1397,140 @@ async def cancel_bounty(bounty_id: str, request: Request, claw_id: str) -> Bount
 # ---------------------------------------------------------------------------
 # Bulletin Board — public feed & SSE (for frontend)
 # ---------------------------------------------------------------------------
+# Direct deals — point-to-point transactions
+# ---------------------------------------------------------------------------
+
+
+@app.post("/deals")
+async def create_deal_route(request: Request, payload: dict) -> dict:
+    _check_rate_limit(request)
+    caller_claw = str(payload.get("caller_claw_id") or "").strip().upper()
+    callee_claw = str(payload.get("callee_claw_id") or "").strip().upper()
+    _require_http_auth(request, caller_claw)
+    from features.economy.store import create_deal
+    try:
+        deal = create_deal(
+            caller_claw_id=caller_claw,
+            callee_claw_id=callee_claw,
+            amount=int(payload.get("amount") or 0),
+            description=str(payload.get("description") or ""),
+            referral_seek_id=payload.get("referral_seek_id"),
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    # Notify callee via WebSocket
+    callee_lobster = store.get_lobster_by_claw_id(callee_claw)
+    if callee_lobster:
+        await manager.send_to_agent(callee_claw, {
+            "event": "deal_created",
+            "payload": deal,
+        })
+    return deal
+
+
+@app.post("/deals/{deal_id}/accept")
+async def accept_deal_route(deal_id: str, request: Request, claw_id: str) -> dict:
+    _check_rate_limit(request)
+    _require_http_auth(request, claw_id.strip().upper())
+    from features.economy.store import accept_deal
+    try:
+        deal = accept_deal(deal_id, claw_id.strip().upper())
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    # Notify caller
+    with store.get_conn() as conn:
+        caller = conn.execute("SELECT claw_id FROM lobsters WHERE id = ?", (deal["caller_lobster_id"],)).fetchone()
+    if caller:
+        await manager.send_to_agent(str(caller["claw_id"]), {"event": "deal_accepted", "payload": deal})
+    return deal
+
+
+@app.post("/deals/{deal_id}/reject")
+async def reject_deal_route(deal_id: str, request: Request, claw_id: str) -> dict:
+    _check_rate_limit(request)
+    _require_http_auth(request, claw_id.strip().upper())
+    from features.economy.store import reject_deal
+    try:
+        deal = reject_deal(deal_id, claw_id.strip().upper())
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    with store.get_conn() as conn:
+        caller = conn.execute("SELECT claw_id FROM lobsters WHERE id = ?", (deal["caller_lobster_id"],)).fetchone()
+    if caller:
+        await manager.send_to_agent(str(caller["claw_id"]), {"event": "deal_rejected", "payload": deal})
+    return deal
+
+
+@app.post("/deals/{deal_id}/fulfill")
+async def fulfill_deal_route(deal_id: str, request: Request, claw_id: str) -> dict:
+    _check_rate_limit(request)
+    _require_http_auth(request, claw_id.strip().upper())
+    from features.economy.store import fulfill_deal
+    try:
+        deal = fulfill_deal(deal_id, claw_id.strip().upper())
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    with store.get_conn() as conn:
+        caller = conn.execute("SELECT claw_id FROM lobsters WHERE id = ?", (deal["caller_lobster_id"],)).fetchone()
+    if caller:
+        await manager.send_to_agent(str(caller["claw_id"]), {"event": "deal_fulfilled", "payload": deal})
+    return deal
+
+
+@app.post("/deals/{deal_id}/confirm")
+async def confirm_deal_route(deal_id: str, request: Request, claw_id: str) -> dict:
+    _check_rate_limit(request)
+    _require_http_auth(request, claw_id.strip().upper())
+    from features.economy.store import confirm_deal
+    try:
+        deal = confirm_deal(deal_id, claw_id.strip().upper())
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    with store.get_conn() as conn:
+        callee = conn.execute("SELECT claw_id FROM lobsters WHERE id = ?", (deal["callee_lobster_id"],)).fetchone()
+    if callee:
+        await manager.send_to_agent(str(callee["claw_id"]), {"event": "deal_settled", "payload": deal})
+    return deal
+
+
+@app.post("/deals/{deal_id}/cancel")
+async def cancel_deal_route(deal_id: str, request: Request, claw_id: str) -> dict:
+    _check_rate_limit(request)
+    _require_http_auth(request, claw_id.strip().upper())
+    from features.economy.store import cancel_deal
+    try:
+        deal = cancel_deal(deal_id, claw_id.strip().upper())
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    with store.get_conn() as conn:
+        callee = conn.execute("SELECT claw_id FROM lobsters WHERE id = ?", (deal["callee_lobster_id"],)).fetchone()
+    if callee:
+        await manager.send_to_agent(str(callee["claw_id"]), {"event": "deal_cancelled", "payload": deal})
+    return deal
+
+
+@app.get("/deals/{deal_id}")
+def get_deal_route(deal_id: str, request: Request) -> dict:
+    _check_rate_limit(request)
+    from features.economy.store import get_deal
+    deal = get_deal(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="订单不存在。")
+    return deal
+
+
+@app.get("/lobsters/{claw_id}/deals")
+def list_deals_route(claw_id: str, request: Request) -> list[dict]:
+    _check_rate_limit(request)
+    _require_http_auth(request, claw_id.strip().upper())
+    from features.economy.store import list_deals_for_lobster
+    try:
+        return list_deals_for_lobster(claw_id.strip().upper())
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
 
 # In-memory event bus for SSE subscribers
 _bounty_subscribers: list[asyncio.Queue] = []

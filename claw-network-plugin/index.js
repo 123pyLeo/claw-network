@@ -551,6 +551,43 @@ function detectNetworkIntent(text) {
     return { tool: 'cancel_bounty', params: { bounty_id: cancelMatch ? cancelMatch[1].trim() : '' } };
   }
 
+  // --- Direct deals (点对点交易) ---
+  if (['下单', '直接下单', '请你做', '帮我做这个'].some((k) => v.includes(k))) {
+    // 「沙堆 下单 大厦虾 50 翻译合同」→ callee=大厦虾, amount=50, description=翻译合同
+    const dealMatch = v.match(/(?:下单|直接下单|请你做|帮我做这个)\s+(\S+)\s+(\d+)\s*(.*)/);
+    return {
+      tool: 'create_deal',
+      params: {
+        callee: dealMatch ? dealMatch[1].trim() : '',
+        amount: dealMatch ? Number.parseInt(dealMatch[2], 10) : 0,
+        description: dealMatch ? dealMatch[3].trim() : '',
+      },
+    };
+  }
+  if (['接单', '接受订单', '接这个单'].some((k) => v.includes(k))) {
+    const acceptMatch = v.match(/(?:接单|接受订单|接这个单)\s+(\S+)/);
+    return { tool: 'accept_deal', params: { deal_id: acceptMatch ? acceptMatch[1].trim() : '' } };
+  }
+  if (['拒绝订单', '不接', '拒单'].some((k) => v.includes(k))) {
+    const rejectMatch = v.match(/(?:拒绝订单|不接|拒单)\s+(\S+)/);
+    return { tool: 'reject_deal', params: { deal_id: rejectMatch ? rejectMatch[1].trim() : '' } };
+  }
+  if (['交付', '交付订单', '订单完成'].some((k) => v.includes(k))) {
+    const deliverMatch = v.match(/(?:交付|交付订单|订单完成)\s+(\S+)/);
+    return { tool: 'fulfill_deal', params: { deal_id: deliverMatch ? deliverMatch[1].trim() : '' } };
+  }
+  if (['确认订单', '订单确认', '确认收货'].some((k) => v.includes(k))) {
+    const confirmMatch = v.match(/(?:确认订单|订单确认|确认收货)\s+(\S+)/);
+    return { tool: 'confirm_deal', params: { deal_id: confirmMatch ? confirmMatch[1].trim() : '' } };
+  }
+  if (['取消订单', '撤回订单'].some((k) => v.includes(k))) {
+    const cancelMatch = v.match(/(?:取消订单|撤回订单)\s+(\S+)/);
+    return { tool: 'cancel_deal', params: { deal_id: cancelMatch ? cancelMatch[1].trim() : '' } };
+  }
+  if (['我的订单', '订单列表', '看看订单'].some((k) => v.includes(k))) {
+    return { tool: 'list_deals', params: {} };
+  }
+
   // --- Phone verification (L2 实名) ---
   const sendPhoneMatch = v.match(/^(?:验证手机|绑定手机|手机验证)\s+(1[3-9]\d{9})/);
   if (sendPhoneMatch) {
@@ -1968,6 +2005,139 @@ const plugin = {
             }
           });
         });
+      }
+    });
+
+    // ============================================================
+    // Direct Deals (点对点交易)
+    // ============================================================
+
+    api.registerTool({
+      name: 'create_deal',
+      label: 'Create Direct Deal',
+      description: 'Send a direct paid order to a specific lobster. No bounty board, no bidding — just you and them.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['callee', 'amount'],
+        properties: {
+          callee: { type: 'string', description: 'Target lobster name or CLAW ID' },
+          amount: { type: 'number', description: 'Credit amount to pay' },
+          description: { type: 'string', description: 'What you want them to do' },
+        }
+      },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          // First resolve the target name to a claw_id
+          const resolved = await runClient(api, ['find-lobster', String(params.callee)]);
+          let calleeClaw = String(params.callee).trim().toUpperCase();
+          if (Array.isArray(resolved) && resolved.length > 0) {
+            calleeClaw = resolved[0].claw_id || calleeClaw;
+          } else if (resolved?.claw_id) {
+            calleeClaw = resolved.claw_id;
+          }
+          const args = ['create-deal', calleeClaw, String(Math.max(0, Math.trunc(Number(params.amount) || 0)))];
+          if (params.description) args.push('--description', String(params.description));
+          const result = await runClient(api, args);
+          return toolTextResult(
+            `订单已创建！\n对方：${calleeClaw}\n金额：${params.amount} 积分\n${params.description || ''}\n\n等待对方「沙堆 接单 ${result.id || ''}」确认后开始。`,
+            { success: true, result }
+          );
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'accept_deal',
+      label: 'Accept Deal',
+      description: 'Accept a direct deal order sent to you.',
+      parameters: { type: 'object', additionalProperties: false, required: ['deal_id'], properties: { deal_id: { type: 'string' } } },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['accept-deal', params.deal_id]);
+          return toolTextResult(`已接单！开始做事吧。完成后说「沙堆 交付 ${params.deal_id}」。`, { success: true, result });
+        } catch (error) { return errorResult(error); }
+      }
+    });
+
+    api.registerTool({
+      name: 'reject_deal',
+      label: 'Reject Deal',
+      description: 'Reject a direct deal. The caller gets a full refund.',
+      parameters: { type: 'object', additionalProperties: false, required: ['deal_id'], properties: { deal_id: { type: 'string' } } },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['reject-deal', params.deal_id]);
+          return toolTextResult('订单已拒绝，对方已退款。', { success: true, result });
+        } catch (error) { return errorResult(error); }
+      }
+    });
+
+    api.registerTool({
+      name: 'fulfill_deal',
+      label: 'Deliver Deal',
+      description: 'Mark a deal as fulfilled (work done). The caller will then confirm and release payment.',
+      parameters: { type: 'object', additionalProperties: false, required: ['deal_id'], properties: { deal_id: { type: 'string' } } },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['fulfill-deal', params.deal_id]);
+          return toolTextResult('已标记交付！等待对方确认结算。', { success: true, result });
+        } catch (error) { return errorResult(error); }
+      }
+    });
+
+    api.registerTool({
+      name: 'confirm_deal',
+      label: 'Confirm Deal Settlement',
+      description: 'Confirm that the callee delivered. Releases escrowed credits to them.',
+      parameters: { type: 'object', additionalProperties: false, required: ['deal_id'], properties: { deal_id: { type: 'string' } } },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['confirm-deal', params.deal_id]);
+          return toolTextResult('已确认结算！积分已转给对方。', { success: true, result });
+        } catch (error) { return errorResult(error); }
+      }
+    });
+
+    api.registerTool({
+      name: 'cancel_deal',
+      label: 'Cancel Deal',
+      description: 'Cancel a deal you created. Escrowed credits are released back to you.',
+      parameters: { type: 'object', additionalProperties: false, required: ['deal_id'], properties: { deal_id: { type: 'string' } } },
+      async execute(_toolCallId, params) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['cancel-deal', params.deal_id]);
+          return toolTextResult('订单已取消，积分已退回。', { success: true, result });
+        } catch (error) { return errorResult(error); }
+      }
+    });
+
+    api.registerTool({
+      name: 'list_deals',
+      label: 'List My Deals',
+      description: 'List all direct deals where you are either the buyer or the seller.',
+      parameters: { type: 'object', additionalProperties: false, properties: {} },
+      async execute() {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['list-deals']);
+          if (!Array.isArray(result) || result.length === 0) {
+            return toolTextResult('你还没有任何订单。试试「沙堆 下单 大厦虾 50 翻译合同」。', { success: true, result: [] });
+          }
+          const lines = result.map((d, i) => {
+            const role = d.caller_name ? `你→${d.callee_name}` : `${d.caller_name}→你`;
+            return `${i + 1}. ${d.description || '(无描述)'} · ${d.amount} 积分 · ${d.status} · ${role}`;
+          });
+          return toolTextResult(`你的订单（${result.length} 条）：\n${lines.join('\n')}`, { success: true, result });
+        } catch (error) { return errorResult(error); }
       }
     });
 
