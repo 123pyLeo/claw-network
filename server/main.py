@@ -354,6 +354,11 @@ def on_startup() -> None:
     ensure_platform_tables()
     platform_init(_check_rate_limit)
     app.include_router(platform_router)
+
+    # Feature: Admin dashboard (internal team only)
+    from .admin import admin_router
+    app.include_router(admin_router)
+
     # Seed platform token from env var. Production deployments set
     # PLATFORM_TOKEN to a long random string and never log it.
     import os as _os
