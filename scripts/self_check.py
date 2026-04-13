@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 from pathlib import Path
+
+# Ensure project root is on sys.path so `python scripts/self_check.py` works
+# without requiring PYTHONPATH to be set manually.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 # SAFETY: redirect the database to a temporary file BEFORE importing the app.
 # This prevents self_check from ever touching the production database.
@@ -124,7 +131,7 @@ def main() -> None:
         assert any(event["event_type"] == "room_message" for event in bob_event_rows), "expected room_message event"
         assert any(event["event_type"] == "collaboration_request" for event in bob_event_rows), "expected collaboration_request event"
 
-    print(f"self_check passed using {Path(DB_PATH)}")
+    print(f"self_check passed using {_TEMP_DB}")
 
 
 if __name__ == "__main__":
