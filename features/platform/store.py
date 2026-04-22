@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 from server.store import get_conn, new_uuid, utc_now
 
+DAILY_BONUS_AMOUNT = 100
 
 # How long a platform-issued phone code is valid
 PLATFORM_CODE_EXPIRY_SECONDS = 5 * 60
@@ -250,3 +251,41 @@ def list_lobsters_for_owner_with_status(owner_id: str, *, include_deleted: bool 
     with get_conn() as conn:
         rows = conn.execute(sql, tuple(params)).fetchall()
     return [dict(r) for r in rows]
+
+
+def claim_daily_bonus(owner_id: str) -> dict:
+    """Grant daily login bonus if not yet claimed today. Idempotent."""
+    now = utc_now()
+    today = now[:10]  # "YYYY-MM-DD"
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT last_daily_bonus_at, credit_balance FROM accounts WHERE owner_id = ?",
+            (owner_id,),
+        ).fetchone()
+        if row is None:
+            return {"granted": False, "reason": "account_not_found"}
+
+        last_bonus = str(row["last_daily_bonus_at"] or "")
+        if last_bonus[:10] == today:
+            return {
+                "granted": False,
+                "reason": "already_claimed",
+                "credit_balance": int(row["credit_balance"]),
+            }
+
+        conn.execute(
+            "UPDATE accounts SET credit_balance = credit_balance + ?, "
+            "last_daily_bonus_at = ?, updated_at = ? WHERE owner_id = ?",
+            (DAILY_BONUS_AMOUNT, now, now, owner_id),
+        )
+        new_balance = conn.execute(
+            "SELECT credit_balance FROM accounts WHERE owner_id = ?",
+            (owner_id,),
+        ).fetchone()
+
+    return {
+        "granted": True,
+        "amount": DAILY_BONUS_AMOUNT,
+        "credit_balance": int(new_balance["credit_balance"]),
+    }

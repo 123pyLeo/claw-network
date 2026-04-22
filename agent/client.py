@@ -1319,6 +1319,39 @@ class ClawNetworkClient:
                 if event_name == "roundtable_activity" and isinstance(event, dict):
                     print(f"【圆桌活动】{event.get('content', '')}")
 
+    # ------------------------------------------------------------------
+    # BP matching — investor/founder role operations
+    # ------------------------------------------------------------------
+
+    def bp_redeem_invite(self, code: str) -> dict:
+        """Redeem an invite code to claim a role (investor/founder)."""
+        return self._request(
+            "POST",
+            f"/bp/invite-codes/redeem?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+            {"code": code.strip()},
+        )
+
+    def bp_submit_role_app(self, requested_role: str, intro_text: str, org_name: str = "") -> dict:
+        """Submit a role application. Founder → auto-approved. Investor → pending review."""
+        return self._request(
+            "POST",
+            f"/bp/role-applications?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+            {
+                "requested_role": requested_role.strip(),
+                "intro_text": intro_text.strip(),
+                "org_name": org_name.strip(),
+            },
+        )
+
+    def bp_get_listing(self, listing_id: str) -> dict:
+        return self._request("GET", f"/bp/listings/{urllib.parse.quote(listing_id)}")
+
+    def bp_request_meeting(self, intent_id: str) -> dict:
+        return self._request(
+            "POST",
+            f"/bp/intents/{urllib.parse.quote(intent_id)}/request-meeting?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+        )
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Claw Network sidecar client")
@@ -1574,6 +1607,21 @@ def build_parser() -> argparse.ArgumentParser:
     review_join_p = subparsers.add_parser("review-join-request")
     review_join_p.add_argument("request_id")
     review_join_p.add_argument("decision", choices=["approved", "rejected"])
+
+    # --- BP matching (new Phase 1 commands) ---
+    bp_redeem_p = subparsers.add_parser("bp-redeem-invite")
+    bp_redeem_p.add_argument("code")
+
+    bp_role_p = subparsers.add_parser("bp-submit-role-app")
+    bp_role_p.add_argument("requested_role", choices=["investor", "founder"])
+    bp_role_p.add_argument("intro_text")
+    bp_role_p.add_argument("--org", default="")
+
+    bp_get_p = subparsers.add_parser("bp-get-listing")
+    bp_get_p.add_argument("listing_id")
+
+    bp_meet_p = subparsers.add_parser("bp-request-meeting")
+    bp_meet_p.add_argument("intent_id")
 
     return parser
 
@@ -1903,6 +1951,20 @@ def main() -> None:
         return
     if args.command == "review-join-request":
         print(json.dumps(client.review_join_request(args.request_id, args.decision), ensure_ascii=False, indent=2))
+        return
+
+    # BP matching (new Phase 1)
+    if args.command == "bp-redeem-invite":
+        print(json.dumps(client.bp_redeem_invite(args.code), ensure_ascii=False, indent=2))
+        return
+    if args.command == "bp-submit-role-app":
+        print(json.dumps(client.bp_submit_role_app(args.requested_role, args.intro_text, args.org), ensure_ascii=False, indent=2))
+        return
+    if args.command == "bp-get-listing":
+        print(json.dumps(client.bp_get_listing(args.listing_id), ensure_ascii=False, indent=2))
+        return
+    if args.command == "bp-request-meeting":
+        print(json.dumps(client.bp_request_meeting(args.intent_id), ensure_ascii=False, indent=2))
         return
 
     parser.error("Unknown command")

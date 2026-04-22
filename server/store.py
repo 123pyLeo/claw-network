@@ -568,6 +568,43 @@ def soft_delete_lobster(claw_id: str) -> sqlite3.Row:
     return row
 
 
+def unbind_lobster_from_owner(claw_id: str, owner_id: str) -> sqlite3.Row:
+    """Detach a lobster from its owner without deleting it.
+
+    After unbinding:
+      - lobster.owner_id = NULL (becomes "anonymous" — like a fresh install.sh lobster)
+      - lobster.owner_name cleared
+      - All history (invocations, deals, verdicts, stats) stays attached to the
+        lobster by lobster_id — unaffected.
+      - The OpenClaw-side process keeps running with its existing auth_token;
+        the lobster just has no account behind it anymore.
+      - The lobster can later be re-paired to any account via pairing code.
+
+    Raises ValueError if the lobster doesn't exist, is deleted, is the official
+    lobster, or doesn't belong to `owner_id`.
+    """
+    claw_id = claw_id.strip().upper()
+    lobster = get_lobster_by_claw_id(claw_id)
+    if lobster is None:
+        raise ValueError("龙虾不存在或已删除。")
+    if int(lobster["is_official"] or 0) == 1:
+        raise ValueError("官方龙虾不能解绑。")
+    current_owner = str(lobster["owner_id"] or "")
+    if not current_owner:
+        raise ValueError("这只龙虾还没有绑定到账号。")
+    if current_owner != owner_id:
+        raise ValueError("这只龙虾不属于当前账号。")
+    now = utc_now()
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE lobsters SET owner_id = NULL, owner_name = '', updated_at = ? WHERE id = ?",
+            (now, str(lobster["id"])),
+        )
+    row = get_lobster_by_claw_id(claw_id)
+    assert row is not None
+    return row
+
+
 def reset_lobster_auth_token(claw_id: str) -> tuple[sqlite3.Row, str]:
     """Generate a new auth_token for a lobster, invalidating the old one.
 
@@ -2188,6 +2225,18 @@ def stats_overview() -> dict[str, int | str]:
             conn.execute("SELECT COUNT(*) FROM bounties WHERE status IN ('open', 'bidding', 'assigned')").fetchone()[0]
         )
         bids_total = int(conn.execute("SELECT COUNT(*) FROM bounty_bids").fetchone()[0])
+        try:
+            transactions_today_amount = int(conn.execute(
+                "SELECT COALESCE(SUM(amount),0) FROM invocations WHERE created_at >= ? AND settlement_status IN ('instant','settled')",
+                (today_prefix,),
+            ).fetchone()[0])
+            transactions_today_count = int(conn.execute(
+                "SELECT COUNT(*) FROM invocations WHERE created_at >= ? AND settlement_status IN ('instant','settled')",
+                (today_prefix,),
+            ).fetchone()[0])
+        except Exception:
+            transactions_today_amount = 0
+            transactions_today_count = 0
 
     return {
         "users_total": lobsters_total,
@@ -2205,6 +2254,8 @@ def stats_overview() -> dict[str, int | str]:
         "bids_total": bids_total,
         "official_claw_id": OFFICIAL_CLAW_ID,
         "official_name": OFFICIAL_NAME,
+        "transactions_today_amount": transactions_today_amount,
+        "transactions_today_count": transactions_today_count,
     }
 
 
@@ -2637,10 +2688,49 @@ def _consume_session_turn(session_id: str) -> sqlite3.Row:
     return row
 
 
+def _bp_matched_pair(from_lid: str, to_lid: str) -> bool:
+    """Whether these two lobsters share an accepted BP intent (either direction).
+
+    When a BP intent reaches `accepted` or `auto_accepted`, both sides have
+    explicitly consented to this specific relationship — the investor by
+    creating the intent, the founder by accepting it. That mutual-consent
+    gate is strictly stronger than a generic friendship, so messages between
+    this pair should skip the collaboration-policy confirmation that exists
+    to defend against stranger spam.
+
+    Note: this introduces a dependency from the sandpile core on the
+    BP-matching feature schema (bp_intents + bp_listings). That's
+    architecturally imperfect but pragmatic for MVP — we swallow missing-
+    table errors so a pre-BP database still works.
+    """
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                """SELECT 1 FROM bp_intents bi
+                   JOIN bp_listings bl ON bl.id = bi.listing_id
+                   WHERE bi.status IN ('accepted', 'auto_accepted')
+                     AND (
+                       (bi.investor_lobster_id = ? AND bl.founder_lobster_id = ?)
+                       OR
+                       (bi.investor_lobster_id = ? AND bl.founder_lobster_id = ?)
+                     )
+                   LIMIT 1""",
+                (from_lid, to_lid, to_lid, from_lid),
+            ).fetchone()
+        return row is not None
+    except sqlite3.OperationalError:
+        return False
+
+
 def _can_start_session(initiator: sqlite3.Row, recipient: sqlite3.Row) -> tuple[bool, str | None]:
     if _has_persistent_grant(grantor=recipient, grantee=initiator):
         return True, None
     if recipient["is_official"]:
+        return True, None
+
+    # BP-matched pairs cleared a stronger mutual-consent gate than generic
+    # friendship — bypass the collaboration-policy confirmation.
+    if _bp_matched_pair(str(initiator["id"]), str(recipient["id"])):
         return True, None
 
     initiator_is_official = bool(initiator["is_official"])
@@ -3137,6 +3227,26 @@ def list_bounties_for_owner(owner_id: str, status: str | None = None) -> list[sq
         return conn.execute(query, tuple(params)).fetchall()
 
 
+def list_bounties_awaiting_delivery_for_bidder(bidder_owner_id: str) -> list[sqlite3.Row]:
+    """Bounties where the selected bidder is this owner and they still need to deliver.
+
+    Status covered: 'assigned' (B hasn't delivered yet) and 'fulfilled' (B
+    delivered but A hasn't confirmed — kept in list so B can still see the
+    thread or withdraw a delivery).
+    """
+    with get_conn() as conn:
+        return conn.execute(
+            _bounty_row_select() + """
+            JOIN bounty_bids bb ON bb.bounty_id = b.id AND bb.status = 'selected'
+            JOIN lobsters lb ON lb.id = bb.bidder_lobster_id
+            WHERE lb.owner_id = ?
+              AND b.status IN ('assigned', 'fulfilled')
+            ORDER BY b.updated_at DESC
+            """,
+            (bidder_owner_id,),
+        ).fetchall()
+
+
 def list_bounties_pending_confirmation_for_poster(poster_claw_id: str) -> list[sqlite3.Row]:
     """Bounties this poster needs to confirm settlement on (status='fulfilled')."""
     poster = get_lobster_by_claw_id(poster_claw_id)
@@ -3191,6 +3301,16 @@ def confirm_bounty_settlement(
         row = conn.execute(
             _bounty_row_select() + " WHERE b.id = ?", (bounty_id,)
         ).fetchone()
+
+    # Settle any active delivery for this bounty — this also deletes cached bytes.
+    try:
+        from features.economy.store import list_active_deliveries_for_order, mark_delivery_settled
+        for d in list_active_deliveries_for_order(bounty_id, "bounty"):
+            mark_delivery_settled(d["id"])
+    except Exception:
+        # Don't let delivery bookkeeping block the settlement itself.
+        pass
+
     assert row is not None
     return row, settled_invocation
 

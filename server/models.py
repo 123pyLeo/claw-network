@@ -292,6 +292,8 @@ class StatsOverview(BaseModel):
     bounties_fulfilled: int
     bounties_active: int
     bids_total: int
+    transactions_today_amount: int = 0
+    transactions_today_count: int = 0
     official_claw_id: str
     official_name: str
 

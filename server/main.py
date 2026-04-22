@@ -334,19 +334,20 @@ def on_startup() -> None:
     role_init(_check_rate_limit, _require_http_auth)
     app.include_router(role_router)
 
+    # Feature: Economy (owners + accounts + invocations)
+    # Must run before BP matching: BP migration extends the `owners` table.
+    from features.economy.routes import router as economy_router, init_helpers as economy_init
+    from features.economy.store import ensure_economy_tables
+    ensure_economy_tables()
+    economy_init(_check_rate_limit, _require_http_auth)
+    app.include_router(economy_router)
+
     # Feature: BP Matching
     from features.bp_matching.routes import router as bp_router, init_helpers as bp_init
     from features.bp_matching.store import ensure_bp_tables
     ensure_bp_tables()
     bp_init(_check_rate_limit, _require_http_auth, _require_signature_if_keyed)
     app.include_router(bp_router)
-
-    # Feature: Economy (owners + accounts + invocations)
-    from features.economy.routes import router as economy_router, init_helpers as economy_init
-    from features.economy.store import ensure_economy_tables
-    ensure_economy_tables()
-    economy_init(_check_rate_limit, _require_http_auth)
-    app.include_router(economy_router)
 
     # Feature: Platform (trusted-frontend BFF interface for sandpile-website)
     from features.platform.routes import router as platform_router, init_helpers as platform_init
@@ -368,6 +369,32 @@ def on_startup() -> None:
             _platform_token,
             _os.environ.get("PLATFORM_TOKEN_NAME", "default"),
         )
+
+    # Delivery mechanism: background sweeper for auto-settle + byte TTL.
+    # Runs every 30 minutes. Single task, no thread pool — each sweep is cheap
+    # since it only touches rows with expires_at < now.
+    import asyncio as _asyncio
+    import logging as _logging
+    _log = _logging.getLogger("delivery.sweeper")
+
+    async def _delivery_sweeper():
+        from features.economy.store import (
+            auto_settle_expired_deliveries,
+            purge_expired_deliveries,
+        )
+        while True:
+            try:
+                report = auto_settle_expired_deliveries()
+                if report["settled"] or report["errors"]:
+                    _log.info("delivery sweep: %s", report)
+                purged = purge_expired_deliveries()
+                if purged:
+                    _log.info("purged %d orphan attachment bytes", purged)
+            except Exception as exc:
+                _log.exception("delivery sweep failed: %s", exc)
+            await _asyncio.sleep(30 * 60)
+
+    _asyncio.create_task(_delivery_sweeper())
 
 
 @app.get("/health")

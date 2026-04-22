@@ -494,6 +494,60 @@ function detectNetworkIntent(text) {
     return { tool: 'get_account_balance', params: {} };
   }
 
+  // --- BP matching: redeem invite code (role grant) ---
+  // Match "沙堆 兑换邀请码 SANDPILE-XXX-YYY" or "沙堆 我有邀请码 SANDPILE-XXX"
+  const bpInviteMatch = v.match(/(?:兑换|输入|我有|使用)?\s*邀请码\s*(SANDPILE[-_][A-Z0-9]+[-_][A-Z0-9]+)/i)
+    || v.match(/\b(SANDPILE[-_][A-Z0-9]+[-_][A-Z0-9]+)\b/i);
+  if (bpInviteMatch) {
+    return { tool: 'bp_redeem_invite', params: { code: bpInviteMatch[1].toUpperCase().replace(/_/g, '-') } };
+  }
+
+  // --- BP matching: role application ---
+  // Founder: "沙堆 我要认证创始人" / "沙堆 认证成创始人 介绍文字"
+  const founderMatch = v.match(/(?:认证|我是|成为)?\s*(?:创始人|founder)/i);
+  if (founderMatch) {
+    // Grab intro text after any punctuation or keyword
+    const introMatch = v.match(/(?:创始人|founder)[,，:：\s]*(.+)/i);
+    const intro = introMatch ? introMatch[1].trim() : '';
+    const orgMatch = v.match(/(?:机构|公司|团队)[：:]\s*([^,，\s]+)/);
+    return {
+      tool: 'bp_submit_role_app',
+      params: {
+        requested_role: 'founder',
+        intro_text: intro || '创始人认证',
+        org_name: orgMatch ? orgMatch[1].trim() : '',
+      },
+    };
+  }
+
+  const investorMatch = v.match(/(?:认证|我是|成为)\s*(?:投资人|investor|基金)/i);
+  if (investorMatch) {
+    const introMatch = v.match(/(?:投资人|investor|基金)[,，:：\s]*(.+)/i);
+    const intro = introMatch ? introMatch[1].trim() : '';
+    const orgMatch = v.match(/(?:机构|基金|公司)[：:]\s*([^,，\s]+)/);
+    return {
+      tool: 'bp_submit_role_app',
+      params: {
+        requested_role: 'investor',
+        intro_text: intro || '投资人认证',
+        org_name: orgMatch ? orgMatch[1].trim() : '',
+      },
+    };
+  }
+
+  // --- BP matching: get a specific listing (for investor agent reading BP) ---
+  const bpGetMatch = v.match(/(?:看|查|打开)\s*(?:项目|BP)\s+([a-f0-9-]{8,})/i);
+  if (bpGetMatch) {
+    return { tool: 'bp_get_listing', params: { listing_id: bpGetMatch[1] } };
+  }
+
+  // --- BP matching: request meeting ---
+  const bpMeetMatch = v.match(/(?:约见|见面|想见)[\s:：]*([a-f0-9-]{8,})/i);
+  if (bpMeetMatch) {
+    return { tool: 'bp_request_meeting', params: { intent_id: bpMeetMatch[1] } };
+  }
+
+
   // --- Bulletin board (fuzzy matching is safe here — behind 沙堆 gate) ---
   if (['发个需求', '发布需求', '挂个需求', '我需要', '找人帮', '谁能帮', '帮我做', '需要帮忙', '帮个忙'].some((k) => v.includes(k))) {
     // Extract title from common patterns
@@ -1898,7 +1952,7 @@ const plugin = {
     api.registerTool({
       name: 'fulfill_bounty',
       label: 'Fulfill Bounty',
-      description: 'Mark a bounty as fulfilled after the work is done.',
+      description: 'Mark a bounty as fulfilled after the work is done. Pure status flip; to attach notes/files/code links use the sandpile website delivery flow.',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -1911,7 +1965,8 @@ const plugin = {
         try {
           await runClient(api, ['register']);
           const result = await runClient(api, ['fulfill-bounty', params.bounty_id]);
-          return toolTextResult('需求已标记为完成。', { success: true, result });
+          const hint = '\n\n想附说明/附件给需求方?打开 sandpile.io → 我中标的需求 → 点「交付」。';
+          return toolTextResult('需求已标记为完成。' + hint, { success: true, result });
         } catch (error) {
           return errorResult(error);
         }
@@ -1988,6 +2043,121 @@ const plugin = {
             ? `当前账户:\n  总额    ${total} 积分\n  可用    ${available} 积分\n  冻结    ${committed} 积分(escrow 中)`
             : `当前账户:\n  总额    ${total} 积分\n  可用    ${available} 积分`;
           return toolTextResult(lines, { success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    // ----- BP matching tools (Phase 1) -----
+
+    api.registerTool({
+      name: 'bp_redeem_invite',
+      label: 'Redeem BP Invite Code',
+      description: 'Redeem a SANDPILE-XXXX-XXXX invite code to claim investor or founder role.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { code: { type: 'string', description: 'Invite code (SANDPILE-XXXX-XXXX)' } },
+        required: ['code'],
+      },
+      async execute({ code }) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['bp-redeem-invite', String(code).trim()]);
+          const roleLabel = result?.role === 'investor' ? '投资人' : result?.role === 'founder' ? '创始人' : result?.role;
+          const verifiedLabel = result?.role_verified ? ' · 已认证' : '';
+          return toolTextResult(`✓ 邀请码兑换成功\n  角色:${roleLabel}${verifiedLabel}`, { success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'bp_submit_role_app',
+      label: 'Submit BP Role Application',
+      description: 'Submit a founder or investor role application. Founder applications are auto-approved (light auth). Investor applications go to admin review unless the user has an invite code.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          requested_role: { type: 'string', enum: ['investor', 'founder'] },
+          intro_text: { type: 'string', description: 'One-line self intro (required).' },
+          org_name: { type: 'string', description: 'Organization / fund / company name (optional).' },
+        },
+        required: ['requested_role'],
+      },
+      async execute({ requested_role, intro_text = '', org_name = '' }) {
+        try {
+          await runClient(api, ['register']);
+          const intro = String(intro_text || '').trim() || (requested_role === 'founder' ? '创始人' : '投资人');
+          const args = ['bp-submit-role-app', requested_role, intro];
+          if (org_name && String(org_name).trim()) {
+            args.push('--org', String(org_name).trim());
+          }
+          const result = await runClient(api, args);
+          const status = result?.status;
+          if (status === 'approved') {
+            return toolTextResult(`✓ 角色认证通过\n  角色:${requested_role === 'founder' ? '创始人' : '投资人'}\n  你可以开始发 BP / 浏览项目了。`, { success: true, result });
+          }
+          if (status === 'pending') {
+            return toolTextResult(`📋 已提交投资人认证申请,等待人工审核(通常 1-2 个工作日)。\n  如有邀请码,可以直接用:"沙堆 邀请码 SANDPILE-XXXX-XXXX"`, { success: true, result });
+          }
+          return toolTextResult(`申请状态:${status}`, { success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'bp_get_listing',
+      label: 'Get BP Listing Detail',
+      description: 'Fetch full structured content of a BP listing. Caller must be an approved-investor on this listing.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { listing_id: { type: 'string' } },
+        required: ['listing_id'],
+      },
+      async execute({ listing_id }) {
+        try {
+          const result = await runClient(api, ['bp-get-listing', String(listing_id).trim()]);
+          const lines = [
+            `📇 ${result.project_name}${result.sector ? ' · ' + result.sector : ''}${result.stage ? ' · ' + result.stage : ''}`,
+            `一句话: ${result.one_liner}`,
+          ];
+          if (result.problem) lines.push(`\n## 问题\n${result.problem}`);
+          if (result.solution) lines.push(`\n## 解决方案\n${result.solution}`);
+          if (result.team_intro) lines.push(`\n## 团队\n${result.team_intro}`);
+          if (result.traction) lines.push(`\n## 进展\n${result.traction}`);
+          if (result.business_model) lines.push(`\n## 商业模式\n${result.business_model}`);
+          if (result.ask_note) lines.push(`\n## 融资计划\n${result.ask_note}`);
+          return toolTextResult(lines.join('\n'), { success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'bp_request_meeting',
+      label: 'Request BP Meeting (Unlock Contact)',
+      description: 'Signal that this side wants to meet the counterpart. When both sides signal, contact info is exchanged automatically.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { intent_id: { type: 'string' } },
+        required: ['intent_id'],
+      },
+      async execute({ intent_id }) {
+        try {
+          const result = await runClient(api, ['bp-request-meeting', String(intent_id).trim()]);
+          if (result.unlocked) {
+            return toolTextResult(`✓ 双方同意约见,联系方式已交换。沙堆退场,你们接下来自己约时间。`, { success: true, result });
+          }
+          return toolTextResult(`📨 已标记"想约见",等对方也确认后自动解锁联系方式。`, { success: true, result });
         } catch (error) {
           return errorResult(error);
         }
@@ -2163,13 +2333,18 @@ const plugin = {
       parameters: { type: 'object', additionalProperties: false, properties: {} },
       async execute() {
         try {
-          await runClient(api, ['register']);
+          const register = await runClient(api, ['register']);
+          const myClaw = (register?.lobster?.claw_id ?? register?.output ?? '').toString().toUpperCase();
           const result = await runClient(api, ['list-deals']);
           if (!Array.isArray(result) || result.length === 0) {
             return toolTextResult('你还没有任何订单。试试「沙堆 下单 大厦虾 50 翻译合同」。', { success: true, result: [] });
           }
           const lines = result.map((d, i) => {
-            const role = d.caller_name ? `你→${d.callee_name}` : `${d.caller_name}→你`;
+            const callerClaw = String(d.caller_claw_id || '').toUpperCase();
+            const iAmCaller = myClaw && callerClaw && myClaw === callerClaw;
+            const role = iAmCaller
+              ? `你→${d.callee_name || d.callee_claw_id || '?'}`
+              : `${d.caller_name || d.caller_claw_id || '?'}→你`;
             return `${i + 1}. ${d.description || '(无描述)'} · ${d.amount} 积分 · ${d.status} · ${role}`;
           });
           return toolTextResult(`你的订单（${result.length} 条）：\n${lines.join('\n')}`, { success: true, result });

@@ -13,8 +13,20 @@ from .models import (
     BPIntentCreateRequest,
     BPIntentRow,
     BPIntentReviewRequest,
+    InviteCodeCreateRequest,
+    InviteCodeRow,
+    InviteCodeRedeemRequest,
+    InviteCodeRedeemResponse,
+    RoleApplicationCreateRequest,
+    RoleApplicationRow,
+    RoleApplicationReviewRequest,
+    OwnerContactSetRequest,
+    OwnerContactRow,
+    MeetingRequestResponse,
+    MeetingUnlockedPayload,
 )
 from . import store as bp_store
+from features.platform.routes import _require_platform_token
 
 router = APIRouter(prefix="/bp", tags=["bp-matching"])
 
@@ -62,6 +74,12 @@ async def create_listing(payload: BPListingCreateRequest, request: Request, claw
             team_size=payload.team_size,
             access_policy=payload.access_policy,
             expires_in_days=payload.expires_in_days or 90,
+            problem=payload.problem,
+            solution=payload.solution,
+            team_intro=payload.team_intro,
+            traction=payload.traction,
+            business_model=payload.business_model,
+            ask_note=payload.ask_note,
         )
     except ValueError as exc:
         raise _http_error(exc) from exc
@@ -74,11 +92,21 @@ def search_listings(
     sector: str | None = None,
     stage: str | None = None,
     limit: int = 50,
+    before_created_at: str | None = None,
 ) -> list[BPListingRow]:
-    """Search active BP listings. Public endpoint."""
+    """Search active BP listings. Public endpoint.
+
+    Pagination: pass the `created_at` of the last row from the previous
+    page as `before_created_at` to fetch older listings. Omit on first call.
+    """
     _check_rate_limit(request)
     try:
-        results = bp_store.search_listings(sector=sector, stage=stage, limit=limit)
+        results = bp_store.search_listings(
+            sector=sector,
+            stage=stage,
+            limit=limit,
+            before_created_at=before_created_at,
+        )
     except ValueError as exc:
         raise _http_error(exc) from exc
     return [BPListingRow(**r) for r in results]
@@ -102,16 +130,55 @@ async def update_listing(listing_id: str, payload: BPListingUpdateRequest, reque
     normalized = claw_id.strip().upper()
     lobster = _require_http_auth(request, normalized)
     await _require_signature_if_keyed(request, lobster)
+    content_updates = payload.model_dump(
+        exclude_none=True,
+        exclude={"access_policy", "status"},
+    )
     try:
         result = bp_store.update_listing(
             listing_id=listing_id,
             claw_id=normalized,
             access_policy=payload.access_policy,
             status=payload.status,
+            content_updates=content_updates,
         )
     except ValueError as exc:
         raise _http_error(exc) from exc
+
+    # If a key content field changed, nudge investors with still-pending intents.
+    notify = result.pop("_notify_investors", [])
+    for investor_claw in notify:
+        try:
+            await manager.send_to_agent(investor_claw, {
+                "event": "bp_listing_updated",
+                "payload": {
+                    "listing_id": listing_id,
+                    "project_name": result.get("project_name"),
+                    "one_liner": result.get("one_liner"),
+                    "funding_ask": result.get("funding_ask"),
+                    "stage": result.get("stage"),
+                },
+            })
+        except Exception:
+            pass
+
     return BPListingRow(**result)
+
+
+@router.get("/my-intents", response_model=list[BPIntentRow])
+def my_intents_route(request: Request, claw_id: str) -> list[BPIntentRow]:
+    """Investor pipeline view: all intents I've created, newest first.
+
+    For pending intents, queue_position / queue_total reflect where I
+    stand in each BP's review queue right now.
+    """
+    _check_rate_limit(request)
+    _require_http_auth(request, claw_id.strip().upper())
+    try:
+        results = bp_store.list_my_intents(claw_id.strip().upper())
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return [BPIntentRow(**r) for r in results]
 
 
 @router.get("/my-listings", response_model=list[BPListingRow])
@@ -180,14 +247,404 @@ async def review_intent(intent_id: str, payload: BPIntentReviewRequest, request:
             intent_id=intent_id,
             claw_id=normalized,
             decision=payload.decision,
+            review_note=payload.note,
         )
     except ValueError as exc:
         raise _http_error(exc) from exc
 
-    # Notify investor via WebSocket
+    # Notify investor via WebSocket — payload now carries review_note so the
+    # investor sees the founder's reasoning (especially important on reject).
     await manager.send_to_agent(result["investor_claw_id"], {
         "event": "bp_intent_reviewed",
         "payload": result,
     })
 
+    # The queue shifted: nudge every still-pending investor on this same
+    # listing with their new position so the wait isn't opaque.
+    listing_id_for_queue = result["listing_id"]
+    try:
+        remaining = bp_store.list_pending_intents_for_listing(listing_id_for_queue)
+    except Exception:
+        remaining = []
+    for it in remaining:
+        await manager.send_to_agent(it["investor_claw_id"], {
+            "event": "bp_queue_update",
+            "payload": {
+                "intent_id": it["id"],
+                "listing_id": listing_id_for_queue,
+                "project_name": it["project_name"],
+                "queue_position": it["queue_position"],
+                "queue_total": it["queue_total"],
+            },
+        })
+
+    # Conversation kickoff hint: only on accept. Sandpile pushes one
+    # `bp_chat_ready` event to each side carrying a role-specific suggestion
+    # for who should speak first. Avoids the "both sides wait for the
+    # other" deadlock where a freshly accepted intent never advances.
+    if result["status"] == "accepted":
+        listing = bp_store.get_listing(result["listing_id"])
+        founder_claw = listing["founder_claw_id"]
+        investor_claw = result["investor_claw_id"]
+        await manager.send_to_agent(founder_claw, {
+            "event": "bp_chat_ready",
+            "payload": {
+                "intent_id": intent_id,
+                "listing_id": result["listing_id"],
+                "your_role": "founder",
+                "peer_claw_id": investor_claw,
+                "hint": "你刚通过此投资人的兴趣。建议先发一段简短开场白：欢迎、点出 BP 重点、邀请他提问。",
+            },
+        })
+        await manager.send_to_agent(investor_claw, {
+            "event": "bp_chat_ready",
+            "payload": {
+                "intent_id": intent_id,
+                "listing_id": result["listing_id"],
+                "your_role": "investor",
+                "peer_claw_id": founder_claw,
+                "hint": "founder 已通过你的兴趣。如果对方未在 30 秒内开场，建议你主动发一个具体的尽调问题（traction、团队、商业模式等任选一项）。",
+            },
+        })
+
     return BPIntentRow(**result)
+
+
+# ---------------------------------------------------------------------------
+# Invite codes (admin creates, lobster redeems)
+# ---------------------------------------------------------------------------
+
+@router.post("/invite-codes", response_model=InviteCodeRow)
+def create_invite_code_route(payload: InviteCodeCreateRequest, request: Request) -> InviteCodeRow:
+    """Admin endpoint — generate a new invite code.
+
+    Auth: platform token (admin/trusted frontend only).
+    """
+    _check_rate_limit(request)
+    token_row = _require_platform_token(request)
+    try:
+        result = bp_store.create_invite_code(
+            role=payload.role,
+            role_verified=payload.role_verified,
+            generated_by=str(token_row.get("name") or "admin"),
+            note=payload.note,
+            valid_days=payload.valid_days,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    # Add missing fields for response
+    result["used_at"] = None
+    result["used_by_lobster_id"] = None
+    return InviteCodeRow(**result)
+
+
+@router.get("/invite-codes", response_model=list[InviteCodeRow])
+def list_invite_codes_route(request: Request, status: str | None = None, limit: int = 100) -> list[InviteCodeRow]:
+    """Admin endpoint — list invite codes. status: unused|used|expired|None(all)."""
+    _check_rate_limit(request)
+    _require_platform_token(request)
+    rows = bp_store.list_invite_codes(status=status, limit=limit)
+    # Normalize role_verified from int to bool
+    for r in rows:
+        r["role_verified"] = bool(r.get("role_verified"))
+    return [InviteCodeRow(**r) for r in rows]
+
+
+@router.post("/invite-codes/redeem", response_model=InviteCodeRedeemResponse)
+async def redeem_invite_code_route(
+    payload: InviteCodeRedeemRequest,
+    request: Request,
+    claw_id: str,
+) -> InviteCodeRedeemResponse:
+    """Lobster redeems an invite code to claim a role. Requires lobster auth."""
+    _check_rate_limit(request)
+    lobster = _require_http_auth(request, claw_id.strip().upper())
+    await _require_signature_if_keyed(request, lobster)
+    try:
+        result = bp_store.redeem_invite_code(payload.code, str(lobster["id"]))
+    except bp_store.InviteCodeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return InviteCodeRedeemResponse(**result)
+
+
+# ---------------------------------------------------------------------------
+# Role applications (lobster submits, admin reviews)
+# ---------------------------------------------------------------------------
+
+@router.post("/role-applications", response_model=RoleApplicationRow)
+async def submit_role_application_route(
+    payload: RoleApplicationCreateRequest,
+    request: Request,
+    claw_id: str,
+) -> RoleApplicationRow:
+    """Lobster submits a role application.
+
+    - founder: auto-approved (light auth)
+    - investor: queued for admin review
+    """
+    _check_rate_limit(request)
+    lobster = _require_http_auth(request, claw_id.strip().upper())
+    await _require_signature_if_keyed(request, lobster)
+    try:
+        result = bp_store.submit_role_application(
+            lobster_id=str(lobster["id"]),
+            requested_role=payload.requested_role,
+            intro_text=payload.intro_text,
+            org_name=payload.org_name,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    # Fetch full row for response
+    full = bp_store.get_role_application(result["id"])
+    if full:
+        full.setdefault("claw_id", str(lobster["claw_id"]))
+        full.setdefault("lobster_name", str(lobster["name"]) if "name" in lobster.keys() else "")
+    return RoleApplicationRow(**full)
+
+
+@router.get("/role-applications", response_model=list[RoleApplicationRow])
+def list_pending_applications_route(request: Request, limit: int = 50) -> list[RoleApplicationRow]:
+    """Admin — list pending role applications."""
+    _check_rate_limit(request)
+    _require_platform_token(request)
+    rows = bp_store.list_pending_applications(limit=limit)
+    return [RoleApplicationRow(**r) for r in rows]
+
+
+@router.post("/role-applications/{app_id}/review", response_model=RoleApplicationRow)
+def review_role_application_route(
+    app_id: str,
+    payload: RoleApplicationReviewRequest,
+    request: Request,
+) -> RoleApplicationRow:
+    """Admin reviews a pending role application."""
+    _check_rate_limit(request)
+    token_row = _require_platform_token(request)
+    try:
+        bp_store.review_role_application(
+            app_id=app_id,
+            decision=payload.decision,
+            reviewer=str(token_row.get("name") or "admin"),
+            review_note=payload.review_note,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    full = bp_store.get_role_application(app_id)
+    if full is None:
+        raise HTTPException(status_code=404, detail="Application not found after review.")
+    return RoleApplicationRow(**full)
+
+
+# ---------------------------------------------------------------------------
+# Owner contact info (for State 4 unlock)
+# ---------------------------------------------------------------------------
+
+@router.put("/owners/{owner_id}/contact")
+def set_owner_contact_route(
+    owner_id: str,
+    payload: OwnerContactSetRequest,
+    request: Request,
+) -> dict:
+    """Set / update an owner's contact info (admin only for now)."""
+    _check_rate_limit(request)
+    _require_platform_token(request)
+    try:
+        bp_store.set_owner_contact(
+            owner_id=owner_id,
+            primary_contact=payload.primary_contact,
+            primary_contact_type=payload.primary_contact_type,
+            secondary_contacts=payload.secondary_contacts,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return {"ok": True}
+
+
+@router.get("/owners/{owner_id}/contact", response_model=OwnerContactRow)
+def get_owner_contact_route(owner_id: str, request: Request) -> OwnerContactRow:
+    """Read an owner's contact info. Admin-only."""
+    _check_rate_limit(request)
+    _require_platform_token(request)
+    result = bp_store.get_owner_contact(owner_id)
+    return OwnerContactRow(**result)
+
+
+@router.put("/my-contact")
+async def set_my_contact_route(
+    payload: OwnerContactSetRequest,
+    request: Request,
+    claw_id: str,
+) -> dict:
+    """Set / update the caller's own contact info.
+
+    Looks up the caller's owner_id from their lobster record, then writes
+    the contact into that owner row. This is the user-facing counterpart
+    to the admin-only PUT /bp/owners/{owner_id}/contact.
+    """
+    _check_rate_limit(request)
+    normalized = claw_id.strip().upper()
+    lobster = _require_http_auth(request, normalized)
+    await _require_signature_if_keyed(request, lobster)
+    owner_id = str(lobster["owner_id"] or "")
+    if not owner_id:
+        raise HTTPException(
+            status_code=400,
+            detail="请先完成手机验证后再设置联系方式。",
+        )
+    try:
+        bp_store.set_owner_contact(
+            owner_id=owner_id,
+            primary_contact=payload.primary_contact,
+            primary_contact_type=payload.primary_contact_type,
+            secondary_contacts=payload.secondary_contacts,
+        )
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return {"ok": True}
+
+
+@router.get("/my-contact", response_model=OwnerContactRow)
+async def get_my_contact_route(
+    request: Request,
+    claw_id: str,
+) -> OwnerContactRow:
+    """Read the caller's own contact info."""
+    _check_rate_limit(request)
+    normalized = claw_id.strip().upper()
+    lobster = _require_http_auth(request, normalized)
+    await _require_signature_if_keyed(request, lobster)
+    owner_id = str(lobster["owner_id"] or "")
+    if not owner_id:
+        return OwnerContactRow(primary_contact=None, primary_contact_type=None, secondary_contacts={})
+    result = bp_store.get_owner_contact(owner_id)
+    return OwnerContactRow(**result)
+
+
+# ---------------------------------------------------------------------------
+# State 4: Meeting request + contact unlock
+# ---------------------------------------------------------------------------
+
+@router.post("/intents/{intent_id}/request-meeting", response_model=MeetingRequestResponse)
+async def request_meeting_route(
+    intent_id: str,
+    request: Request,
+    claw_id: str,
+) -> MeetingRequestResponse:
+    """Either side (investor or founder) signals they want to meet.
+
+    When both sides have signaled, the intent is 'unlocked' and sandpile
+    pushes contact info to each side via WebSocket.
+    """
+    _check_rate_limit(request)
+    normalized = claw_id.strip().upper()
+    lobster = _require_http_auth(request, normalized)
+    await _require_signature_if_keyed(request, lobster)
+
+    # Determine which side this lobster is on
+    from server.store import get_conn as _gc
+    with _gc() as conn:
+        row = conn.execute(
+            """SELECT bi.investor_lobster_id, bl.founder_lobster_id,
+                      bi.listing_id
+               FROM bp_intents bi
+               JOIN bp_listings bl ON bl.id = bi.listing_id
+               WHERE bi.id = ?""",
+            (intent_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Intent not found.")
+
+    lobster_id = str(lobster["id"])
+    if lobster_id == str(row["investor_lobster_id"]):
+        side = "investor"
+        peer_claw_id_side = "founder"
+    elif lobster_id == str(row["founder_lobster_id"]):
+        side = "founder"
+        peer_claw_id_side = "investor"
+    else:
+        raise HTTPException(status_code=403, detail="你不是该 intent 的参与方。")
+
+    # Front-load: caller must have their own contact info ready before they
+    # can signal "want to meet". Otherwise the unlock would be one-sided —
+    # they'd receive the peer's contact while delivering nothing in return.
+    caller_owner_id = str(lobster["owner_id"] or "")
+    if not caller_owner_id:
+        raise HTTPException(status_code=400, detail="请先完成手机验证并补全联系方式后再发起约见。")
+    caller_contact = bp_store.get_owner_contact(caller_owner_id)
+    if not caller_contact.get("primary_contact"):
+        raise HTTPException(
+            status_code=400,
+            detail="请先补全你的联系方式（微信或电话）后再发起约见——对方解锁到的将是你的这份联系方式。",
+        )
+
+    try:
+        result = bp_store.request_meeting(intent_id, side)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+    # Notify the peer about a fresh "wants to meet" signal — but only the
+    # first time this side marks it, so the peer isn't pinged repeatedly
+    # when the caller's agent re-issues the same request.
+    if result["side_newly_set"]:
+        with _gc() as conn:
+            peer = conn.execute(
+                """SELECT l.claw_id FROM lobsters l
+                   WHERE l.id = ?""",
+                (str(row["investor_lobster_id"]) if side == "founder" else str(row["founder_lobster_id"]),),
+            ).fetchone()
+        if peer:
+            await manager.send_to_agent(str(peer["claw_id"]), {
+                "event": "bp_meeting_interest",
+                "payload": {
+                    "intent_id": intent_id,
+                    "from_side": side,
+                    "unlocked": result["unlocked"],
+                },
+            })
+
+    # Push unlock events (with contact info) only on the transition into
+    # unlocked — never re-broadcast for subsequent calls on an already-unlocked intent.
+    if result["first_unlock"]:
+        # Fetch each side's claw_id
+        with _gc() as conn:
+            inv_claw = conn.execute(
+                "SELECT claw_id FROM lobsters WHERE id = ?",
+                (str(row["investor_lobster_id"]),),
+            ).fetchone()
+            fnd_claw = conn.execute(
+                "SELECT claw_id FROM lobsters WHERE id = ?",
+                (str(row["founder_lobster_id"]),),
+            ).fetchone()
+
+        # Investor receives founder's contact
+        try:
+            inv_payload = bp_store.get_meeting_unlock_payload(intent_id, "investor")
+            if inv_claw:
+                await manager.send_to_agent(str(inv_claw["claw_id"]), {
+                    "event": "bp_meeting_unlocked",
+                    "payload": inv_payload,
+                })
+        except ValueError:
+            pass
+
+        # Founder receives investor's contact
+        try:
+            fnd_payload = bp_store.get_meeting_unlock_payload(intent_id, "founder")
+            if fnd_claw:
+                await manager.send_to_agent(str(fnd_claw["claw_id"]), {
+                    "event": "bp_meeting_unlocked",
+                    "payload": fnd_payload,
+                })
+        except ValueError:
+            pass
+
+    return MeetingRequestResponse(**result)
+
+
+@router.post("/admin/expire-stale-meetings")
+def expire_stale_meetings_route(request: Request) -> dict:
+    """Admin helper: mark overdue meeting requests as expired."""
+    _check_rate_limit(request)
+    _require_platform_token(request)
+    count = bp_store.expire_stale_meeting_requests()
+    return {"expired": count}

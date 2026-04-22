@@ -93,3 +93,10 @@ class PairingCodeStatusResponse(BaseModel):
     claimed_lobster_id: str | None = None
     claimed_at: datetime | None = None
     expires_at: datetime | None = None
+
+
+class DailyBonusResponse(BaseModel):
+    granted: bool
+    amount: int | None = None
+    reason: str | None = None
+    credit_balance: int | None = None

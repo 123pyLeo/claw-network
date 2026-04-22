@@ -530,6 +530,62 @@ async def _handle_event(
     if event_name == "collaboration_response" and isinstance(event, dict):
         print(f"【协作审批结果】{str(event.get('content') or '').strip()}", flush=True)
 
+    # --- BP matching events ---
+    if event_name == "bp_intent" and isinstance(event, dict):
+        investor = str(event.get("investor_name") or "?").strip()
+        org = str(event.get("investor_org") or "").strip()
+        org_suffix = f" @ {org}" if org else ""
+        note = str(event.get("personal_note") or "").strip()
+        proj = str(event.get("project_name") or "").strip()
+        intent_id = str(event.get("id") or "").strip()
+        note_line = f"\n  附言:{note}" if note else ""
+        print(
+            f"【BP 新意向】{investor}{org_suffix} 对「{proj}」有意向{note_line}\n"
+            f"  处理:'沙堆 批准意向 {intent_id}' 或 '沙堆 拒绝意向 {intent_id}'",
+            flush=True,
+        )
+    if event_name == "bp_intent_reviewed" and isinstance(event, dict):
+        proj = str(event.get("project_name") or "").strip()
+        status = str(event.get("status") or "").strip()
+        intent_id = str(event.get("id") or "").strip()
+        if status in ("accepted", "auto_accepted"):
+            print(
+                f"【BP 意向通过】创始人接受了你对「{proj}」的意向。\n"
+                f"  下一步:'沙堆 看项目 {event.get('listing_id', '')}' 查看完整 BP",
+                flush=True,
+            )
+        elif status == "rejected":
+            print(f"【BP 意向被拒】「{proj}」创始人未接受你的意向。", flush=True)
+    if event_name == "bp_meeting_interest" and isinstance(event, dict):
+        from_side = str(event.get("from_side") or "").strip()
+        intent_id = str(event.get("intent_id") or "").strip()
+        unlocked = bool(event.get("unlocked"))
+        who = "投资人" if from_side == "investor" else "创始人"
+        if not unlocked:
+            print(
+                f"【BP 约见请求】{who}想和你见面聊。\n"
+                f"  同意则输入:'沙堆 约见 {intent_id}'",
+                flush=True,
+            )
+    if event_name == "bp_meeting_unlocked" and isinstance(event, dict):
+        name = str(event.get("peer_name") or "").strip()
+        org = str(event.get("peer_org") or "").strip()
+        org_suffix = f" ({org})" if org else ""
+        contact = str(event.get("peer_contact") or "").strip()
+        ctype = str(event.get("peer_contact_type") or "").strip()
+        type_label = {"wechat": "微信", "phone": "电话"}.get(ctype, ctype)
+        secondary = event.get("peer_secondary_contacts") or {}
+        lines = [
+            f"【BP 约见解锁】双方都同意约见了!",
+            f"  对方:{name}{org_suffix}",
+            f"  {type_label}:{contact}" if contact else "  对方尚未填联系方式",
+        ]
+        if isinstance(secondary, dict) and secondary:
+            other = ", ".join(f"{k}:{v}" for k, v in secondary.items())
+            lines.append(f"  其他:{other}")
+        lines.append("  接下来直接联系对方,约时间见面。")
+        print("\n".join(lines), flush=True)
+
     if not bridge_enabled or not isinstance(event, dict):
         return
     if event_name not in {"message", "text"}:
@@ -685,9 +741,7 @@ async def run_forever(
         official = registration.get("official_lobster") or {}
         if isinstance(official, dict):
             official_claw_id = str(official.get("claw_id") or "").strip().upper() or None
-    if credentials_mode and not official_claw_id:
-        # Credentials-mode import doesn't return official_lobster info.
-        # Fall back to the well-known seeded constant.
+    if not official_claw_id:
         official_claw_id = OFFICIAL_LOBSTER_CLAW_ID_FALLBACK
 
     # ----- Reconnect loop: only re-runs WS bridge, NEVER re-registers -----
