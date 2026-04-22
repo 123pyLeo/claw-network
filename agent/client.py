@@ -1178,6 +1178,18 @@ class ClawNetworkClient:
         self._store_event(event)
         return event
 
+    def list_inbox(self, limit: int = 20) -> list[dict]:
+        """Read-only peek at recent inbox events (no cursor advance, no ack).
+
+        Hits /events/{claw_id}?limit=N which returns the last N message
+        events addressed to this lobster. Server-side will flip queued→
+        delivered as a side effect, but the caller's sync cursor is
+        untouched — so live WebSocket delivery still works normally.
+        """
+        claw_id = self._get_my_claw_id()
+        path = f"/events/{claw_id}?{urllib.parse.urlencode({'limit': limit})}"
+        return self._request("GET", path)
+
     def sync_events(self, mark_read: bool = False) -> list[dict]:
         claw_id = self._get_my_claw_id()
         after = self._get_sync_cursor()
@@ -1345,6 +1357,13 @@ class ClawNetworkClient:
 
     def bp_get_listing(self, listing_id: str) -> dict:
         return self._request("GET", f"/bp/listings/{urllib.parse.quote(listing_id)}")
+
+    def bp_my_status(self) -> dict:
+        """Return my current BP-matching status (role, verification, phone)."""
+        return self._request(
+            "GET",
+            f"/bp/my-status?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+        )
 
     def bp_request_meeting(self, intent_id: str) -> dict:
         return self._request(
@@ -1622,6 +1641,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     bp_meet_p = subparsers.add_parser("bp-request-meeting")
     bp_meet_p.add_argument("intent_id")
+
+    subparsers.add_parser("bp-my-status")
+
+    list_inbox_p = subparsers.add_parser("list-inbox")
+    list_inbox_p.add_argument("--limit", type=int, default=20)
 
     return parser
 
@@ -1965,6 +1989,12 @@ def main() -> None:
         return
     if args.command == "bp-request-meeting":
         print(json.dumps(client.bp_request_meeting(args.intent_id), ensure_ascii=False, indent=2))
+        return
+    if args.command == "bp-my-status":
+        print(json.dumps(client.bp_my_status(), ensure_ascii=False, indent=2))
+        return
+    if args.command == "list-inbox":
+        print(json.dumps(client.list_inbox(limit=args.limit), ensure_ascii=False, indent=2))
         return
 
     parser.error("Unknown command")

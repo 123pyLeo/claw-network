@@ -502,6 +502,15 @@ function detectNetworkIntent(text) {
     return { tool: 'bp_redeem_invite', params: { code: bpInviteMatch[1].toUpperCase().replace(/_/g, '-') } };
   }
 
+  // --- Inbox: show recent messages this lobster received ---
+  // MUST resolve to a real tool call so the LLM doesn't fabricate
+  // "no new messages" from conversation memory.
+  if (/^(?:查看?|看|查一下)?\s*(?:消息|收件箱|未读|新消息)/.test(v)
+    || /(?:有没有|收到).*?(?:消息|回复)/.test(v)
+    || /^(?:我的)?(?:消息|收件箱)$/.test(v)) {
+    return { tool: 'list_my_inbox', params: { limit: 20 } };
+  }
+
   // --- BP matching: query my role/verification status ---
   // MUST come BEFORE founder/investor role-apply matchers, otherwise phrases
   // like "我是投资人吗" / "认证通过了吗" get swallowed as "apply for role".
@@ -2179,6 +2188,36 @@ const plugin = {
             return toolTextResult(`✓ 双方同意约见,联系方式已交换。沙堆退场,你们接下来自己约时间。`, { success: true, result });
           }
           return toolTextResult(`📨 已标记"想约见",等对方也确认后自动解锁联系方式。`, { success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'list_my_inbox',
+      label: 'List My Inbox',
+      description: 'Return the most recent message events addressed to this lobster: text messages (ask_lobster replies), friend requests, BP events, etc. Call this whenever the user asks whether they have new messages, received anything, or wants to see the inbox. Answer based on this tool\'s return — do NOT guess from earlier conversation.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { limit: { type: 'number' } },
+      },
+      async execute({ limit = 20 } = {}) {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['list-inbox', '--limit', String(limit)]);
+          if (!Array.isArray(result) || result.length === 0) {
+            return toolTextResult('收件箱是空的，没有历史消息。', { success: true, result: [] });
+          }
+          const lines = result.map((r, i) => {
+            const t = (r.created_at || '').slice(5, 16).replace('T', ' ');
+            const from = r.from_name || r.from_claw_id || '系统';
+            const et = r.event_type || '?';
+            const body = String(r.content || '').slice(0, 120).replace(/\n+/g, ' ');
+            return `${i + 1}. [${t}] (${et}) ${from}：${body}`;
+          });
+          return toolTextResult(`最近 ${result.length} 条消息：\n${lines.join('\n')}`, { success: true, result });
         } catch (error) {
           return errorResult(error);
         }
