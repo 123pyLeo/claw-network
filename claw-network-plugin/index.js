@@ -502,6 +502,19 @@ function detectNetworkIntent(text) {
     return { tool: 'bp_redeem_invite', params: { code: bpInviteMatch[1].toUpperCase().replace(/_/g, '-') } };
   }
 
+  // --- BP matching: query my role/verification status ---
+  // MUST come BEFORE founder/investor role-apply matchers, otherwise phrases
+  // like "我是投资人吗" / "认证通过了吗" get swallowed as "apply for role".
+  if (
+    /(?:我的?|当前|查|看).*?(?:认证|身份|角色|状态)/.test(v)
+    || /(?:认证|身份|角色|审核).*?(?:状态|好了吗|通过了吗|下来了吗|怎么样|如何)/.test(v)
+    || /(?:我(?:是不是|已经|有没有)).*?(?:认证|投资人|创始人)/.test(v)
+    || /^(?:我是)?(?:认证)?(?:投资人|创始人)吗[?？]?$/.test(v)
+    || /^(?:查|看)?(?:身份|角色|状态|认证)$/.test(v)
+  ) {
+    return { tool: 'bp_my_status', params: {} };
+  }
+
   // --- BP matching: role application ---
   // Founder: "沙堆 我要认证创始人" / "沙堆 认证成创始人 介绍文字"
   const founderMatch = v.match(/(?:认证|我是|成为)?\s*(?:创始人|founder)/i);
@@ -533,6 +546,14 @@ function detectNetworkIntent(text) {
         org_name: orgMatch ? orgMatch[1].trim() : '',
       },
     };
+  }
+
+  // --- BP matching: my status (role / verified / phone) ---
+  if (/(?:我的?|查|看)?\s*(?:认证|身份|角色|状态)/.test(v) && /(?:认证|身份|角色)/.test(v)) {
+    return { tool: 'bp_my_status', params: {} };
+  }
+  if (/(?:我|是不是|通过了吗).*?(?:认证|投资人|创始人)/.test(v) || /(?:认证|审核).*?(?:状态|好了吗|通过了吗)/.test(v)) {
+    return { tool: 'bp_my_status', params: {} };
   }
 
   // --- BP matching: get a specific listing (for investor agent reading BP) ---
@@ -2158,6 +2179,34 @@ const plugin = {
             return toolTextResult(`✓ 双方同意约见,联系方式已交换。沙堆退场,你们接下来自己约时间。`, { success: true, result });
           }
           return toolTextResult(`📨 已标记"想约见",等对方也确认后自动解锁联系方式。`, { success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'bp_my_status',
+      label: 'Check My BP Status',
+      description: 'Return the caller\'s current BP-matching status: role (founder/investor/none), role verification, phone verification. Call this whenever the user asks whether they are a verified investor/founder, or whether their role application has been approved. Answer based on this tool\'s return — do NOT guess from earlier conversation.',
+      parameters: { type: 'object', additionalProperties: false, properties: {} },
+      async execute() {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['bp-my-status']);
+          const role = result?.role || '(未申请)';
+          const roleLabel = role === 'investor' ? '投资人' : role === 'founder' ? '创始人' : role === 'both' ? '投资人 + 创始人' : '未申请角色';
+          const verifiedLabel = result?.role_verified ? '✅ 已通过' : (role && role !== '(未申请)' ? '⏳ 审核中' : '—');
+          const phoneLabel = result?.phone_verified ? '✅' : '❌ 未验证';
+          const lines = [
+            `当前 BP 身份状态：`,
+            `  · 角色：${roleLabel}`,
+            `  · 认证：${verifiedLabel}${result?.role_verification_method ? ` (${result.role_verification_method})` : ''}`,
+            `  · 手机：${phoneLabel}`,
+            `  · 可发 BP：${result?.can_publish_bp ? '是' : '否'}`,
+            `  · 可看 BP 完整详情：${result?.can_view_bp_detail ? '是' : '否'}`,
+          ];
+          return toolTextResult(lines.join('\n'), { success: true, result });
         } catch (error) {
           return errorResult(error);
         }

@@ -513,6 +513,14 @@ async def _handle_event(
                 idle_timeout_seconds=roundtable_idle_timeout_seconds,
                 poll_seconds=roundtable_poll_seconds,
             )
+    if event_name == "text" and isinstance(event, dict):
+        from_name = str(event.get("from_name") or event.get("from_claw_id") or "未知龙虾").strip()
+        from_claw = str(event.get("from_claw_id") or "").strip()
+        content = str(event.get("content") or "").strip()
+        suffix = f" ({from_claw})" if from_claw and from_claw != from_name else ""
+        print(f"【新消息】来自 {from_name}{suffix}：{content}", flush=True)
+    if event_name == "message_accepted" and isinstance(event, dict):
+        pass  # outgoing ack, skip
     if event_name == "friend_request" and isinstance(event, dict):
         from_claw_id = str(event.get("from_claw_id") or "").strip()
         request_id = str(event.get("id") or "").strip()
