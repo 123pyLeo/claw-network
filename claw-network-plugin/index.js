@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -3079,7 +3079,232 @@ const plugin = {
         }
       }
     });
+
+    // ------------------------------------------------------------
+    // Proactive notifier service: sidecar listens to sandpile WS, then
+    // fans the message out to whatever IM channels (Feishu, WeCom,
+    // Telegram, Discord, Slack...) the user has configured in OpenClaw.
+    // Each channel uses its own creds from api.config.channels — the
+    // sandpile server holds no IM secrets.
+    if (typeof api.registerService === 'function') {
+      registerSandpileNotifier(api);
+    } else if (api.logger?.warn) {
+      api.logger.warn('[sandpile] registerService unavailable — proactive push disabled');
+    }
   }
 };
+
+// ============================================================
+// Proactive multi-channel notifier
+// ============================================================
+
+function registerSandpileNotifier(api) {
+  let child = null;
+  let stopping = false;
+  let stdoutBuf = '';
+
+  const cfg = getPluginConfig(api) ?? {};
+  const pythonBin = cfg.pythonBin || process.env.PYTHON_BIN || 'python3';
+  const clientPath = cfg.clientPath || defaultClientPath;
+  const projectRoot = path.resolve(path.dirname(clientPath), '..');
+  const sidecarScript = cfg.sidecarScript
+    || path.join(projectRoot, 'claw-network-plugin', 'scripts', 'sidecar_runner.py');
+  const dataDir = cfg.dataDir || path.join(projectRoot, 'agent_data');
+  const endpoint = cfg.endpoint || 'https://api.sandpile.io';
+  const runtimeId = cfg.runtimeId;
+  const name = cfg.name;
+  const ownerName = cfg.ownerName;
+
+  if (!runtimeId || !name || !ownerName) {
+    api.logger?.warn?.('[sandpile] pluginConfig missing runtimeId/name/ownerName — notifier not started');
+    return;
+  }
+
+  function handleNotifyLine(line) {
+    if (!line.startsWith('[NOTIFY] ')) return;
+    let payload;
+    try { payload = JSON.parse(line.slice('[NOTIFY] '.length)); } catch { return; }
+    const text = String(payload?.text || '').trim();
+    if (!text) return;
+    dispatchToAllChannels(api, text, payload).catch((err) => {
+      api.logger?.error?.(`[sandpile] dispatch failed: ${err?.message || err}`);
+    });
+  }
+
+  function onStdout(chunk) {
+    stdoutBuf += chunk.toString('utf8');
+    let idx;
+    while ((idx = stdoutBuf.indexOf('\n')) >= 0) {
+      const line = stdoutBuf.slice(0, idx);
+      stdoutBuf = stdoutBuf.slice(idx + 1);
+      handleNotifyLine(line.trim());
+    }
+  }
+
+  function start() {
+    if (child || stopping) return;
+    const args = [
+      sidecarScript,
+      '--endpoint', endpoint,
+      '--runtime-id', runtimeId,
+      '--name', name,
+      '--owner-name', ownerName,
+      '--data-dir', dataDir,
+    ];
+    if (cfg.clawId && cfg.authToken) {
+      args.push('--claw-id', cfg.clawId, '--auth-token', cfg.authToken);
+    }
+    // Strip proxy env vars — Python websockets routes through them and
+    // breaks WS upgrade. Same trick start_sidecar.sh uses.
+    const cleanEnv = { ...process.env };
+    for (const v of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) {
+      delete cleanEnv[v];
+    }
+    cleanEnv.PYTHONPATH = projectRoot;
+    cleanEnv.PAGER = 'cat';
+    try {
+      child = spawn(pythonBin, args, { stdio: ['ignore', 'pipe', 'pipe'], env: cleanEnv });
+    } catch (err) {
+      api.logger?.error?.(`[sandpile] failed to spawn sidecar: ${err?.message || err}`);
+      return;
+    }
+    child.stdout?.on('data', onStdout);
+    child.stderr?.on('data', (c) => {
+      const line = c.toString('utf8').trim();
+      if (line) api.logger?.warn?.(`[sandpile sidecar stderr] ${line.slice(0, 300)}`);
+    });
+    child.on('exit', (code, signal) => {
+      api.logger?.warn?.(`[sandpile] sidecar exited (code=${code}, signal=${signal})`);
+      child = null;
+      if (!stopping) setTimeout(start, 5000);
+    });
+    api.logger?.info?.(`[sandpile] sidecar started (pid=${child.pid}, endpoint=${endpoint})`);
+  }
+
+  api.registerService({
+    id: 'claw-network-notifier',
+    start: async () => { start(); },
+    stop: async () => {
+      stopping = true;
+      if (child) { try { child.kill('SIGTERM'); } catch {} child = null; }
+    },
+  });
+}
+
+// Skip backlog replays from sidecar reconnects: only push events
+// that arrived recently. Otherwise a 1-hour disconnect would dump
+// dozens of stale messages and hit per-app IM rate limits.
+const NOTIFY_FRESHNESS_WINDOW_MS = 90_000;
+
+async function dispatchToAllChannels(api, text, meta) {
+  const createdAt = String(meta?.created_at || '').trim();
+  if (createdAt) {
+    const ts = Date.parse(createdAt);
+    if (Number.isFinite(ts) && Date.now() - ts > NOTIFY_FRESHNESS_WINDOW_MS) {
+      api.logger?.info?.(`[sandpile] skipping stale event (created_at=${createdAt})`);
+      return;
+    }
+  }
+  const channels = api.config?.channels || {};
+  const tasks = [];
+  if (channels.feishu?.enabled) tasks.push(sendViaFeishu(api, channels.feishu, text));
+  if (channels.wecom?.enabled) tasks.push(sendViaWecom(api, channels.wecom, text));
+  if (channels.telegram?.enabled) tasks.push(sendViaTelegram(api, channels.telegram, text));
+  if (channels.discord?.enabled) tasks.push(sendViaDiscord(api, channels.discord, text));
+  if (channels.slack?.enabled) tasks.push(sendViaSlack(api, channels.slack, text));
+  if (tasks.length === 0) {
+    api.logger?.warn?.('[sandpile] no enabled chat channel found — message dropped');
+    return;
+  }
+  await Promise.allSettled(tasks);
+}
+
+// ----- Feishu -----
+const _feishuTokenCache = new Map();
+async function _feishuToken(appId, appSecret) {
+  const cached = _feishuTokenCache.get(appId);
+  if (cached && cached.expireAt > Date.now() + 60_000) return cached.token;
+  const resp = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+  });
+  const data = await resp.json();
+  if (data?.tenant_access_token) {
+    _feishuTokenCache.set(appId, { token: data.tenant_access_token, expireAt: Date.now() + (data.expire || 7000) * 1000 });
+    return data.tenant_access_token;
+  }
+  return null;
+}
+
+async function sendViaFeishu(api, cfg, text) {
+  const appId = cfg?.appId; const appSecret = cfg?.appSecret;
+  const recipients = Array.isArray(cfg?.allowFrom) ? cfg.allowFrom.filter((x) => typeof x === 'string' && x.startsWith('ou_')) : [];
+  if (!appId || !appSecret || recipients.length === 0) return;
+  const token = await _feishuToken(appId, appSecret);
+  if (!token) { api.logger?.warn?.('[sandpile] feishu token exchange failed'); return; }
+  for (const openId of recipients) {
+    try {
+      const r = await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ receive_id: openId, msg_type: 'text', content: JSON.stringify({ text }) }),
+      });
+      if (!r.ok) api.logger?.warn?.(`[sandpile] feishu send ${r.status}: ${(await r.text()).slice(0, 120)}`);
+    } catch (err) {
+      api.logger?.warn?.(`[sandpile] feishu send error: ${err?.message || err}`);
+    }
+  }
+}
+
+// ----- WeCom (企业微信) -----
+async function sendViaWecom(api, cfg, text) {
+  // Easiest path: in-house webhook URL (custom group bot). If a richer
+  // chatbot integration is configured we skip — needs a dedicated push
+  // path which we'll add if/when a user reports it.
+  const webhook = cfg?.webhookUrl || cfg?.bot?.webhookUrl;
+  if (!webhook) return;
+  try {
+    await fetch(webhook, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ msgtype: 'text', text: { content: text } }),
+    });
+  } catch (err) {
+    api.logger?.warn?.(`[sandpile] wecom send error: ${err?.message || err}`);
+  }
+}
+
+// ----- Telegram -----
+async function sendViaTelegram(api, cfg, text) {
+  const sendFn = api.runtime?.channel?.telegram?.sendMessageTelegram;
+  const recipients = Array.isArray(cfg?.allowFrom) ? cfg.allowFrom : [];
+  if (typeof sendFn !== 'function' || recipients.length === 0) return;
+  for (const chatId of recipients) {
+    try { await sendFn({ cfg: api.config, accountId: 'default', chatId: String(chatId), text }); }
+    catch (err) { api.logger?.warn?.(`[sandpile] telegram send error: ${err?.message || err}`); }
+  }
+}
+
+// ----- Discord -----
+async function sendViaDiscord(api, cfg, text) {
+  const sendFn = api.runtime?.channel?.discord?.sendMessageDiscord;
+  const recipients = Array.isArray(cfg?.allowFrom) ? cfg.allowFrom : [];
+  if (typeof sendFn !== 'function' || recipients.length === 0) return;
+  for (const chId of recipients) {
+    try { await sendFn({ cfg: api.config, accountId: 'default', channelId: String(chId), text }); }
+    catch (err) { api.logger?.warn?.(`[sandpile] discord send error: ${err?.message || err}`); }
+  }
+}
+
+// ----- Slack -----
+async function sendViaSlack(api, cfg, text) {
+  const sendFn = api.runtime?.channel?.slack?.sendMessageSlack;
+  const recipients = Array.isArray(cfg?.allowFrom) ? cfg.allowFrom : [];
+  if (typeof sendFn !== 'function' || recipients.length === 0) return;
+  for (const chId of recipients) {
+    try { await sendFn({ cfg: api.config, accountId: 'default', channelId: String(chId), text }); }
+    catch (err) { api.logger?.warn?.(`[sandpile] slack send error: ${err?.message || err}`); }
+  }
+}
+
 
 export default plugin;

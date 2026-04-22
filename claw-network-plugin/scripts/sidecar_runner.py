@@ -11,6 +11,22 @@ from pathlib import Path
 import websockets
 from agent.client import ClawNetworkClient
 
+
+def _notify(kind: str, text: str, **meta) -> None:
+    """Emit a machine-readable notification line.
+
+    The Node-side plugin service tails this process's stdout and forwards
+    these lines into OpenClaw via enqueueSystemEvent + requestHeartbeatNow,
+    so the user's chat channel (Feishu/Discord/Telegram) receives a proactive
+    message. Kept separate from the human-readable 【...】 prints which exist
+    for terminal-watching debugging.
+    """
+    try:
+        payload = {"kind": kind, "text": text, **meta}
+        print(f"[NOTIFY] {json.dumps(payload, ensure_ascii=False)}", flush=True)
+    except Exception:
+        pass
+
 DEFAULT_ROUNDTABLE_MAX_TURNS = 20
 DEFAULT_ROUNDTABLE_MAX_DURATION_SECONDS = 300
 DEFAULT_ROUNDTABLE_IDLE_TIMEOUT_SECONDS = 120
@@ -519,6 +535,7 @@ async def _handle_event(
         content = str(event.get("content") or "").strip()
         suffix = f" ({from_claw})" if from_claw and from_claw != from_name else ""
         print(f"【新消息】来自 {from_name}{suffix}：{content}", flush=True)
+        _notify("text", f"{from_name}：{content}", from_name=from_name, from_claw=from_claw, content=content, created_at=str(event.get("created_at") or ""))
     if event_name == "message_accepted" and isinstance(event, dict):
         pass  # outgoing ack, skip
     if event_name == "friend_request" and isinstance(event, dict):
@@ -526,6 +543,7 @@ async def _handle_event(
         request_id = str(event.get("id") or "").strip()
         content = str(event.get("content") or "").strip()
         print(f"【好友申请】{content}", flush=True)
+        _notify("friend_request", f"收到好友申请：{content}", from_claw=from_claw_id, request_id=request_id, created_at=str(event.get("created_at") or ""))
         if from_claw_id or request_id:
             print(
                 f"可处理方式：先查看待处理好友申请，再接受或拒绝。来源={from_claw_id or '未知'} 请求ID={request_id or '未知'}",
@@ -552,6 +570,11 @@ async def _handle_event(
             f"  处理:'沙堆 批准意向 {intent_id}' 或 '沙堆 拒绝意向 {intent_id}'",
             flush=True,
         )
+        _notify(
+            "bp_intent",
+            f"{investor}{org_suffix} 对你的 BP「{proj}」表达了兴趣{note_line}",
+            investor=investor, project=proj, intent_id=intent_id, personal_note=note, created_at=str(event.get("created_at") or ""),
+        )
     if event_name == "bp_intent_reviewed" and isinstance(event, dict):
         proj = str(event.get("project_name") or "").strip()
         status = str(event.get("status") or "").strip()
@@ -562,8 +585,14 @@ async def _handle_event(
                 f"  下一步:'沙堆 看项目 {event.get('listing_id', '')}' 查看完整 BP",
                 flush=True,
             )
+            _notify(
+                "bp_intent_accepted",
+                f"创始人接受了你对 BP「{proj}」的意向，可以查看完整 BP 并进一步沟通。",
+                project=proj, intent_id=intent_id, listing_id=str(event.get("listing_id") or ""), created_at=str(event.get("created_at") or ""),
+            )
         elif status == "rejected":
             print(f"【BP 意向被拒】「{proj}」创始人未接受你的意向。", flush=True)
+            _notify("bp_intent_rejected", f"「{proj}」创始人未接受你的意向。", project=proj, intent_id=intent_id, created_at=str(event.get("created_at") or ""))
     if event_name == "bp_meeting_interest" and isinstance(event, dict):
         from_side = str(event.get("from_side") or "").strip()
         intent_id = str(event.get("intent_id") or "").strip()
@@ -574,6 +603,11 @@ async def _handle_event(
                 f"【BP 约见请求】{who}想和你见面聊。\n"
                 f"  同意则输入:'沙堆 约见 {intent_id}'",
                 flush=True,
+            )
+            _notify(
+                "bp_meeting_interest",
+                f"{who}想和你见面聊。回复『沙堆 约见 {intent_id}』同意。",
+                who=who, intent_id=intent_id, created_at=str(event.get("created_at") or ""),
             )
     if event_name == "bp_meeting_unlocked" and isinstance(event, dict):
         name = str(event.get("peer_name") or "").strip()
@@ -593,6 +627,11 @@ async def _handle_event(
             lines.append(f"  其他:{other}")
         lines.append("  接下来直接联系对方,约时间见面。")
         print("\n".join(lines), flush=True)
+        _notify(
+            "bp_meeting_unlocked",
+            "\n".join(lines[:-1]) + "\n接下来直接联系对方。",
+            peer_name=name, peer_org=org, contact=contact, contact_type=type_label,
+        )
 
     if not bridge_enabled or not isinstance(event, dict):
         return
