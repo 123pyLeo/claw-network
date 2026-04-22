@@ -2255,50 +2255,62 @@ const plugin = {
     api.registerTool({
       name: 'upgrade_self',
       label: 'Upgrade Claw Network',
-      description: 'Pull the latest claw-network from GitHub and re-install the plugin locally. Requires git + bash. After upgrade, restart OpenClaw to load the new plugin code.',
+      description: 'Pull the latest claw-network from GitHub and re-install the plugin locally. Returns immediately ("fire-and-forget") because the actual git+install can take 1-3 minutes; the user must restart OpenClaw afterwards. Tell the user to wait at least 2 minutes before restarting.',
       parameters: {
         type: 'object',
         additionalProperties: false,
         properties: {}
       },
       async execute() {
-        // We shell out to bash, fetching the upgrade-remote script over HTTPS
-        // and piping it into bash. The same one-liner that the broadcast tells
-        // people to copy-paste — but here the chat triggers it for them.
-        return await new Promise((resolve) => {
-          const cp = require('child_process');
-          const cmd = 'curl -fsSL https://sandpile.io/upgrade.sh | bash';
-          const child = cp.spawn('bash', ['-c', cmd], {
-            stdio: ['ignore', 'pipe', 'pipe'],
-            env: process.env,
+        // Fire-and-forget: kick off the upgrade detached, return now.
+        //
+        // Why: the previous implementation awaited the child process to
+        // exit, which meant the LLM tool-call sat blocked for 1-3 minutes
+        // (curl + git fetch + pip/npm install) — and on slow / proxied
+        // / GFW-bottlenecked networks it could hang forever, leaving
+        // the user staring at a "thinking..." spinner.
+        //
+        // Now we spawn detached, log the upgrade output to a file the
+        // user can tail if they care, and return a short "started"
+        // message immediately. Hard timeout (5 min) prevents zombies.
+        const cp = require('child_process');
+        const fs = require('fs');
+        const os = require('os');
+        const logPath = path.join(os.tmpdir(), `claw-network-upgrade-${Date.now()}.log`);
+        // Strip proxy env vars — curl honors them and can hang on dead
+        // proxies common in CN dev setups.
+        const cleanEnv = { ...process.env };
+        for (const v of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) {
+          delete cleanEnv[v];
+        }
+        const wrapped = `set -e; (curl --max-time 60 -fsSL https://sandpile.io/upgrade.sh | bash) >> ${JSON.stringify(logPath)} 2>&1; echo "[done exit=$?]" >> ${JSON.stringify(logPath)}`;
+        try {
+          const child = cp.spawn('bash', ['-c', wrapped], {
+            detached: true,
+            stdio: 'ignore',
+            env: cleanEnv,
           });
-          let stdout = '';
-          let stderr = '';
-          child.stdout.on('data', (d) => { stdout += d.toString(); });
-          child.stderr.on('data', (d) => { stderr += d.toString(); });
-          child.on('error', (err) => {
-            resolve(toolTextResult(
-              `❌ 无法启动升级脚本:${err.message}\n请手动在终端跑:\n  curl -fsSL https://sandpile.io/upgrade.sh | bash`,
-              { success: false }
-            ));
-          });
-          child.on('close', (code) => {
-            const combined = (stdout + (stderr ? '\n' + stderr : '')).trim();
-            // Only show the last ~30 lines to keep the chat readable.
-            const tail = combined.split('\n').slice(-30).join('\n');
-            if (code === 0) {
-              resolve(toolTextResult(
-                `✅ 升级完成。\n\n${tail}\n\n💡 请重启 OpenClaw 让新插件生效。`,
-                { success: true }
-              ));
-            } else {
-              resolve(toolTextResult(
-                `❌ 升级失败 (exit ${code}):\n\n${tail}\n\n如果无法解决,可以在终端手动跑:\n  curl -fsSL https://sandpile.io/upgrade.sh | bash`,
-                { success: false }
-              ));
-            }
-          });
-        });
+          child.unref();
+          // Hard timeout: kill the orphaned process group after 5 min so
+          // we don't leak runaways.
+          setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, 5 * 60 * 1000);
+        } catch (err) {
+          return toolTextResult(
+            `❌ 无法启动升级脚本：${err.message}\n请手动在终端跑：\n  curl -fsSL https://sandpile.io/upgrade.sh | bash`,
+            { success: false }
+          );
+        }
+        return toolTextResult(
+          `🔄 升级已启动（后台运行）。\n\n` +
+          `预计 1-3 分钟完成（取决于网络速度）。\n` +
+          `日志：${logPath}\n\n` +
+          `💡 等约 2 分钟后请重启 OpenClaw 让新插件生效：\n` +
+          `   1) 命令行：openclaw gateway restart\n` +
+          `   2) 或：systemctl --user restart openclaw-gateway（systemd 用户）\n\n` +
+          `如果 5 分钟后还没生效，去看日志或在终端手动跑：\n` +
+          `  curl -fsSL https://sandpile.io/upgrade.sh | bash`,
+          { success: true, log_path: logPath }
+        );
       }
     });
 
