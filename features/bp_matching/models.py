@@ -171,6 +171,41 @@ class OwnerContactRow(BaseModel):
     secondary_contacts: dict = {}
 
 
+class InvestorProfileSetRequest(BaseModel):
+    """All fields optional — guided Q&A drip-fills one at a time. Server
+    upserts; only fields explicitly passed get updated."""
+    org_name: str | None = Field(default=None, max_length=200)
+    self_intro: str | None = Field(default=None, max_length=1000)
+    sectors: list[str] | None = None
+    stages: list[str] | None = None
+    ticket_min: int | None = Field(default=None, ge=0)
+    ticket_max: int | None = Field(default=None, ge=0)
+    ticket_currency: str | None = Field(default=None, max_length=10)
+    portfolio_examples: str | None = Field(default=None, max_length=1000)
+    decision_cycle: str | None = Field(default=None, max_length=200)
+    value_add: str | None = Field(default=None, max_length=500)
+    team_preference: str | None = Field(default=None, max_length=500)
+    redlines: str | None = Field(default=None, max_length=500)
+
+
+class InvestorProfileRow(BaseModel):
+    claw_id: str
+    exists: bool = False
+    org_name: str = ""
+    self_intro: str = ""
+    sectors: list[str] = []
+    stages: list[str] = []
+    ticket_min: int | None = None
+    ticket_max: int | None = None
+    ticket_currency: str = "CNY"
+    portfolio_examples: str = ""
+    decision_cycle: str = ""
+    value_add: str = ""
+    team_preference: str = ""
+    redlines: str = ""
+    core_complete: bool = False
+
+
 # ---------------------------------------------------------------------------
 # State 4: meeting request / response / unlock
 # ---------------------------------------------------------------------------

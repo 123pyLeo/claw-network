@@ -22,6 +22,8 @@ from .models import (
     RoleApplicationReviewRequest,
     OwnerContactSetRequest,
     OwnerContactRow,
+    InvestorProfileSetRequest,
+    InvestorProfileRow,
     MeetingRequestResponse,
     MeetingUnlockedPayload,
 )
@@ -165,6 +167,49 @@ async def update_listing(listing_id: str, payload: BPListingUpdateRequest, reque
     return BPListingRow(**result)
 
 
+@router.post("/a2a/sessions/{session_id}/vote")
+async def a2a_vote_route(session_id: str, payload: dict, request: Request, claw_id: str) -> dict:
+    """A plugin sidecar reports its 'should we end this conversation?' vote.
+
+    Body: {"want_end": bool, "reason"?: str}. Auth: lobster's auth_token
+    matching `claw_id` query param.
+
+    Returns the resulting state-machine decision so the caller knows what
+    happened (waiting for other vote / resumed / concluded).
+    """
+    _check_rate_limit(request)
+    normalized = claw_id.strip().upper()
+    _require_http_auth(request, normalized)
+    want_end = bool(payload.get("want_end"))
+    try:
+        from . import a2a_engine, a2a_dispatch
+        result = a2a_engine.record_vote(session_id, normalized, want_end)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    # Push the resulting WS signal (next speaker / concluded / etc.).
+    try:
+        await a2a_dispatch.dispatch(result, session_id)
+    except Exception:
+        pass  # best-effort
+    return result
+
+
+@router.get("/my-status")
+def my_bp_status_route(request: Request, claw_id: str) -> dict:
+    """Return the caller's BP-matching status (role, verification, phone).
+
+    Exists so the plugin/agent can ground answers like "am I a verified
+    investor?" in real DB state instead of LLM hallucination.
+    """
+    _check_rate_limit(request)
+    normalized = claw_id.strip().upper()
+    _require_http_auth(request, normalized)
+    try:
+        return bp_store.get_my_bp_status(normalized)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+
+
 @router.get("/my-intents", response_model=list[BPIntentRow])
 def my_intents_route(request: Request, claw_id: str) -> list[BPIntentRow]:
     """Investor pipeline view: all intents I've created, newest first.
@@ -258,6 +303,29 @@ async def review_intent(intent_id: str, payload: BPIntentReviewRequest, request:
         "event": "bp_intent_reviewed",
         "payload": result,
     })
+
+    # If the engine started an A2A session (both lobsters opted into auto),
+    # push the kickoff "your_turn" signal to the investor.
+    if payload.decision == "accepted":
+        import logging
+        _alog = logging.getLogger("a2a_kickoff")
+        try:
+            from . import a2a_dispatch
+            from server.store import get_conn
+            with get_conn() as conn:
+                row = conn.execute(
+                    "SELECT id FROM bp_a2a_sessions WHERE intent_id = ? AND status = 'running'",
+                    (intent_id,),
+                ).fetchone()
+            _alog.warning(f"[a2a_kickoff] intent={intent_id[:8]} session_row={'yes' if row else 'no'}")
+            if row:
+                await a2a_dispatch.dispatch(
+                    {"kind": "speak", "speaker_claw_id": result["investor_claw_id"]},
+                    row["id"],
+                )
+                _alog.warning(f"[a2a_kickoff] dispatched speak to investor={result['investor_claw_id']}")
+        except Exception as exc:
+            _alog.warning(f"[a2a_kickoff] FAILED: {exc!r}")
 
     # The queue shifted: nudge every still-pending investor on this same
     # listing with their new position so the wait isn't opaque.
@@ -518,6 +586,61 @@ async def get_my_contact_route(
         return OwnerContactRow(primary_contact=None, primary_contact_type=None, secondary_contacts={})
     result = bp_store.get_owner_contact(owner_id)
     return OwnerContactRow(**result)
+
+
+# ---------------------------------------------------------------------------
+# Investor preference card
+# ---------------------------------------------------------------------------
+
+@router.put("/my-investor-profile", response_model=InvestorProfileRow)
+async def set_my_investor_profile_route(
+    payload: InvestorProfileSetRequest,
+    request: Request,
+    claw_id: str,
+) -> InvestorProfileRow:
+    """Drip-fill the caller's investor profile. Only fields explicitly
+    passed get updated, so the guided Q&A can submit one field at a time."""
+    _check_rate_limit(request)
+    normalized = claw_id.strip().upper()
+    lobster = _require_http_auth(request, normalized)
+    await _require_signature_if_keyed(request, lobster)
+    if (lobster.get("role") or "") not in ("investor", "both"):
+        raise HTTPException(status_code=403, detail="只有投资人角色才能填写投资偏好卡。")
+    fields = payload.model_dump(exclude_unset=True)
+    try:
+        result = bp_store.set_investor_profile(normalized, **fields)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return InvestorProfileRow(**result)
+
+
+@router.get("/my-investor-profile", response_model=InvestorProfileRow)
+async def get_my_investor_profile_route(
+    request: Request,
+    claw_id: str,
+) -> InvestorProfileRow:
+    _check_rate_limit(request)
+    normalized = claw_id.strip().upper()
+    lobster = _require_http_auth(request, normalized)
+    await _require_signature_if_keyed(request, lobster)
+    result = bp_store.get_investor_profile(normalized)
+    return InvestorProfileRow(**result)
+
+
+@router.get("/investor-profile/{claw_id}", response_model=InvestorProfileRow)
+async def get_investor_profile_for_founder_route(
+    claw_id: str,
+    request: Request,
+    viewer_claw_id: str,
+) -> InvestorProfileRow:
+    """Founder-side lookup: when a founder receives an intent, their agent
+    can fetch the investor's preference card to show in the IM card."""
+    _check_rate_limit(request)
+    viewer_normalized = viewer_claw_id.strip().upper()
+    lobster = _require_http_auth(request, viewer_normalized)
+    await _require_signature_if_keyed(request, lobster)
+    result = bp_store.get_investor_profile(claw_id.strip().upper())
+    return InvestorProfileRow(**result)
 
 
 # ---------------------------------------------------------------------------

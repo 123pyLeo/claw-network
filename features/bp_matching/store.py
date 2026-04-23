@@ -154,6 +154,33 @@ def ensure_bp_tables() -> None:
         if "secondary_contacts" not in owner_cols:
             conn.execute("ALTER TABLE owners ADD COLUMN secondary_contacts TEXT")
 
+        # ---- investor preference cards ----
+        # Filled via guided Q&A right after Phase-1 auth passes. Drives
+        # local listing pre-filter (sidecar) and is shown to founders when
+        # they receive an intent ("is this investor a real fit?").
+        # JSON-encoded array fields stored as TEXT; Python side normalizes.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS investor_profiles (
+                claw_id              TEXT PRIMARY KEY,
+                org_name             TEXT NOT NULL DEFAULT '',
+                self_intro           TEXT NOT NULL DEFAULT '',
+                sectors              TEXT NOT NULL DEFAULT '[]',
+                stages               TEXT NOT NULL DEFAULT '[]',
+                ticket_min           INTEGER,
+                ticket_max           INTEGER,
+                ticket_currency      TEXT NOT NULL DEFAULT 'CNY',
+                portfolio_examples   TEXT NOT NULL DEFAULT '',
+                decision_cycle       TEXT NOT NULL DEFAULT '',
+                value_add            TEXT NOT NULL DEFAULT '',
+                team_preference      TEXT NOT NULL DEFAULT '',
+                redlines             TEXT NOT NULL DEFAULT '',
+                created_at           TEXT NOT NULL,
+                updated_at           TEXT NOT NULL
+            )
+            """
+        )
+
         # a2a_events: observability-only log of agent-to-agent BP interactions.
         # Deliberately separate from invocations (the economic ledger) so
         # statistics queries against money flows don't have to filter these out.
@@ -176,6 +203,55 @@ def ensure_bp_tables() -> None:
             "CREATE INDEX IF NOT EXISTS idx_a2a_events_source "
             "ON a2a_events(source_type, source_id)"
         )
+
+        # ---- A2A autonomous matchmaking sessions ----
+        # A row per accepted bp_intent that's eligible for AI-driven first-
+        # contact dialogue. Server orchestrates state; LLM calls happen in
+        # each user's plugin (their LLM credentials, their privacy).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bp_a2a_sessions (
+                id                  TEXT PRIMARY KEY,
+                intent_id           TEXT NOT NULL UNIQUE,
+                listing_id          TEXT NOT NULL,
+                investor_claw_id    TEXT NOT NULL,
+                founder_claw_id     TEXT NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                turn_count          INTEGER NOT NULL DEFAULT 0,
+                next_speaker        TEXT,
+                investor_want_end   INTEGER,
+                founder_want_end    INTEGER,
+                summary             TEXT DEFAULT '',
+                last_turn_at        TEXT,
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL,
+                concluded_at        TEXT
+            )
+            """
+        )
+        # status: pending | running | awaiting_vote | concluded_match
+        #         | concluded_pass | stalled | failed
+        # next_speaker: 'investor' | 'founder' (whose LLM should generate next msg)
+        # *_want_end: NULL = haven't voted yet, 1 = wants to end, 0 = wants to continue
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bp_a2a_sessions_status "
+            "ON bp_a2a_sessions(status, last_turn_at)"
+        )
+
+        # Per-lobster A2A mode preference. Default 'manual' = AI drafts a
+        # reply, human approves in IM before send. 'auto' = AI runs the
+        # whole conversation autonomously. 'off' = no A2A at all (human
+        # handles every inbound message themselves).
+        lob_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lobsters)").fetchall()}
+        if "bp_a2a_mode" not in lob_cols:
+            conn.execute("ALTER TABLE lobsters ADD COLUMN bp_a2a_mode TEXT NOT NULL DEFAULT 'manual'")
+
+        # retry_count: number of times the current turn has been re-pushed
+        # by the driver. Resets when the turn actually advances. Caps at
+        # RETRY_LIMIT, after which session is marked stalled.
+        a2a_cols = {row["name"] for row in conn.execute("PRAGMA table_info(bp_a2a_sessions)").fetchall()}
+        if "retry_count" not in a2a_cols:
+            conn.execute("ALTER TABLE bp_a2a_sessions ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
 
 
 # ---------------------------------------------------------------------------
@@ -227,9 +303,55 @@ _INTENT_SELECT = """
 """
 
 
+def _has_verified_phone(lobster) -> bool:
+    """True if the lobster itself has a verified phone, OR its owner does.
+
+    Old sidecar flow verified phone per-lobster; new flow (sandpile.io
+    console) verifies per-owner. We accept either.
+    """
+    if lobster["verified_phone"]:
+        return True
+    owner_id = str(lobster["owner_id"] or "")
+    if not owner_id:
+        return False
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT auth_phone FROM owners WHERE id = ?", (owner_id,)
+        ).fetchone()
+    return bool(row and row["auth_phone"])
+
+
+def get_my_bp_status(claw_id: str) -> dict:
+    """Return the caller's BP-matching status: role, verification, phone.
+
+    Used by the `bp_my_status` tool so the LLM can ground answers in DB
+    truth instead of hallucinating from stale conversation context.
+    """
+    lobster = get_lobster_by_claw_id(claw_id)
+    if lobster is None:
+        raise ValueError("Lobster not found.")
+    role = str(lobster["role"] or "").strip() or None
+    role_verified = bool(lobster["role_verified"])
+    phone_verified = _has_verified_phone(lobster)
+    method = None
+    try:
+        method = str(lobster["role_verification_method"] or "").strip() or None
+    except (KeyError, IndexError):
+        pass
+    return {
+        "claw_id": claw_id.strip().upper(),
+        "role": role,
+        "role_verified": role_verified,
+        "role_verification_method": method,
+        "phone_verified": phone_verified,
+        "can_publish_bp": phone_verified and role in ("founder", "both"),
+        "can_view_bp_detail": phone_verified and role in ("investor", "both") and role_verified,
+    }
+
+
 def _require_founder(lobster) -> None:
     """Check that lobster is a verified founder (or has phone verification)."""
-    if not lobster["verified_phone"]:
+    if not _has_verified_phone(lobster):
         raise ValueError("请先完成手机验证。")
     role = str(lobster["role"] or "").strip()
     if role not in ("founder", "both"):
@@ -238,7 +360,7 @@ def _require_founder(lobster) -> None:
 
 def _require_verified_investor(lobster) -> None:
     """Check that lobster is a verified investor."""
-    if not lobster["verified_phone"]:
+    if not _has_verified_phone(lobster):
         raise ValueError("请先完成手机验证。")
     role = str(lobster["role"] or "").strip()
     if role not in ("investor", "both"):
@@ -381,8 +503,28 @@ def search_listings(
     return [dict(row) for row in rows]
 
 
+def _resolve_listing_id(listing_id: str) -> str:
+    """Same prefix-resolution trick as _resolve_intent_id, for listing IDs."""
+    raw = (listing_id or "").strip()
+    if not raw:
+        raise ValueError("BP 不存在。")
+    if len(raw) >= 36:
+        return raw
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id FROM bp_listings WHERE id LIKE ? LIMIT 2",
+            (raw + "%",),
+        ).fetchall()
+    if not rows:
+        raise ValueError("BP 不存在。")
+    if len(rows) > 1:
+        raise ValueError("ID 前缀匹配到多条，请提供更完整的 ID。")
+    return str(rows[0]["id"])
+
+
 def get_listing(listing_id: str) -> dict:
     """Get a single BP listing."""
+    listing_id = _resolve_listing_id(listing_id)
     with get_conn() as conn:
         row = conn.execute(f"{_LISTING_SELECT} WHERE bl.id = ?", (listing_id,)).fetchone()
     if row is None:
@@ -595,9 +737,33 @@ def list_intents(listing_id: str, claw_id: str) -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
             f"{_INTENT_SELECT} WHERE bi.listing_id = ? ORDER BY bi.created_at ASC",
-            (listing_id,),
+            (listing["id"],),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _resolve_intent_id(intent_id: str) -> str:
+    """Accept either a full UUID or an 8+ char hex prefix. Returns full id.
+
+    The CLI output shows 8-char prefixes (e.g. `ce166999`) for readability,
+    so founders naturally copy the prefix back when approving. Do prefix
+    resolution here so every review/meeting call works.
+    """
+    raw = (intent_id or "").strip()
+    if not raw:
+        raise ValueError("兴趣记录不存在。")
+    if len(raw) >= 36:
+        return raw
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id FROM bp_intents WHERE id LIKE ? LIMIT 2",
+            (raw + "%",),
+        ).fetchall()
+    if not rows:
+        raise ValueError("兴趣记录不存在。")
+    if len(rows) > 1:
+        raise ValueError("ID 前缀匹配到多条，请提供更完整的 ID。")
+    return str(rows[0]["id"])
 
 
 def review_intent(intent_id: str, claw_id: str, decision: str, review_note: str = "") -> dict:
@@ -612,6 +778,7 @@ def review_intent(intent_id: str, claw_id: str, decision: str, review_note: str 
     if lobster is None:
         raise ValueError("Lobster not found.")
 
+    intent_id = _resolve_intent_id(intent_id)
     now = utc_now()
     investor_claw_id = None
 
@@ -640,6 +807,14 @@ def review_intent(intent_id: str, claw_id: str, decision: str, review_note: str 
         investor = get_lobster_by_claw_id(investor_claw_id)
         if investor:
             ensure_friendship(str(lobster["id"]), str(investor["id"]))
+        # Try to start an A2A session if both sides opted into auto mode.
+        # The actual WS push to kick off turn 1 is done by the route layer
+        # (which has access to the async dispatcher).
+        try:
+            from . import a2a_engine
+            a2a_engine.start_session(intent_id)
+        except Exception:
+            pass  # best-effort; A2A is opt-in, never block accept on its failure
 
     # Log the review as an a2a_events observability record (both accept and reject).
     investor_row = get_lobster_by_claw_id(investor_claw_id)
@@ -959,6 +1134,130 @@ def get_owner_contact(owner_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Investor preference cards
+# ---------------------------------------------------------------------------
+
+INVESTOR_PROFILE_CORE_FIELDS = ("org_name", "self_intro", "sectors", "stages", "ticket_min")
+
+
+def _normalize_str_list(value) -> list[str]:
+    """Accept list / comma-separated str / None — always return clean list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        # split on common separators
+        parts = []
+        for chunk in value.replace("，", ",").replace("、", ",").replace(";", ",").replace("/", ",").split(","):
+            chunk = chunk.strip()
+            if chunk:
+                parts.append(chunk)
+        return parts
+    return []
+
+
+def set_investor_profile(claw_id: str, **fields) -> dict:
+    """Upsert an investor profile. Only fields explicitly passed are updated;
+    omitted ones keep their prior value (so the guided Q&A can drip-fill).
+
+    Returns the post-write profile dict.
+    """
+    import json as _json
+    normalized_id = str(claw_id).strip().upper()
+    if not normalized_id:
+        raise ValueError("claw_id is required")
+
+    sectors = fields.get("sectors")
+    stages = fields.get("stages")
+    if sectors is not None:
+        fields["sectors"] = _json.dumps(_normalize_str_list(sectors), ensure_ascii=False)
+    if stages is not None:
+        fields["stages"] = _json.dumps(_normalize_str_list(stages), ensure_ascii=False)
+
+    ticket_min = fields.get("ticket_min")
+    ticket_max = fields.get("ticket_max")
+    if ticket_min is not None:
+        try:
+            fields["ticket_min"] = int(ticket_min)
+        except (TypeError, ValueError):
+            raise ValueError("ticket_min 必须是数字")
+    if ticket_max is not None:
+        try:
+            fields["ticket_max"] = int(ticket_max)
+        except (TypeError, ValueError):
+            raise ValueError("ticket_max 必须是数字")
+
+    now = utc_now()
+    allowed = {
+        "org_name", "self_intro", "sectors", "stages",
+        "ticket_min", "ticket_max", "ticket_currency",
+        "portfolio_examples", "decision_cycle", "value_add",
+        "team_preference", "redlines",
+    }
+    update_fields = {k: v for k, v in fields.items() if k in allowed and v is not None}
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT claw_id FROM investor_profiles WHERE claw_id = ?",
+            (normalized_id,),
+        ).fetchone()
+        if existing is None:
+            cols = ["claw_id", "created_at", "updated_at"] + list(update_fields.keys())
+            placeholders = ",".join(["?"] * len(cols))
+            values = [normalized_id, now, now] + list(update_fields.values())
+            conn.execute(
+                f"INSERT INTO investor_profiles ({','.join(cols)}) VALUES ({placeholders})",
+                values,
+            )
+        elif update_fields:
+            sets = ", ".join(f"{k} = ?" for k in update_fields)
+            values = list(update_fields.values()) + [now, normalized_id]
+            conn.execute(
+                f"UPDATE investor_profiles SET {sets}, updated_at = ? WHERE claw_id = ?",
+                values,
+            )
+    return get_investor_profile(normalized_id)
+
+
+def get_investor_profile(claw_id: str) -> dict:
+    """Read profile. Returns dict with empty defaults if no row exists."""
+    import json as _json
+    normalized_id = str(claw_id).strip().upper()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM investor_profiles WHERE claw_id = ?",
+            (normalized_id,),
+        ).fetchone()
+    if row is None:
+        return {
+            "claw_id": normalized_id,
+            "exists": False,
+            "org_name": "", "self_intro": "",
+            "sectors": [], "stages": [],
+            "ticket_min": None, "ticket_max": None, "ticket_currency": "CNY",
+            "portfolio_examples": "", "decision_cycle": "", "value_add": "",
+            "team_preference": "", "redlines": "",
+            "core_complete": False,
+        }
+    out = dict(row)
+    out["exists"] = True
+    for k in ("sectors", "stages"):
+        try:
+            out[k] = _json.loads(out.get(k) or "[]")
+        except (ValueError, TypeError):
+            out[k] = []
+    out["core_complete"] = (
+        bool(out.get("org_name"))
+        and bool(out.get("self_intro"))
+        and bool(out.get("sectors"))
+        and bool(out.get("stages"))
+        and out.get("ticket_min") is not None
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # State 4: meeting request / response / contact unlock
 # ---------------------------------------------------------------------------
 
@@ -982,6 +1281,7 @@ def request_meeting(intent_id: str, side: str) -> dict:
     """
     if side not in ("investor", "founder"):
         raise ValueError("side must be 'investor' or 'founder'.")
+    intent_id = _resolve_intent_id(intent_id)
     now = utc_now()
     col = "investor_meet_at" if side == "investor" else "founder_meet_at"
 

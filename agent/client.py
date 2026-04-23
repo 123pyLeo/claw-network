@@ -1371,6 +1371,43 @@ class ClawNetworkClient:
             f"/bp/intents/{urllib.parse.quote(intent_id)}/request-meeting?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
         )
 
+    def bp_set_my_contact(self, primary_contact: str, primary_contact_type: str,
+                          secondary_contacts: dict | None = None) -> dict:
+        """Set my own contact (used by Phase 2 guided Q&A)."""
+        body = {
+            "primary_contact": primary_contact.strip(),
+            "primary_contact_type": primary_contact_type.strip(),
+        }
+        if secondary_contacts:
+            body["secondary_contacts"] = secondary_contacts
+        return self._request(
+            "PUT",
+            f"/bp/my-contact?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+            body,
+        )
+
+    def bp_get_my_contact(self) -> dict:
+        return self._request(
+            "GET",
+            f"/bp/my-contact?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+        )
+
+    def bp_set_investor_profile(self, **fields) -> dict:
+        """Drip-fill investor profile. Pass only fields you want to update.
+        Server upserts; omitted fields keep their prior value."""
+        body = {k: v for k, v in fields.items() if v is not None}
+        return self._request(
+            "PUT",
+            f"/bp/my-investor-profile?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+            body,
+        )
+
+    def bp_get_my_investor_profile(self) -> dict:
+        return self._request(
+            "GET",
+            f"/bp/my-investor-profile?claw_id={urllib.parse.quote(self._get_my_claw_id())}",
+        )
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Claw Network sidecar client")
@@ -1643,6 +1680,29 @@ def build_parser() -> argparse.ArgumentParser:
     bp_meet_p.add_argument("intent_id")
 
     subparsers.add_parser("bp-my-status")
+
+    set_contact_p = subparsers.add_parser("bp-set-my-contact")
+    set_contact_p.add_argument("--type", required=True, choices=["wechat", "phone"])
+    set_contact_p.add_argument("--value", required=True)
+    set_contact_p.add_argument("--secondary-json", default="")
+
+    subparsers.add_parser("bp-get-my-contact")
+
+    set_prof_p = subparsers.add_parser("bp-set-investor-profile")
+    set_prof_p.add_argument("--org-name", default=None)
+    set_prof_p.add_argument("--self-intro", default=None)
+    set_prof_p.add_argument("--sectors", default=None, help="comma-separated, e.g. 'AI,消费,SaaS'")
+    set_prof_p.add_argument("--stages", default=None, help="comma-separated, e.g. '种子,天使,Pre-A'")
+    set_prof_p.add_argument("--ticket-min", type=int, default=None)
+    set_prof_p.add_argument("--ticket-max", type=int, default=None)
+    set_prof_p.add_argument("--ticket-currency", default=None)
+    set_prof_p.add_argument("--portfolio-examples", default=None)
+    set_prof_p.add_argument("--decision-cycle", default=None)
+    set_prof_p.add_argument("--value-add", default=None)
+    set_prof_p.add_argument("--team-preference", default=None)
+    set_prof_p.add_argument("--redlines", default=None)
+
+    subparsers.add_parser("bp-get-my-investor-profile")
 
     list_inbox_p = subparsers.add_parser("list-inbox")
     list_inbox_p.add_argument("--limit", type=int, default=20)
@@ -1992,6 +2052,38 @@ def main() -> None:
         return
     if args.command == "bp-my-status":
         print(json.dumps(client.bp_my_status(), ensure_ascii=False, indent=2))
+        return
+    if args.command == "bp-set-my-contact":
+        secondary = None
+        if args.secondary_json:
+            try:
+                secondary = json.loads(args.secondary_json)
+            except Exception:
+                secondary = None
+        print(json.dumps(client.bp_set_my_contact(args.value, args.type, secondary), ensure_ascii=False, indent=2))
+        return
+    if args.command == "bp-get-my-contact":
+        print(json.dumps(client.bp_get_my_contact(), ensure_ascii=False, indent=2))
+        return
+    if args.command == "bp-set-investor-profile":
+        kwargs = {
+            "org_name": args.org_name,
+            "self_intro": args.self_intro,
+            "sectors": [s.strip() for s in args.sectors.split(",") if s.strip()] if args.sectors is not None else None,
+            "stages": [s.strip() for s in args.stages.split(",") if s.strip()] if args.stages is not None else None,
+            "ticket_min": args.ticket_min,
+            "ticket_max": args.ticket_max,
+            "ticket_currency": args.ticket_currency,
+            "portfolio_examples": args.portfolio_examples,
+            "decision_cycle": args.decision_cycle,
+            "value_add": args.value_add,
+            "team_preference": args.team_preference,
+            "redlines": args.redlines,
+        }
+        print(json.dumps(client.bp_set_investor_profile(**kwargs), ensure_ascii=False, indent=2))
+        return
+    if args.command == "bp-get-my-investor-profile":
+        print(json.dumps(client.bp_get_my_investor_profile(), ensure_ascii=False, indent=2))
         return
     if args.command == "list-inbox":
         print(json.dumps(client.list_inbox(limit=args.limit), ensure_ascii=False, indent=2))

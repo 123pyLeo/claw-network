@@ -2172,6 +2172,81 @@ const plugin = {
     });
 
     api.registerTool({
+      name: 'bp_extract_from_doc',
+      label: 'Extract BP fields from uploaded document text',
+      description: 'Use when the user uploads or pastes a BP (PDF/PPT/text) and wants to publish it on sandpile. OpenClaw has already extracted the document to plain text — pass that text in. Returns structured BP fields (project_name, one_liner, sector, stage, funding_ask, currency, team_size, problem, solution, team_intro, traction, business_model, ask_note). Show the result to the user for confirmation/edit before calling post_bp_listing.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { text: { type: 'string', description: 'The full plain-text content of the BP document.' } },
+        required: ['text'],
+      },
+      async execute({ text }) {
+        try {
+          const cfg = getPluginConfig(api) ?? {};
+          const pythonBin = cfg.pythonBin || process.env.PYTHON_BIN || 'python3';
+          const script = path.join(__pluginDir, 'scripts', 'bp_extract.py');
+          const cleanEnv = { ...process.env, PAGER: 'cat' };
+          for (const v of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) {
+            delete cleanEnv[v];
+          }
+          const result = await new Promise((resolve, reject) => {
+            const child = spawn(pythonBin, [script], {
+              stdio: ['pipe', 'pipe', 'pipe'],
+              env: cleanEnv,
+              cwd: path.join(__pluginDir, 'scripts'),
+            });
+            let out = '', err = '';
+            child.stdout.on('data', (c) => { out += c.toString('utf8'); });
+            child.stderr.on('data', (c) => { err += c.toString('utf8'); });
+            child.on('error', reject);
+            child.on('close', (code) => {
+              if (code !== 0 && !out.trim()) {
+                reject(new Error(`bp_extract.py exited ${code}: ${err.slice(0, 300)}`));
+              } else {
+                resolve(out.trim());
+              }
+            });
+            child.stdin.end(String(text || ''), 'utf8');
+          });
+          let parsed;
+          try { parsed = JSON.parse(result); } catch { parsed = { ok: false, error: 'invalid JSON from extractor', raw: result.slice(0, 300) }; }
+          if (!parsed.ok) {
+            return errorResult(new Error(parsed.error || '抽取失败'));
+          }
+          const f = parsed.fields || {};
+          const core = (v) => v && String(v).trim() ? String(v).trim() : '⚠️ 还缺，请补一下';
+          const opt  = (v) => v && String(v).trim() ? String(v).trim() : '—';
+          const moneyRaw = Number(f.funding_ask || 0);
+          const money = moneyRaw > 0 ? `${moneyRaw} ${f.currency || ''}`.trim() : '— (没定也没事)';
+          const teamN = Number(f.team_size || 0);
+          const lines = [
+            `从你的 BP 里抽到的字段（核心 5 个标 ★，其它都是选填）：`,
+            ``,
+            `★ 项目名: ${core(f.project_name)}`,
+            `★ 一句话: ${core(f.one_liner)}`,
+            `★ 问题: ${core(f.problem)}`,
+            `★ 解法: ${core(f.solution)}`,
+            `★ 团队介绍: ${core(f.team_intro)}`,
+            ``,
+            `  赛道: ${opt(f.sector)}  · 阶段: ${opt(f.stage)}`,
+            `  募资额: ${money}`,
+            `  团队规模: ${teamN > 0 ? teamN : '—'}`,
+            `  进展: ${opt(f.traction)}`,
+            `  商业模式: ${opt(f.business_model)}`,
+            `  资金用途/ask: ${opt(f.ask_note)}`,
+            ``,
+            `★ 标的字段如果还缺请补一下；其它选填的有就有、没有也行。`,
+            `确认无误就告诉我"发布"，我直接帮你 post_bp_listing。要改哪个字段直接说。`,
+          ];
+          return toolTextResult(lines.join('\n'), { success: true, result: f });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
       name: 'bp_request_meeting',
       label: 'Request BP Meeting (Unlock Contact)',
       description: 'Signal that this side wants to meet the counterpart. When both sides signal, contact info is exchanged automatically.',
@@ -2244,6 +2319,147 @@ const plugin = {
             `  · 手机：${phoneLabel}`,
             `  · 可发 BP：${result?.can_publish_bp ? '是' : '否'}`,
             `  · 可看 BP 完整详情：${result?.can_view_bp_detail ? '是' : '否'}`,
+          ];
+          return toolTextResult(lines.join('\n'), { success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'bp_set_my_contact',
+      label: 'Set my contact info (sandpile)',
+      description: 'Save the caller\'s primary contact (wechat or phone) to the sandpile platform. Use this when the user gives you their 微信号 or 手机号 during the contact-info onboarding flow. type must be exactly "wechat" or "phone". Optionally pass secondary as a JSON-string of additional contacts (e.g. `{"phone":"139..."}`). Confirm with the user before calling — this is the contact that will be exchanged with their match when an A2A session concludes successfully.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['type', 'value'],
+        properties: {
+          type: { type: 'string', enum: ['wechat', 'phone'] },
+          value: { type: 'string', description: '微信号或手机号本身' },
+          secondary: { type: 'string', description: 'optional JSON string of additional contacts' },
+        },
+      },
+      async execute({ type, value, secondary }) {
+        try {
+          await runClient(api, ['register']);
+          const args = ['bp-set-my-contact', '--type', type, '--value', String(value).trim()];
+          if (secondary) args.push('--secondary-json', secondary);
+          await runClient(api, args);
+          return toolTextResult(`✅ 已保存：${type === 'wechat' ? '微信' : '手机'} ${value}。\n\n撮合成功后，对方会拿到这个联系方式来加你。要改的话直接告诉我。`, { success: true });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'bp_get_my_contact',
+      label: 'Check my saved contact info',
+      description: 'Return the caller\'s currently-saved contact info on sandpile. Call this when the user asks whether they\'ve filled in their contact, or before triggering BP publishing/intent flows that require it.',
+      parameters: { type: 'object', additionalProperties: false, properties: {} },
+      async execute() {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['bp-get-my-contact']);
+          if (!result?.primary_contact) {
+            return toolTextResult(`联系方式还没填。撮合成功时对方就拿不到你的联系方式——建议尽早填一下，告诉我"我的微信是 xxx"或"我的手机是 xxx"即可。`, { success: true, result });
+          }
+          const t = result.primary_contact_type === 'wechat' ? '微信' : '手机';
+          return toolTextResult(`已填：${t} ${result.primary_contact}`, { success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'bp_set_investor_profile',
+      label: 'Set investor preference card (sandpile)',
+      description: `Drip-fill the caller's investor profile card. Only investor-role lobsters can use this. Call once per field the user just told you — pass ONLY the fields that are new/changed, omit the rest (server upserts). The 5 core fields (org_name, self_intro, sectors, stages, ticket_min) MUST be filled before the user can express intent. Use this during the post-auth guided Q&A. Examples: user says "我是 SequoiaCN" → call with {org_name:"SequoiaCN"}. User says "我看 AI 和消费" → call with {sectors:["AI","消费"]}. User says "ticket 100 到 500 万" → call with {ticket_min:1000000, ticket_max:5000000, ticket_currency:"CNY"}. Note: ticket_min/max are integers in the smallest unit (元 not 万元) — convert "100 万" → 1000000.`,
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          org_name: { type: 'string', description: '机构名（个人天使可填"个人天使"）' },
+          self_intro: { type: 'string', description: '一句话自我介绍' },
+          sectors: { type: 'array', items: { type: 'string' }, description: '关注赛道，如 ["AI","消费","SaaS"]' },
+          stages: { type: 'array', items: { type: 'string' }, description: '关注阶段，如 ["种子","天使","Pre-A"]' },
+          ticket_min: { type: 'integer', description: 'ticket 范围下限（单位：元；100 万 → 1000000）' },
+          ticket_max: { type: 'integer', description: 'ticket 范围上限（单位：元）' },
+          ticket_currency: { type: 'string', description: '币种，默认 CNY' },
+          portfolio_examples: { type: 'string', description: '（选填）投过的代表项目' },
+          decision_cycle: { type: 'string', description: '（选填）决策周期' },
+          value_add: { type: 'string', description: '（选填）投后能提供啥' },
+          team_preference: { type: 'string', description: '（选填）团队偏好' },
+          redlines: { type: 'string', description: '（选填）红线，比如"不投硬件"' },
+        },
+      },
+      async execute(params = {}) {
+        try {
+          await runClient(api, ['register']);
+          const args = ['bp-set-investor-profile'];
+          if (params.org_name !== undefined) args.push('--org-name', String(params.org_name));
+          if (params.self_intro !== undefined) args.push('--self-intro', String(params.self_intro));
+          if (params.sectors !== undefined) args.push('--sectors', (Array.isArray(params.sectors) ? params.sectors : [params.sectors]).join(','));
+          if (params.stages !== undefined) args.push('--stages', (Array.isArray(params.stages) ? params.stages : [params.stages]).join(','));
+          if (params.ticket_min !== undefined) args.push('--ticket-min', String(params.ticket_min));
+          if (params.ticket_max !== undefined) args.push('--ticket-max', String(params.ticket_max));
+          if (params.ticket_currency !== undefined) args.push('--ticket-currency', String(params.ticket_currency));
+          if (params.portfolio_examples !== undefined) args.push('--portfolio-examples', String(params.portfolio_examples));
+          if (params.decision_cycle !== undefined) args.push('--decision-cycle', String(params.decision_cycle));
+          if (params.value_add !== undefined) args.push('--value-add', String(params.value_add));
+          if (params.team_preference !== undefined) args.push('--team-preference', String(params.team_preference));
+          if (params.redlines !== undefined) args.push('--redlines', String(params.redlines));
+          const result = await runClient(api, args);
+          const remaining = [];
+          if (!result.org_name) remaining.push('机构名');
+          if (!result.self_intro) remaining.push('一句话自我介绍');
+          if (!result.sectors || result.sectors.length === 0) remaining.push('关注赛道');
+          if (!result.stages || result.stages.length === 0) remaining.push('关注阶段');
+          if (result.ticket_min === null || result.ticket_min === undefined) remaining.push('ticket 范围');
+          let msg;
+          if (remaining.length === 0) {
+            msg = `✅ 投资偏好卡已完成核心 5 项！现在可以开始看项目和发意向了。\n\n如果还想补选填字段（投过的项目、决策周期、投后能力、团队偏好、红线），可以随时告诉我。`;
+          } else {
+            msg = `✅ 已记下。还差 ${remaining.length} 项核心字段：${remaining.join('、')}。\n填完才能发意向（创始人收到时会看到这张卡，决定要不要回应你）。`;
+          }
+          return toolTextResult(msg, { success: true, result });
+        } catch (error) {
+          return errorResult(error);
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'bp_get_my_investor_profile',
+      label: 'Read my investor preference card',
+      description: 'Return the caller\'s current investor preference card. Call this BEFORE any "list BPs" or "express intent" flow — you need to know whether the core 5 fields are filled (`core_complete`), and you also use the sectors/stages/ticket range to LOCALLY pre-filter the listing list (sort matching ones to the top). Don\'t guess from earlier conversation, always call this tool fresh.',
+      parameters: { type: 'object', additionalProperties: false, properties: {} },
+      async execute() {
+        try {
+          await runClient(api, ['register']);
+          const result = await runClient(api, ['bp-get-my-investor-profile']);
+          if (!result.exists) {
+            return toolTextResult(`你还没填投资偏好卡。建议先告诉我你的机构、关注赛道、关注阶段、ticket 范围，5 个问题 1-2 分钟搞定。`, { success: true, result });
+          }
+          const lines = [
+            `当前投资偏好卡：`,
+            `  · 机构: ${result.org_name || '（缺）'}`,
+            `  · 一句话: ${result.self_intro || '（缺）'}`,
+            `  · 关注赛道: ${(result.sectors || []).join('、') || '（缺）'}`,
+            `  · 关注阶段: ${(result.stages || []).join('、') || '（缺）'}`,
+            `  · ticket: ${result.ticket_min || '?'} - ${result.ticket_max || '?'} ${result.ticket_currency || ''}`,
+            ``,
+            `选填：`,
+            `  · 投过项目: ${result.portfolio_examples || '—'}`,
+            `  · 决策周期: ${result.decision_cycle || '—'}`,
+            `  · 投后能力: ${result.value_add || '—'}`,
+            `  · 团队偏好: ${result.team_preference || '—'}`,
+            `  · 红线: ${result.redlines || '—'}`,
+            ``,
+            result.core_complete ? `✅ 核心 5 项完整，可以发意向。` : `⚠️ 核心字段不全，发意向前要补完。`,
           ];
           return toolTextResult(lines.join('\n'), { success: true, result });
         } catch (error) {
@@ -3149,7 +3365,9 @@ function registerSandpileNotifier(api) {
     while ((idx = stdoutBuf.indexOf('\n')) >= 0) {
       const line = stdoutBuf.slice(0, idx);
       stdoutBuf = stdoutBuf.slice(idx + 1);
-      handleNotifyLine(line.trim());
+      const trimmed = line.trim();
+      if (trimmed) api.logger?.info?.(`[sandpile sidecar] ${trimmed.slice(0, 240)}`);
+      handleNotifyLine(trimmed);
     }
   }
 
@@ -3166,6 +3384,10 @@ function registerSandpileNotifier(api) {
     if (cfg.clawId && cfg.authToken) {
       args.push('--claw-id', cfg.clawId, '--auth-token', cfg.authToken);
     }
+    // NOTE: removed --bridge-openclaw flag. A2A autonomous matchmaking
+    // is now driven by the sandpile server pushing a2a:your_turn /
+    // a2a:judge / a2a:concluded WS events; the plugin (Node side) reacts
+    // by calling the user's configured LLM directly. See task #14.
     // Strip proxy env vars — Python websockets routes through them and
     // breaks WS upgrade. Same trick start_sidecar.sh uses.
     const cleanEnv = { ...process.env };
@@ -3286,13 +3508,50 @@ async function sendViaWecom(api, cfg, text) {
 }
 
 // ----- Telegram -----
+//
+// Uses Telegram bot REST API directly (no api.runtime.channel.* dance —
+// signatures differ across OpenClaw versions). Recipients come from two
+// places: the inline `allowFrom` in channels.telegram.* config (legacy)
+// and OpenClaw's pairing store at ~/.openclaw/credentials/telegram-allowFrom.json
+// (new pairing-based dmPolicy puts paired chat_ids only there).
+function _telegramRecipients(cfg) {
+  const out = new Set();
+  for (const v of Array.isArray(cfg?.allowFrom) ? cfg.allowFrom : []) {
+    const s = String(v).trim();
+    if (s) out.add(s);
+  }
+  try {
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const credPath = path.join(process.env.OPENCLAW_HOME || path.join(os.homedir(), '.openclaw'), 'credentials', 'telegram-allowFrom.json');
+    if (fs.existsSync(credPath)) {
+      const data = JSON.parse(fs.readFileSync(credPath, 'utf8'));
+      for (const v of Array.isArray(data?.allowFrom) ? data.allowFrom : []) {
+        const s = String(v).trim();
+        if (s) out.add(s);
+      }
+    }
+  } catch {}
+  return Array.from(out);
+}
+
 async function sendViaTelegram(api, cfg, text) {
-  const sendFn = api.runtime?.channel?.telegram?.sendMessageTelegram;
-  const recipients = Array.isArray(cfg?.allowFrom) ? cfg.allowFrom : [];
-  if (typeof sendFn !== 'function' || recipients.length === 0) return;
+  const token = cfg?.botToken || cfg?.token;
+  const recipients = _telegramRecipients(cfg);
+  if (!token || recipients.length === 0) {
+    api.logger?.warn?.(`[sandpile] telegram skipped: token=${token ? 'yes' : 'no'} recipients=${recipients.length}`);
+    return;
+  }
   for (const chatId of recipients) {
-    try { await sendFn({ cfg: api.config, accountId: 'default', chatId: String(chatId), text }); }
-    catch (err) { api.logger?.warn?.(`[sandpile] telegram send error: ${err?.message || err}`); }
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+      });
+      if (!r.ok) api.logger?.warn?.(`[sandpile] telegram send ${r.status}: ${(await r.text()).slice(0, 160)}`);
+    } catch (err) {
+      api.logger?.warn?.(`[sandpile] telegram send error: ${err?.message || err}`);
+    }
   }
 }
 

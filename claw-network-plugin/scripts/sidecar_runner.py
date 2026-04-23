@@ -12,6 +12,27 @@ import websockets
 from agent.client import ClawNetworkClient
 
 
+def _format_lobster_label(name: str, owner: str, role: str = "", org: str = "") -> str:
+    """Render a lobster's identity for IM display.
+    Founder:  '还好虾（健康哥）'
+    Investor: '大厦虾（leo）@ TensorBrain'
+    Other:    '还好虾（健康哥）' or just name if no owner
+    Empty fallback: claw_id passed in as `name`.
+    """
+    name = (name or "").strip()
+    owner = (owner or "").strip()
+    org = (org or "").strip()
+    role = (role or "").strip().lower()
+    if not name:
+        return owner or "未知龙虾"
+    label = name
+    if owner:
+        label = f"{label}（{owner}）"
+    if role == "investor" and org:
+        label = f"{label} @ {org}"
+    return label
+
+
 def _notify(kind: str, text: str, **meta) -> None:
     """Emit a machine-readable notification line.
 
@@ -476,6 +497,7 @@ async def _monitor_joined_roundtables(
         await asyncio.sleep(sleep_seconds)
 
 
+
 async def _handle_event(
     client: ClawNetworkClient,
     payload: dict,
@@ -498,9 +520,12 @@ async def _handle_event(
         print(json.dumps(payload, ensure_ascii=False), flush=True)
         return
 
-    if isinstance(event, dict) and "id" in event and "created_at" in event:
-        client._store_event(event)
-        client._set_sync_cursor(event["created_at"])
+    if isinstance(event, dict) and "id" in event and "created_at" in event and "event_type" in event:
+        try:
+            client._store_event(event)
+            client._set_sync_cursor(event["created_at"])
+        except Exception as exc:
+            print(json.dumps({"event": "store_event_failed", "detail": str(exc)[:200]}, ensure_ascii=False), flush=True)
 
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
@@ -530,12 +555,18 @@ async def _handle_event(
                 poll_seconds=roundtable_poll_seconds,
             )
     if event_name == "text" and isinstance(event, dict):
-        from_name = str(event.get("from_name") or event.get("from_claw_id") or "未知龙虾").strip()
+        from_name = str(event.get("from_name") or "").strip()
+        from_owner = str(event.get("from_owner_name") or "").strip()
+        from_role = str(event.get("from_role") or "").strip()
+        from_org = str(event.get("from_org_name") or "").strip()
         from_claw = str(event.get("from_claw_id") or "").strip()
         content = str(event.get("content") or "").strip()
-        suffix = f" ({from_claw})" if from_claw and from_claw != from_name else ""
-        print(f"【新消息】来自 {from_name}{suffix}：{content}", flush=True)
-        _notify("text", f"{from_name}：{content}", from_name=from_name, from_claw=from_claw, content=content, created_at=str(event.get("created_at") or ""))
+        label = _format_lobster_label(from_name or from_claw, from_owner, from_role, from_org)
+        print(f"【新消息】来自 {label}：{content}", flush=True)
+        _notify("text", f"{label}：{content}",
+                from_name=from_name, from_owner=from_owner, from_role=from_role,
+                from_org=from_org, from_claw=from_claw, content=content,
+                created_at=str(event.get("created_at") or ""))
     if event_name == "message_accepted" and isinstance(event, dict):
         pass  # outgoing ack, skip
     if event_name == "friend_request" and isinstance(event, dict):
@@ -633,38 +664,170 @@ async def _handle_event(
             peer_name=name, peer_org=org, contact=contact, contact_type=type_label,
         )
 
-    if not bridge_enabled or not isinstance(event, dict):
+    # ─────────────────────────────────────────────────────────────────
+    # A2A autonomous matchmaking (server-orchestrated, plugin-LLM)
+    # ─────────────────────────────────────────────────────────────────
+    if event_name == "a2a:your_turn" and isinstance(event, dict):
+        await _handle_a2a_your_turn(client, event)
         return
-    if event_name not in {"message", "text"}:
+    if event_name == "a2a:judge" and isinstance(event, dict):
+        await _handle_a2a_judge(client, event)
         return
-    if not official_claw_id:
+    if event_name == "a2a:concluded" and isinstance(event, dict):
+        await _handle_a2a_concluded(event)
         return
-    if str(event.get("to_claw_id") or "").strip().upper() != official_claw_id:
-        return
-
-    sender = str(event.get("from_claw_id") or "").strip().upper()
-    content = str(event.get("content") or "").strip()
-    if not sender or not content:
-        return
-
-    try:
-        reply = await _run_openclaw_turn(content, openclaw_bin=openclaw_bin, agent_id=openclaw_agent_id)
-    except Exception as exc:  # noqa: BLE001
-        print(
-            json.dumps(
-                {
-                    "event": "bridge_error",
-                    "detail": str(exc),
-                    "source_event_id": event.get("id"),
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
+    if event_name == "a2a:stalled" and isinstance(event, dict):
+        _notify(
+            "a2a_stalled",
+            f"⚠️ A2A 撮合会话挂起：{event.get('reason','5 分钟无活动')}",
+            session_id=str(event.get("session_id") or ""),
+            intent_id=str(event.get("intent_id") or ""),
         )
         return
 
-    result = client.send_lobster_message(sender, reply)
-    print(json.dumps({"event": "bridge_reply_sent", "payload": result["event"]}, ensure_ascii=False), flush=True)
+
+async def _handle_a2a_your_turn(client, event: dict) -> None:
+    """Server says it's our turn — call LLM, send the reply through sandpile."""
+    try:
+        from a2a_prompts import build_speak_prompt
+        from a2a_llm import call_llm
+    except Exception as exc:
+        print(json.dumps({"event": "a2a_error", "stage": "import", "detail": str(exc)}, ensure_ascii=False), flush=True)
+        return
+    sys_p, usr_p = build_speak_prompt(event)
+    peer_claw = str(event.get("peer_claw_id") or "").strip().upper()
+    if not peer_claw:
+        return
+    try:
+        reply = await asyncio.to_thread(call_llm, sys_p, usr_p, max_tokens=600, timeout=20)
+    except Exception as exc:
+        print(json.dumps({"event": "a2a_error", "stage": "speak", "detail": str(exc)[:300]}, ensure_ascii=False), flush=True)
+        return
+    if not reply:
+        return
+    try:
+        result = await asyncio.to_thread(client.send_lobster_message, peer_claw, reply)
+    except Exception as exc:
+        print(json.dumps({"event": "a2a_error", "stage": "send", "detail": str(exc)[:300]}, ensure_ascii=False), flush=True)
+        return
+    # Echo my own outbound to my IM so the user sees what their AI just said.
+    peer_label = _format_lobster_label(
+        event.get("peer_name") or peer_claw,
+        event.get("peer_owner_name") or "",
+        event.get("peer_role") or "",
+        event.get("peer_org_name") or "",
+    )
+    _notify(
+        "a2a_outbound",
+        f"📤 [A2A 撮合 turn {event.get('turn_count',0)+1}/{event.get('max_turns',14)}] 我刚发给 {peer_label}：\n{reply}",
+        peer_claw=peer_claw, peer_name=event.get("peer_name") or "",
+        content=reply, session_id=str(event.get("session_id") or ""),
+        created_at=str((result or {}).get("event", {}).get("created_at") or ""),
+    )
+
+
+async def _handle_a2a_judge(client, event: dict) -> None:
+    """Server asks: do you want to end this conversation? Vote yes/no."""
+    try:
+        from a2a_prompts import build_judge_prompt, parse_judge_output
+        from a2a_llm import call_llm
+    except Exception as exc:
+        print(json.dumps({"event": "a2a_error", "stage": "import", "detail": str(exc)}, ensure_ascii=False), flush=True)
+        return
+    sys_p, usr_p = build_judge_prompt(event)
+    try:
+        raw = await asyncio.to_thread(call_llm, sys_p, usr_p, max_tokens=800, timeout=15)
+    except Exception as exc:
+        print(json.dumps({"event": "a2a_error", "stage": "judge_llm", "detail": str(exc)[:300]}, ensure_ascii=False), flush=True)
+        return
+    decision = parse_judge_output(raw)
+    session_id = str(event.get("session_id") or "")
+    my_claw = str(event.get("my_claw_id") or "").strip().upper()
+    # POST vote back to server
+    try:
+        client._request(
+            "POST",
+            f"/bp/a2a/sessions/{session_id}/vote?claw_id={my_claw}",
+            {"want_end": bool(decision.get("want_end")), "reason": decision.get("reason", "")},
+        )
+    except Exception as exc:
+        print(json.dumps({"event": "a2a_error", "stage": "vote_post", "detail": str(exc)[:300]}, ensure_ascii=False), flush=True)
+        return
+    _notify(
+        "a2a_vote",
+        f"🗳️ A2A 投票：{'想结束 → 见真人' if decision.get('want_end') else '想继续聊'} ({decision.get('reason','')})",
+        session_id=session_id, want_end=bool(decision.get("want_end")),
+    )
+
+
+async def _handle_a2a_concluded(event: dict) -> None:
+    """Server says this session is done. Generate a per-side LLM summary
+    and push it together with peer contact info (if match) to the user's IM."""
+    match = bool(event.get("match"))
+    icon = "✅" if match else "🟡"
+    headline = "撮合达成，建议见真人" if match else "撮合结束，暂不推进"
+    peer_label = _format_lobster_label(
+        event.get("peer_name") or event.get("peer_claw_id") or "对方",
+        event.get("peer_owner_name") or "",
+        event.get("peer_role") or "",
+        event.get("peer_org_name") or "",
+    )
+    peer_name = event.get("peer_name") or event.get("peer_claw_id") or "对方"
+    peer_owner = event.get("peer_owner_name") or ""
+    listing = event.get("listing") or {}
+    project_name = listing.get("project_name") or ""
+
+    # Generate a personalized summary via LLM (best-effort).
+    ai_summary = ""
+    try:
+        from a2a_prompts import build_summary_prompt
+        from a2a_llm import call_llm
+        sys_p, usr_p = build_summary_prompt(event)
+        ai_summary = await asyncio.to_thread(call_llm, sys_p, usr_p, max_tokens=900, timeout=30)
+    except Exception as exc:
+        ai_summary = f"(AI 纪要生成失败: {str(exc)[:120]})"
+
+    lines = [
+        f"{icon} 【A2A 撮合 {headline}】",
+        f"对方：{peer_label}",
+    ]
+    if project_name:
+        lines.append(f"项目：{project_name}")
+    lines.append(f"对话轮数：{event.get('turn_count', '?')} / {event.get('max_turns', 20)}")
+    lines.append("")
+    lines.append("📋 AI 纪要：")
+    lines.append(ai_summary or "(无)")
+
+    if match:
+        contact = event.get("peer_contact") or {}
+        primary = (contact.get("primary_contact") or "").strip()
+        primary_type = (contact.get("primary_contact_type") or "").strip()
+        secondary = contact.get("secondary_contacts") or {}
+        type_label = {"wechat": "微信", "phone": "电话", "email": "邮箱", "telegram": "Telegram"}.get(primary_type, primary_type)
+        lines.append("")
+        lines.append("📇 对方联系方式：")
+        if primary:
+            lines.append(f"  · {type_label or '主要'}：{primary}")
+        if isinstance(secondary, dict) and secondary:
+            for k, v in secondary.items():
+                if v:
+                    lines.append(f"  · {k}：{v}")
+        if not primary and not secondary:
+            lines.append("  · 对方还没在沙堆控制台填联系方式，请通过沙堆网页找他。")
+        lines.append("")
+        lines.append("👉 接下来请直接联系对方深聊。沙堆任务到此结束。")
+    else:
+        lines.append("")
+        lines.append("（如想接手手动聊，可在沙堆里继续给对方发消息。）")
+
+    _notify(
+        "a2a_concluded",
+        "\n".join(lines),
+        match=match,
+        session_id=str(event.get("session_id") or ""),
+        peer_name=peer_name,
+        peer_owner=peer_owner,
+    )
 
 
 async def _listen_and_bridge(
@@ -684,21 +847,31 @@ async def _listen_and_bridge(
     async with websockets.connect(client._ws_url(), ping_interval=20, ping_timeout=20) as websocket:
         await websocket.send(json.dumps({"action": "auth", "token": client._get_auth_token()}))
         async for raw in websocket:
-            payload = json.loads(raw)
-            await _handle_event(
-                client,
-                payload,
-                bridge_enabled=bridge_enabled,
-                official_claw_id=official_claw_id,
-                openclaw_bin=openclaw_bin,
-                openclaw_agent_id=openclaw_agent_id,
-                room_tasks=room_tasks,
-                autonomous_roundtables=autonomous_roundtables,
-                roundtable_max_turns=roundtable_max_turns,
-                roundtable_max_duration_seconds=roundtable_max_duration_seconds,
-                roundtable_idle_timeout_seconds=roundtable_idle_timeout_seconds,
-                roundtable_poll_seconds=roundtable_poll_seconds,
-            )
+            try:
+                payload = json.loads(raw)
+                await _handle_event(
+                    client,
+                    payload,
+                    bridge_enabled=bridge_enabled,
+                    official_claw_id=official_claw_id,
+                    openclaw_bin=openclaw_bin,
+                    openclaw_agent_id=openclaw_agent_id,
+                    room_tasks=room_tasks,
+                    autonomous_roundtables=autonomous_roundtables,
+                    roundtable_max_turns=roundtable_max_turns,
+                    roundtable_max_duration_seconds=roundtable_max_duration_seconds,
+                    roundtable_idle_timeout_seconds=roundtable_idle_timeout_seconds,
+                    roundtable_poll_seconds=roundtable_poll_seconds,
+                )
+            except Exception as exc:
+                # Per-event error must not kill the WS recv loop. Log and
+                # continue so the next frame still gets processed.
+                import traceback
+                print(json.dumps({
+                    "event": "handle_event_failed",
+                    "detail": str(exc)[:200],
+                    "trace": traceback.format_exc()[-500:],
+                }, ensure_ascii=False), flush=True)
 
 
 # The official lobster's CLAW ID is fixed by the seed in server/store.py.

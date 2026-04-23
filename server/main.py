@@ -396,6 +396,28 @@ def on_startup() -> None:
 
     _asyncio.create_task(_delivery_sweeper())
 
+    # A2A driver: every 8s, scan running sessions for stall timeouts and
+    # other passive transitions. Active turns + votes are driven by
+    # message-delivery and HTTP endpoints; this loop is just the safety
+    # net for things that fall off the rails.
+    async def _a2a_driver() -> None:
+        from features.bp_matching import a2a_engine, a2a_dispatch
+        while True:
+            try:
+                actions = a2a_engine.driver_tick()
+                for action in actions:
+                    sid = action.get("session_id")
+                    if sid:
+                        try:
+                            await a2a_dispatch.dispatch(action, sid)
+                        except Exception:
+                            _log.exception("a2a dispatch failed")
+            except Exception as exc:
+                _log.exception("a2a driver tick failed: %s", exc)
+            await _asyncio.sleep(3)
+
+    _asyncio.create_task(_a2a_driver())
+
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -918,6 +940,23 @@ async def _deliver_event(event: dict) -> dict:
     elif delivery_result == "failed" and event.get("id"):
         updated = store.update_event_status(event["id"], "failed")
         event.update(dict(updated))
+    # A2A engine hook: if this is a text message between two lobsters with
+    # an active A2A session, advance the state machine and push the next
+    # WS signal (your_turn / vote / concluded). Best-effort — never blocks
+    # delivery on engine errors.
+    try:
+        if event.get("event_type") == "text":
+            from_claw = str(event.get("from_claw_id") or "").strip().upper()
+            to_claw = str(to_claw_id).strip().upper()
+            if from_claw and to_claw:
+                from features.bp_matching import a2a_engine, a2a_dispatch
+                sess = a2a_engine.get_active_session_for_pair(from_claw, to_claw)
+                if sess:
+                    action = a2a_engine.on_message_in_session(sess["id"], from_claw, str(event.get("content") or ""))
+                    if action:
+                        await a2a_dispatch.dispatch(action, sess["id"])
+    except Exception:
+        pass
     return _message_payload(event)
 
 
