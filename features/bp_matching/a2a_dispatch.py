@@ -306,6 +306,9 @@ async def dispatch(action: dict, session_id: str) -> None:
                 })
 
     elif kind == "stalled":
+        # Reason can come from the engine (timeout) or from the route layer
+        # (e.g. listing closed). Default keeps the timeout phrasing.
+        reason = action.get("reason") or "5 分钟无活动，会话挂起。建议自己接手。"
         for claw in (ctx["investor_claw_id"], ctx["founder_claw_id"]):
             await manager.send_to_agent(claw, {
                 "event": "a2a:stalled",
@@ -313,6 +316,6 @@ async def dispatch(action: dict, session_id: str) -> None:
                     "session_id": session_id,
                     "intent_id": ctx["intent_id"],
                     "turn_count": ctx["turn_count"],
-                    "reason": "5 分钟无活动，会话挂起。建议自己接手。",
+                    "reason": reason,
                 },
             })

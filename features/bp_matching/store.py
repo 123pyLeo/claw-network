@@ -621,6 +621,25 @@ def update_listing(
             params.append(listing_id)
             conn.execute(f"UPDATE bp_listings SET {', '.join(updates)} WHERE id = ?", params)
 
+        # Closing the listing must end any A2A sessions still running on it.
+        # Otherwise the engine keeps driving turns based on a closed BP and
+        # the dispatch layer keeps echoing stale listing context to sidecars.
+        cancelled_sessions: list[str] = []
+        if status == "closed":
+            now = utc_now()
+            cancelled_rows = conn.execute(
+                "SELECT id FROM bp_a2a_sessions WHERE listing_id = ? AND status IN (?, ?)",
+                (listing_id, "running", "awaiting_vote"),
+            ).fetchall()
+            cancelled_sessions = [str(r["id"]) for r in cancelled_rows]
+            if cancelled_sessions:
+                placeholders = ",".join(["?"] * len(cancelled_sessions))
+                conn.execute(
+                    f"UPDATE bp_a2a_sessions SET status = 'stalled', updated_at = ? "
+                    f"WHERE id IN ({placeholders})",
+                    [now, *cancelled_sessions],
+                )
+
         result = conn.execute(f"{_LISTING_SELECT} WHERE bl.id = ?", (listing_id,)).fetchone()
 
         notify_investors: list[str] = []
@@ -635,6 +654,7 @@ def update_listing(
 
     out = dict(result)
     out["_notify_investors"] = notify_investors
+    out["_cancelled_a2a_sessions"] = cancelled_sessions
     return out
 
 
@@ -696,25 +716,15 @@ def create_intent(listing_id: str, investor_claw_id: str, personal_note: str = "
             (intent_id, listing_id, investor_id, initial_status, personal_note.strip(), now),
         )
 
-    # Auto-friend AFTER closing connection
+    # Auto-friend AFTER closing connection. Open BPs skip the manual
+    # review path entirely; the A2A kickoff (start_session + dispatch) is
+    # the route layer's responsibility — keeps store.* free of async/WS
+    # concerns and avoids the double-call risk that came from kicking off
+    # in both store.create_intent and routes.create_intent.
     if initial_status == "auto_accepted":
         founder_lobster = get_lobster_by_claw_id(listing["founder_claw_id"])
         if founder_lobster:
             ensure_friendship(str(founder_lobster["id"]), investor_id)
-        # Open BPs skip the manual review path entirely, but the A2A
-        # kickoff lives there. Without this call open intents got
-        # auto_accepted in DB but never triggered the dialogue.
-        try:
-            from . import a2a_engine
-            a2a_engine.start_session(intent_id)
-        except Exception as exc:
-            # Don't block intent on A2A failure, but at least leave a trail
-            # so the operator can spot orphaned auto_accepted intents that
-            # never started a dialogue.
-            import logging as _lg
-            _lg.getLogger("bp.a2a_kickoff_open").warning(
-                f"start_session failed for open intent {intent_id}: {exc!r}"
-            )
 
     # Log as zero-amount invocation for network observability
     with get_conn() as conn:
@@ -859,22 +869,14 @@ def review_intent(intent_id: str, claw_id: str, decision: str, review_note: str 
         # reject deserve observability + downstream notification.
         investor_claw_id = intent["investor_claw_id"]
 
-    # Auto-friend on accept (skip for reject)
+    # Auto-friend on accept (skip for reject). A2A session kickoff
+    # (start_session + dispatch) is the route layer's responsibility, not
+    # the store's — keeps store.* free of async/engine deps and avoids the
+    # store-and-route double-call pattern we used to have.
     if decision == "accepted":
         investor = get_lobster_by_claw_id(investor_claw_id)
         if investor:
             ensure_friendship(str(lobster["id"]), str(investor["id"]))
-        # Try to start an A2A session if both sides opted into auto mode.
-        # The actual WS push to kick off turn 1 is done by the route layer
-        # (which has access to the async dispatcher).
-        try:
-            from . import a2a_engine
-            a2a_engine.start_session(intent_id)
-        except Exception as exc:
-            import logging as _lg
-            _lg.getLogger("bp.a2a_kickoff_review").warning(
-                f"start_session failed for accepted intent {intent_id}: {exc!r}"
-            )
 
     # Log the review as an a2a_events observability record (both accept and reject).
     investor_row = get_lobster_by_claw_id(investor_claw_id)

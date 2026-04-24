@@ -41,7 +41,6 @@ Hard limits keep the system bounded:
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -272,19 +271,29 @@ def _last_text_between(claw_a: str, claw_b: str, *, before_id: str | None = None
     return None
 
 
-def _begin_vote(session_id: str) -> dict:
-    """Flip session to awaiting_vote and clear prior votes."""
+def _begin_vote(session_id: str) -> dict | None:
+    """Flip session to awaiting_vote and clear prior votes.
+
+    Atomic: only the first caller transitioning running→awaiting_vote
+    returns the vote action. Concurrent on_message_in_session calls (both
+    sides racing past the turn-count check) would otherwise each push
+    a2a:judge to both sidecars, doubling LLM calls and IM noise. Returns
+    None if another caller already transitioned — dispatch handles None
+    by doing nothing.
+    """
     now = utc_now()
     with get_conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             """
             UPDATE bp_a2a_sessions
                SET status = ?, investor_want_end = NULL, founder_want_end = NULL,
                    updated_at = ?
-             WHERE id = ?
+             WHERE id = ? AND status = ?
             """,
-            (S_AWAITING_VOTE, now, session_id),
+            (S_AWAITING_VOTE, now, session_id, S_RUNNING),
         )
+        if cur.rowcount == 0:
+            return None
     return {"kind": "vote"}
 
 
@@ -337,104 +346,71 @@ def record_vote(session_id: str, claw_id: str, want_end: bool) -> dict:
     return {"kind": "speak", "speaker_claw_id": next_speaker_claw, "resumed": True}
 
 
-def conclude(session_id: str, match: bool, summary: str = "") -> dict:
-    """Finalize session. On match, also create the friendship + flag the
-    intent as ready for contact exchange (uses existing
-    request_meeting machinery so contact unlocks via the established
-    flow)."""
+def conclude(session_id: str, match: bool, summary: str = "") -> dict | None:
+    """Finalize session. On match, mark both sides as wanting the meeting
+    (the existing request_meeting machinery handles contact exchange).
+
+    Atomic finalize: only the first caller wins the status transition.
+    Without this, two record_vote calls racing past the both-voted check
+    each call conclude → request_meeting fires twice per side, dispatch
+    pushes two a2a:concluded WS events to each sidecar. Returns None when
+    another caller already finalized — record_vote treats None as 'nothing
+    to dispatch'.
+    """
     now = utc_now()
     final_status = S_CONCLUDED_MATCH if match else S_CONCLUDED_PASS
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM bp_a2a_sessions WHERE id = ?", (session_id,)).fetchone()
-        if row is None:
-            raise ValueError("Session not found.")
-        conn.execute(
+        cur = conn.execute(
             """
             UPDATE bp_a2a_sessions
                SET status = ?, summary = ?, concluded_at = ?, updated_at = ?
-             WHERE id = ?
+             WHERE id = ? AND status IN (?, ?)
             """,
-            (final_status, summary, now, now, session_id),
+            (final_status, summary, now, now, session_id, S_RUNNING, S_AWAITING_VOTE),
         )
+        if cur.rowcount == 0:
+            # Either session doesn't exist or already concluded/stalled.
+            # Either way, this caller has nothing to do.
+            return None
+        row = conn.execute("SELECT * FROM bp_a2a_sessions WHERE id = ?", (session_id,)).fetchone()
 
-    # Default-deny posture: if anything goes wrong below, we want
-    # `missing_contacts == [both]` so dispatch sends a:contact_missing nudges
-    # to both sides instead of a misleading "unlocked!" card with empty data.
-    missing_contacts: list[str] = ["investor", "founder"] if match else []
-    unlock_attempted = False
+    missing_contacts: list[str] = []
     if match:
-        # Before unlocking, check both sides actually have a contact filled.
-        # The route layer enforces this on PUT /my-contact + on the
-        # request-meeting endpoint, but engine.conclude bypasses both. If we
-        # blindly call request_meeting() with empty contacts, the
-        # `a2a:concluded` payload's peer_contact comes back empty — match
-        # appears successful in IM but no microWeChat / phone gets exchanged.
-        # That's the worst failure mode. Instead: only auto-unlock for sides
-        # that already have contact; surface the missing ones so dispatch can
-        # nudge them ("撮合成了但你还没填联系方式…").
-        try:
-            from .store import (
-                request_meeting,
-                get_lobster_by_claw_id,
-                get_owner_contact,
-            )
-            inv_lob = get_lobster_by_claw_id(str(row["investor_claw_id"]))
-            fnd_lob = get_lobster_by_claw_id(str(row["founder_claw_id"]))
-
-            def _has_contact(lob) -> bool:
-                if not lob:
-                    return False
-                owner_id = str(lob["owner_id"] or "")
-                if not owner_id:
-                    return False
-                c = get_owner_contact(owner_id)
-                return bool((c.get("primary_contact") or "").strip())
-
-            inv_ok = _has_contact(inv_lob)
-            fnd_ok = _has_contact(fnd_lob)
-            # Lookups succeeded — replace the default-deny with the real list
-            missing_contacts = []
-            if not inv_ok:
-                missing_contacts.append("investor")
-            if not fnd_ok:
-                missing_contacts.append("founder")
-
-            # Unlock symmetrically only when BOTH sides have contact. The
-            # request_meeting flow exchanges info bidirectionally; unlocking
-            # one direction with an empty peer would leak the asymmetry into
-            # a confusing IM card.
-            if inv_ok and fnd_ok:
-                unlock_attempted = True
-                # If either request_meeting throws, we want the ASYMMETRIC
-                # state (one side unlocked, the other not) to surface — fall
-                # back to default-deny on either side rather than claim
-                # success. The route's GET /bp/intents/.../meeting-unlock
-                # remains the recovery path.
-                try:
-                    request_meeting(str(row["intent_id"]), "investor")
-                    request_meeting(str(row["intent_id"]), "founder")
-                except Exception as exc:
-                    _alog = logging.getLogger("a2a.conclude")
-                    _alog.error(
-                        f"[conclude] request_meeting failed for session={session_id} "
-                        f"intent={row['intent_id']}: {exc!r}"
-                    )
-                    # Re-mark both as missing so dispatch nudges both sides
-                    # to manually trigger '沙堆 约见 <intent>' as recovery.
-                    missing_contacts = ["investor", "founder"]
-        except Exception as exc:
-            _alog = logging.getLogger("a2a.conclude")
-            _alog.error(
-                f"[conclude] contact lookup failed for session={session_id}: {exc!r}"
-            )
-            # missing_contacts stays at default-deny ["investor", "founder"]
+        # Check which sides have contact filled. Only auto-unlock when both
+        # do — request_meeting exchanges bidirectionally; unlocking one side
+        # with an empty peer would surface as a misleading "✓ unlocked, peer
+        # contact: (empty)" card. Sides without contact get an
+        # a2a:contact_missing nudge from dispatch.
+        from .store import (
+            request_meeting,
+            get_lobster_by_claw_id,
+            get_owner_contact,
+        )
+        # Session row references existing lobsters by INSERT-time JOIN; if
+        # either lookup returns None the system is broken and we want a 500.
+        inv_lob = get_lobster_by_claw_id(str(row["investor_claw_id"]))
+        fnd_lob = get_lobster_by_claw_id(str(row["founder_claw_id"]))
+        inv_contact = get_owner_contact(str(inv_lob["owner_id"]))
+        fnd_contact = get_owner_contact(str(fnd_lob["owner_id"]))
+        inv_has = bool((inv_contact.get("primary_contact") or "").strip())
+        fnd_has = bool((fnd_contact.get("primary_contact") or "").strip())
+        if not inv_has:
+            missing_contacts.append("investor")
+        if not fnd_has:
+            missing_contacts.append("founder")
+        if inv_has and fnd_has:
+            # request_meeting is internally idempotent (CAS on
+            # meeting_unlocked_at), so even if this conclude is somehow
+            # entered twice (e.g. operator manually re-runs) the unlock
+            # event still fires only once.
+            request_meeting(str(row["intent_id"]), "investor")
+            request_meeting(str(row["intent_id"]), "founder")
 
     return {
         "kind": "concluded",
         "match": match,
         "session": dict(row) | {"status": final_status, "summary": summary},
         "missing_contacts": missing_contacts,
-        "unlock_attempted": unlock_attempted,
     }
 
 

@@ -121,56 +121,49 @@ def search_listings(
 
 
 @router.get("/listings/{listing_id}", response_model=BPListingRow)
-async def get_listing(listing_id: str, request: Request, claw_id: str | None = None) -> BPListingRow:
-    """Get a single BP listing.
+async def get_listing(listing_id: str, request: Request, claw_id: str) -> BPListingRow:
+    """Get a single BP listing's full detail.
 
-    Authz tiers:
-      - Caller is the listing's founder → full detail.
-      - Caller has an accepted/auto_accepted intent on this listing → full detail.
-      - Listing access_policy is 'open' → full detail (the founder explicitly
-        opted in to public deep-content).
-      - Otherwise → only the summary fields (deep-content fields are blanked).
-        The route still returns 200 so existing browse flows aren't broken,
-        just with redacted bodies.
+    Authz: caller (`claw_id`) must be the listing's founder, OR have an
+    accepted/auto_accepted intent on this listing, OR the listing must be
+    access_policy='open'. Otherwise 403 — explicit so the agent can tell
+    the user "you need to express interest first" instead of seeing
+    blanked-out fields and guessing the BP author wrote nothing.
 
-    `claw_id` is optional but required to get full detail. Anonymous /
-    summary-only callers don't need to pass it.
+    Browse the public summary fields via GET /bp/listings (the search
+    endpoint).
     """
     _check_rate_limit(request)
+    normalized = claw_id.strip().upper()
+    _require_http_auth(request, normalized)
     try:
         result = bp_store.get_listing(listing_id)
     except ValueError as exc:
         raise _http_error(exc) from exc
 
-    can_see_detail = result.get("access_policy") == "open"
-    if not can_see_detail and claw_id:
-        normalized = claw_id.strip().upper()
-        # Auth check (matches the rest of /bp/* — if claw_id passed, it must
-        # belong to the caller).
-        _require_http_auth(request, normalized)
-        if normalized == str(result.get("founder_claw_id") or "").upper():
-            can_see_detail = True
-        else:
-            from server.store import get_conn
-            with get_conn() as conn:
-                row = conn.execute(
-                    """
-                    SELECT bi.status FROM bp_intents bi
-                    JOIN lobsters inv ON inv.id = bi.investor_lobster_id
-                    WHERE bi.listing_id = ? AND inv.claw_id = ?
-                    LIMIT 1
-                    """,
-                    (str(result["id"]), normalized),
-                ).fetchone()
-            if row is not None and row["status"] in ("accepted", "auto_accepted"):
-                can_see_detail = True
+    if result.get("access_policy") == "open":
+        return BPListingRow(**result)
+    if normalized == str(result.get("founder_claw_id") or "").upper():
+        return BPListingRow(**result)
 
-    if not can_see_detail:
-        # Strip the deep-content fields. Pydantic will fall back to defaults
-        # ("") so the response shape stays the same.
-        for k in ("problem", "solution", "team_intro", "traction", "business_model", "ask_note"):
-            result[k] = ""
-    return BPListingRow(**result)
+    from server.store import get_conn
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT bi.status FROM bp_intents bi
+            JOIN lobsters inv ON inv.id = bi.investor_lobster_id
+            WHERE bi.listing_id = ? AND inv.claw_id = ?
+            LIMIT 1
+            """,
+            (str(result["id"]), normalized),
+        ).fetchone()
+    if row is not None and row["status"] in ("accepted", "auto_accepted"):
+        return BPListingRow(**result)
+
+    raise HTTPException(
+        status_code=403,
+        detail="想看这份 BP 的完整内容，需要先发意向并被创始人接受。或者发布者把它设为公开（access_policy=open）。",
+    )
 
 
 @router.patch("/listings/{listing_id}", response_model=BPListingRow)
@@ -198,19 +191,27 @@ async def update_listing(listing_id: str, payload: BPListingUpdateRequest, reque
     # If a key content field changed, nudge investors with still-pending intents.
     notify = result.pop("_notify_investors", [])
     for investor_claw in notify:
-        try:
-            await manager.send_to_agent(investor_claw, {
-                "event": "bp_listing_updated",
-                "payload": {
-                    "listing_id": listing_id,
-                    "project_name": result.get("project_name"),
-                    "one_liner": result.get("one_liner"),
-                    "funding_ask": result.get("funding_ask"),
-                    "stage": result.get("stage"),
-                },
-            })
-        except Exception:
-            pass
+        await manager.send_to_agent(investor_claw, {
+            "event": "bp_listing_updated",
+            "payload": {
+                "listing_id": listing_id,
+                "project_name": result.get("project_name"),
+                "one_liner": result.get("one_liner"),
+                "funding_ask": result.get("funding_ask"),
+                "stage": result.get("stage"),
+            },
+        })
+
+    # If closing the listing cancelled active A2A sessions, push a:stalled
+    # to both sides of each session so their sidecars surface the end.
+    cancelled = result.pop("_cancelled_a2a_sessions", [])
+    if cancelled:
+        from . import a2a_dispatch
+        for sid in cancelled:
+            await a2a_dispatch.dispatch(
+                {"kind": "stalled", "session_id": sid, "reason": "BP 已被发布者关闭，撮合会话终止。"},
+                sid,
+            )
 
     return BPListingRow(**result)
 
@@ -234,16 +235,13 @@ async def a2a_vote_route(session_id: str, payload: dict, request: Request, claw_
         result = a2a_engine.record_vote(session_id, normalized, want_end)
     except ValueError as exc:
         raise _http_error(exc) from exc
-    # Push the resulting WS signal (next speaker / concluded / etc.).
-    # Log dispatch failures — silently swallowing them was leaving sidecars
-    # stuck in awaiting_vote forever, with no breadcrumb in logs.
-    try:
-        await a2a_dispatch.dispatch(result, session_id)
-    except Exception as exc:
-        import logging
-        logging.getLogger("a2a.dispatch").error(
-            f"[record_vote] dispatch failed for session={session_id} action={result.get('kind')}: {exc!r}"
-        )
+    # Engine returns None when this caller raced another caller to a
+    # state transition (e.g. both sides voted want_end simultaneously and
+    # the other call already entered conclude). Nothing to dispatch; the
+    # winning caller's path handled the WS pushes.
+    if result is None:
+        return {"kind": "noop", "note": "vote recorded; another caller already advanced state"}
+    await a2a_dispatch.dispatch(result, session_id)
     return result
 
 
@@ -318,29 +316,17 @@ async def create_intent(listing_id: str, payload: BPIntentCreateRequest, request
         "payload": result,
     })
 
-    # Open BPs auto-accept inside create_intent; that path needs the same
-    # A2A kickoff that the manual-review path gets in review_intent. Mirror
-    # the logic here so open intents actually start a dialogue.
+    # Open BPs auto-accept and need to start the A2A dialogue here (the
+    # manual-review path does this in review_intent). start_session is
+    # idempotent — safe even though store.create_intent used to also call
+    # it; that legacy duplicate has been removed.
     if result.get("status") == "auto_accepted":
-        import logging
-        _alog = logging.getLogger("a2a.kickoff_open")
-        try:
-            from . import a2a_dispatch
-            from server.store import get_conn
-            with get_conn() as conn:
-                row = conn.execute(
-                    "SELECT id FROM bp_a2a_sessions WHERE intent_id = ? AND status = 'running'",
-                    (result["id"],),
-                ).fetchone()
-            if row:
-                await a2a_dispatch.dispatch(
-                    {"kind": "speak", "speaker_claw_id": result["investor_claw_id"]},
-                    row["id"],
-                )
-                await a2a_dispatch.push_contact_missing_nudge(row["id"])
-                _alog.info(f"[kickoff_open] dispatched speak intent={result['id'][:8]} → {result['investor_claw_id']}")
-        except Exception as exc:
-            _alog.error(f"[kickoff_open] FAILED intent={result.get('id')}: {exc!r}")
+        from . import a2a_engine, a2a_dispatch
+        started = a2a_engine.start_session(result["id"])
+        if started is not None:
+            sid = started["session"]["id"]
+            await a2a_dispatch.dispatch(started["next_action"], sid)
+            await a2a_dispatch.push_contact_missing_nudge(sid)
 
     return BPIntentRow(**result)
 
@@ -381,32 +367,16 @@ async def review_intent(intent_id: str, payload: BPIntentReviewRequest, request:
         "payload": result,
     })
 
-    # If the engine started an A2A session (both lobsters opted into auto),
-    # push the kickoff "your_turn" signal to the investor.
+    # On accept, start the A2A dialogue right here. start_session returns
+    # None when the pair isn't both-auto (or session already exists from a
+    # prior call); dispatch only fires when there's something to send.
     if payload.decision == "accepted":
-        import logging
-        _alog = logging.getLogger("a2a_kickoff")
-        try:
-            from . import a2a_dispatch
-            from server.store import get_conn
-            with get_conn() as conn:
-                row = conn.execute(
-                    "SELECT id FROM bp_a2a_sessions WHERE intent_id = ? AND status = 'running'",
-                    (intent_id,),
-                ).fetchone()
-            _alog.warning(f"[a2a_kickoff] intent={intent_id[:8]} session_row={'yes' if row else 'no'}")
-            if row:
-                await a2a_dispatch.dispatch(
-                    {"kind": "speak", "speaker_claw_id": result["investor_claw_id"]},
-                    row["id"],
-                )
-                # Early nudge: if either side hasn't filled contact yet,
-                # tell them now so they can fix it during the 5+ minute
-                # dialogue window — instead of being told only at conclude.
-                await a2a_dispatch.push_contact_missing_nudge(row["id"])
-                _alog.warning(f"[a2a_kickoff] dispatched speak to investor={result['investor_claw_id']}")
-        except Exception as exc:
-            _alog.warning(f"[a2a_kickoff] FAILED: {exc!r}")
+        from . import a2a_engine, a2a_dispatch
+        started = a2a_engine.start_session(intent_id)
+        if started is not None:
+            sid = started["session"]["id"]
+            await a2a_dispatch.dispatch(started["next_action"], sid)
+            await a2a_dispatch.push_contact_missing_nudge(sid)
 
     # The queue shifted: nudge every still-pending investor on this same
     # listing with their new position so the wait isn't opaque.
