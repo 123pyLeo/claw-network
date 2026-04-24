@@ -2144,16 +2144,25 @@ const plugin = {
     api.registerTool({
       name: 'bp_get_listing',
       label: 'Get BP Listing Detail',
-      description: 'Fetch full structured content of a BP listing. Caller must be an approved-investor on this listing.',
+      description: 'Fetch full structured content of a BP listing. listing_id MUST be the actual UUID returned by list_bps in the `id` field of a row — NOT a position like "1" or the project_name. Caller must be the listing\'s founder, OR have an accepted intent on this listing, OR the listing must be access_policy=open. Otherwise the server returns 403 with a hint.',
       parameters: {
         type: 'object',
         additionalProperties: false,
-        properties: { listing_id: { type: 'string' } },
+        properties: { listing_id: { type: 'string', description: 'UUID from list_bps result, e.g. "dc0aec4b-16cc-4b0b-b6b1-71b0d13b4b3c"' } },
         required: ['listing_id'],
       },
       async execute({ listing_id }) {
+        // Reject obviously-bad inputs at the boundary so the server doesn't
+        // log misleading 400s like /bp/listings/undefined. The agent gets
+        // an explicit message back so it can fix its tool args.
+        const id = String(listing_id ?? '').trim();
+        if (!id || id === 'undefined' || id === 'null' || /^\d+$/.test(id)) {
+          return errorResult(new Error(
+            `bp_get_listing 调用错了：listing_id 必须是 list_bps 返回结果里 row.id 这个 UUID（比如 "dc0aec4b-16cc-4b0b-b6b1-71b0d13b4b3c"），不能传 "${id || '空'}"。先调 list_bps 拿到真实的 id 再调用我。`
+          ));
+        }
         try {
-          const result = await runClient(api, ['bp-get-listing', String(listing_id).trim()]);
+          const result = await runClient(api, ['bp-get-listing', id]);
           const lines = [
             `📇 ${result.project_name}${result.sector ? ' · ' + result.sector : ''}${result.stage ? ' · ' + result.stage : ''}`,
             `一句话: ${result.one_liner}`,
@@ -3071,7 +3080,7 @@ const plugin = {
     api.registerTool({
       name: 'list_bps',
       label: 'List BP Listings',
-      description: 'Browse public BP listings, optionally filtered by sector or stage.',
+      description: 'Browse public BP listings, optionally filtered by sector or stage. Each row includes the full `id` (UUID) — when the user wants to drill into one ("看 BP 1 详情" / "express interest in Lumina AI"), pass that id verbatim to bp_get_listing or bp_express_interest. The 8-char short form also works (the server resolves prefixes).',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -3091,9 +3100,12 @@ const plugin = {
             return toolTextResult('暂无 BP。', { success: true, result: [] });
           }
           const lines = result.map((r, i) =>
-            `${i + 1}. [${r.id.slice(0, 8)}] ${r.project_name} - ${r.stage || '?'} - ${r.one_liner}`
+            `${i + 1}. ${r.project_name} (${r.stage || '?'}) — ${r.one_liner}\n   id: ${r.id}`
           );
-          return toolTextResult(`BP 列表（${result.length}）：\n${lines.join('\n')}`, { success: true, result });
+          return toolTextResult(
+            `BP 列表（${result.length}）：\n${lines.join('\n')}\n\n要看详情或表意向时，把对应的 \`id\` 字段原样传给 bp_get_listing / bp_express_interest。`,
+            { success: true, result }
+          );
         } catch (error) {
           return errorResult(error);
         }
