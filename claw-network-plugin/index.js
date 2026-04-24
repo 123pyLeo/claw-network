@@ -3022,7 +3022,7 @@ const plugin = {
     api.registerTool({
       name: 'post_bp',
       label: 'Post BP Listing',
-      description: 'Publish a business plan summary (founder only).',
+      description: 'Publish a business plan summary (founder only). Required: project_name, one_liner. Strongly recommended core fields: problem, solution, team_intro (the 5 core fields per sandpile design — investors filter on these). Optional but useful: sector, stage, funding_ask + currency, team_size, traction, business_model, ask_note. After bp_extract_from_doc returns structured fields, pass them ALL through here — dropping fields wastes the upload pipeline. funding_ask is in 元 (smallest unit, e.g. 500万 → 5000000).',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -3032,9 +3032,16 @@ const plugin = {
           one_liner: { type: 'string' },
           sector: { type: 'string' },
           stage: { type: 'string' },
-          funding_ask: { type: 'integer' },
+          funding_ask: { type: 'integer', description: '本轮募资额，单位元（500万 → 5000000）' },
+          currency: { type: 'string', description: '币种，默认 CNY' },
           team_size: { type: 'integer' },
-          access_policy: { type: 'string', enum: ['manual', 'open'] }
+          access_policy: { type: 'string', enum: ['manual', 'open'] },
+          problem: { type: 'string', description: '在解决什么问题（核心字段之一）' },
+          solution: { type: 'string', description: '解决方案的核心做法（核心字段之一）' },
+          team_intro: { type: 'string', description: '团队介绍：核心成员背景（核心字段之一）' },
+          traction: { type: 'string', description: '当前进展 / 数据' },
+          business_model: { type: 'string', description: '商业模式 / 收入来源' },
+          ask_note: { type: 'string', description: '本轮资金用途 / ask' },
         }
       },
       async execute(_toolCallId, params) {
@@ -3044,8 +3051,15 @@ const plugin = {
           if (params.sector) args.push('--sector', params.sector);
           if (params.stage) args.push('--stage', params.stage);
           if (params.funding_ask) args.push('--funding-ask', String(params.funding_ask));
+          if (params.currency) args.push('--currency', params.currency);
           if (params.team_size) args.push('--team-size', String(params.team_size));
           if (params.access_policy) args.push('--access-policy', params.access_policy);
+          if (params.problem) args.push('--problem', params.problem);
+          if (params.solution) args.push('--solution', params.solution);
+          if (params.team_intro) args.push('--team-intro', params.team_intro);
+          if (params.traction) args.push('--traction', params.traction);
+          if (params.business_model) args.push('--business-model', params.business_model);
+          if (params.ask_note) args.push('--ask-note', params.ask_note);
           const result = await runClient(api, args);
           return toolTextResult(`BP 已发布：${result.project_name}\nID: ${result.id}`, { success: true, result });
         } catch (error) {

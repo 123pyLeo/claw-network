@@ -238,13 +238,17 @@ def ensure_bp_tables() -> None:
             "ON bp_a2a_sessions(status, last_turn_at)"
         )
 
-        # Per-lobster A2A mode preference. Default 'manual' = AI drafts a
-        # reply, human approves in IM before send. 'auto' = AI runs the
-        # whole conversation autonomously. 'off' = no A2A at all (human
-        # handles every inbound message themselves).
+        # Per-lobster A2A mode preference. v1 default is 'auto' — full
+        # autonomous AI conversation. 'manual' (AI drafts, human approves)
+        # and 'off' (no A2A) are v2 features. Schema DEFAULT must match v1
+        # design or every new lobster silently can't participate.
         lob_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lobsters)").fetchall()}
         if "bp_a2a_mode" not in lob_cols:
-            conn.execute("ALTER TABLE lobsters ADD COLUMN bp_a2a_mode TEXT NOT NULL DEFAULT 'manual'")
+            conn.execute("ALTER TABLE lobsters ADD COLUMN bp_a2a_mode TEXT NOT NULL DEFAULT 'auto'")
+        # Backfill: ALTER TABLE DEFAULT only applies to NEW inserts; rows
+        # added before the column existed have NULL/'manual'. Bring them
+        # forward so legacy lobsters can participate in A2A.
+        conn.execute("UPDATE lobsters SET bp_a2a_mode = 'auto' WHERE bp_a2a_mode IS NULL OR bp_a2a_mode = 'manual'")
 
         # retry_count: number of times the current turn has been re-pushed
         # by the driver. Resets when the turn actually advances. Caps at
@@ -624,7 +628,20 @@ def create_intent(listing_id: str, investor_claw_id: str, personal_note: str = "
         raise ValueError("Lobster not found.")
     _require_verified_investor(investor)
 
+    # Hard gate: investor must have a complete preference card before
+    # expressing interest. Without it the founder receives a useless
+    # notification (no org, no thesis, no ticket — can't decide whether to
+    # accept). SKILL.md tells the agent to fill the profile first, but a
+    # buggy or skipped client could still POST here, so enforce server-side.
+    profile = get_investor_profile(investor_claw_id)
+    if not profile.get("core_complete"):
+        raise ValueError(
+            "请先完成投资偏好卡核心 5 项（机构、自我介绍、关注赛道、关注阶段、ticket 范围），"
+            "才能发意向。完成后创始人才能秒判是否对口。"
+        )
+
     listing = get_listing(listing_id)
+    listing_id = str(listing["id"])
     if listing["status"] != "active":
         raise ValueError("该 BP 已关闭或过期。")
     if listing["founder_claw_id"] == investor_claw_id:
@@ -658,6 +675,14 @@ def create_intent(listing_id: str, investor_claw_id: str, personal_note: str = "
         founder_lobster = get_lobster_by_claw_id(listing["founder_claw_id"])
         if founder_lobster:
             ensure_friendship(str(founder_lobster["id"]), investor_id)
+        # Open BPs skip the manual review path entirely, but the A2A
+        # kickoff lives there. Without this call open intents got
+        # auto_accepted in DB but never triggered the dialogue.
+        try:
+            from . import a2a_engine
+            a2a_engine.start_session(intent_id)
+        except Exception:
+            pass  # best-effort; A2A is opt-in, never block intent on its failure
 
     # Log as zero-amount invocation for network observability
     with get_conn() as conn:
@@ -1308,12 +1333,19 @@ def request_meeting(intent_id: str, side: str) -> dict:
         ).fetchone()
 
         both_agreed = bool(updated["investor_meet_at"]) and bool(updated["founder_meet_at"])
-        first_unlock = both_agreed and updated["meeting_unlocked_at"] is None
-        if first_unlock:
-            conn.execute(
-                "UPDATE bp_intents SET meeting_unlocked_at = ? WHERE id = ?",
+        first_unlock = False
+        if both_agreed and updated["meeting_unlocked_at"] is None:
+            # Atomic compare-and-swap. Without the WHERE clause guard, two
+            # concurrent request_meeting calls (one per side) can both pass
+            # the read check and both write — both then return
+            # first_unlock=True, causing duplicate bp_meeting_unlocked WS
+            # events. The IS NULL filter ensures only the first writer wins.
+            cur = conn.execute(
+                "UPDATE bp_intents SET meeting_unlocked_at = ? "
+                "WHERE id = ? AND meeting_unlocked_at IS NULL",
                 (now, intent_id),
             )
+            first_unlock = (cur.rowcount == 1)
 
     return {
         "intent_id": intent_id,

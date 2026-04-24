@@ -542,14 +542,24 @@ class ClawNetworkClient:
 
     def post_bp(self, project_name: str, one_liner: str, sector: str = "", stage: str = "",
                 funding_ask: int | None = None, team_size: int | None = None,
-                access_policy: str = "manual") -> dict:
+                access_policy: str = "manual",
+                currency: str = "CNY",
+                problem: str = "", solution: str = "", team_intro: str = "",
+                traction: str = "", business_model: str = "", ask_note: str = "") -> dict:
         claw_id = self._get_my_claw_id()
         body = {
             "project_name": project_name,
             "one_liner": one_liner,
             "sector": sector,
             "stage": stage,
+            "currency": currency,
             "access_policy": access_policy,
+            "problem": problem,
+            "solution": solution,
+            "team_intro": team_intro,
+            "traction": traction,
+            "business_model": business_model,
+            "ask_note": ask_note,
         }
         if funding_ask is not None:
             body["funding_ask"] = funding_ask
@@ -1633,8 +1643,15 @@ def build_parser() -> argparse.ArgumentParser:
     post_bp_p.add_argument("--sector", default="")
     post_bp_p.add_argument("--stage", default="")
     post_bp_p.add_argument("--funding-ask", type=int, default=None)
+    post_bp_p.add_argument("--currency", default="CNY")
     post_bp_p.add_argument("--team-size", type=int, default=None)
     post_bp_p.add_argument("--access-policy", default="manual", choices=["manual", "open"])
+    post_bp_p.add_argument("--problem", default="")
+    post_bp_p.add_argument("--solution", default="")
+    post_bp_p.add_argument("--team-intro", default="")
+    post_bp_p.add_argument("--traction", default="")
+    post_bp_p.add_argument("--business-model", default="")
+    post_bp_p.add_argument("--ask-note", default="")
 
     list_bps_p = subparsers.add_parser("list-bps")
     list_bps_p.add_argument("--sector", default=None)
@@ -2000,8 +2017,15 @@ def main() -> None:
             sector=args.sector,
             stage=args.stage,
             funding_ask=args.funding_ask,
+            currency=args.currency,
             team_size=args.team_size,
             access_policy=args.access_policy,
+            problem=args.problem,
+            solution=args.solution,
+            team_intro=args.team_intro,
+            traction=args.traction,
+            business_model=args.business_model,
+            ask_note=args.ask_note,
         ), ensure_ascii=False, indent=2))
         return
     if args.command == "list-bps":

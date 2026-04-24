@@ -16,7 +16,7 @@ from typing import Any
 
 from server.realtime import manager
 from . import a2a_engine
-from .store import get_listing
+from .store import get_listing, get_investor_profile
 
 
 def _build_session_context(session_id: str) -> dict:
@@ -42,6 +42,14 @@ def _build_session_context(session_id: str) -> dict:
     )
     inv_meta = _lobster_display(sess["investor_claw_id"])
     fnd_meta = _lobster_display(sess["founder_claw_id"])
+    # Pull the investor's preference card so the founder's prompt builder
+    # can anchor the conversation on the investor's actual thesis (sectors,
+    # ticket size, decision cycle), not just generic "be a founder".
+    investor_profile: dict | None = None
+    try:
+        investor_profile = get_investor_profile(sess["investor_claw_id"])
+    except Exception:
+        investor_profile = None
     return {
         "session_id": session_id,
         "intent_id": sess["intent_id"],
@@ -60,6 +68,7 @@ def _build_session_context(session_id: str) -> dict:
         "next_speaker": sess["next_speaker"],
         "max_turns": a2a_engine.MAX_TURNS,
         "listing": listing,
+        "investor_profile": investor_profile,
         "history": history,
     }
 
@@ -143,6 +152,47 @@ def _load_recent_messages(claw_a: str, claw_b: str, since_iso: str = "", limit: 
     out = [dict(r) for r in rows]
     out.reverse()
     return out
+
+
+async def push_contact_missing_nudge(session_id: str) -> None:
+    """If either side of a fresh session lacks contact info, send them a
+    chat-first reminder up front. Cheaper to nudge now than to discover the
+    gap only after 14 turns of dialogue (Phase 7 contact gating then has to
+    silently withhold the unlock and the user feels cheated).
+
+    Idempotent in spirit: callers should only invoke once per session start.
+    Side that already has contact gets nothing.
+    """
+    ctx = _build_session_context(session_id)
+    if not ctx:
+        return
+    from server.store import get_conn
+    pairs = (
+        (ctx["investor_claw_id"], "investor"),
+        (ctx["founder_claw_id"], "founder"),
+    )
+    for claw, role in pairs:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT o.primary_contact "
+                "FROM owners o JOIN lobsters l ON l.owner_id = o.id "
+                "WHERE l.claw_id = ?",
+                (str(claw).strip().upper(),),
+            ).fetchone()
+        primary = (row["primary_contact"] if row else "") or ""
+        if primary.strip():
+            continue  # this side is fine
+        await manager.send_to_agent(claw, {
+            "event": "a2a:contact_missing",
+            "payload": {
+                "session_id": session_id,
+                "intent_id": ctx["intent_id"],
+                "my_role": role,
+                "phase": "session_start",
+                "reason": "撮合对话刚开始，但你还没填联系方式。聊到结束如果没补上，对方拿不到联系方式。"
+                          "现在告诉我『我的微信是 xxx』或『我的手机是 1xxx』就行。",
+            },
+        })
 
 
 async def dispatch(action: dict, session_id: str) -> None:

@@ -187,10 +187,15 @@ async def a2a_vote_route(session_id: str, payload: dict, request: Request, claw_
     except ValueError as exc:
         raise _http_error(exc) from exc
     # Push the resulting WS signal (next speaker / concluded / etc.).
+    # Log dispatch failures — silently swallowing them was leaving sidecars
+    # stuck in awaiting_vote forever, with no breadcrumb in logs.
     try:
         await a2a_dispatch.dispatch(result, session_id)
-    except Exception:
-        pass  # best-effort
+    except Exception as exc:
+        import logging
+        logging.getLogger("a2a.dispatch").error(
+            f"[record_vote] dispatch failed for session={session_id} action={result.get('kind')}: {exc!r}"
+        )
     return result
 
 
@@ -265,6 +270,30 @@ async def create_intent(listing_id: str, payload: BPIntentCreateRequest, request
         "payload": result,
     })
 
+    # Open BPs auto-accept inside create_intent; that path needs the same
+    # A2A kickoff that the manual-review path gets in review_intent. Mirror
+    # the logic here so open intents actually start a dialogue.
+    if result.get("status") == "auto_accepted":
+        import logging
+        _alog = logging.getLogger("a2a.kickoff_open")
+        try:
+            from . import a2a_dispatch
+            from server.store import get_conn
+            with get_conn() as conn:
+                row = conn.execute(
+                    "SELECT id FROM bp_a2a_sessions WHERE intent_id = ? AND status = 'running'",
+                    (result["id"],),
+                ).fetchone()
+            if row:
+                await a2a_dispatch.dispatch(
+                    {"kind": "speak", "speaker_claw_id": result["investor_claw_id"]},
+                    row["id"],
+                )
+                await a2a_dispatch.push_contact_missing_nudge(row["id"])
+                _alog.info(f"[kickoff_open] dispatched speak intent={result['id'][:8]} → {result['investor_claw_id']}")
+        except Exception as exc:
+            _alog.error(f"[kickoff_open] FAILED intent={result.get('id')}: {exc!r}")
+
     return BPIntentRow(**result)
 
 
@@ -323,6 +352,10 @@ async def review_intent(intent_id: str, payload: BPIntentReviewRequest, request:
                     {"kind": "speak", "speaker_claw_id": result["investor_claw_id"]},
                     row["id"],
                 )
+                # Early nudge: if either side hasn't filled contact yet,
+                # tell them now so they can fix it during the 5+ minute
+                # dialogue window — instead of being told only at conclude.
+                await a2a_dispatch.push_contact_missing_nudge(row["id"])
                 _alog.warning(f"[a2a_kickoff] dispatched speak to investor={result['investor_claw_id']}")
         except Exception as exc:
             _alog.warning(f"[a2a_kickoff] FAILED: {exc!r}")

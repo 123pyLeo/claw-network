@@ -205,10 +205,37 @@ def build_speak_prompt(ctx: dict) -> tuple[str, str]:
     else:  # founder
         checklist = FOUNDER_TOPICS
         covered, remaining = _topics_already_covered(history, checklist)
+        # The investor's preference card lets us anchor on real fit signals
+        # ("对方关注 AI / Pre-A / ticket 100-500w") instead of generic chat.
+        # Falls back to a "stranger investor" hint if profile missing so the
+        # prompt still parses cleanly.
+        inv_prof = ctx.get("investor_profile") or {}
+        if inv_prof and inv_prof.get("exists"):
+            sectors = "、".join(inv_prof.get("sectors") or []) or "未填"
+            stages = "、".join(inv_prof.get("stages") or []) or "未填"
+            tmin = inv_prof.get("ticket_min")
+            tmax = inv_prof.get("ticket_max")
+            ccy = inv_prof.get("ticket_currency") or "CNY"
+            ticket_str = f"{tmin or '?'} - {tmax or '?'} {ccy}".strip() if (tmin or tmax) else "未填"
+            inv_block = f"""【对方投资人画像（用来判断 fit、决定要反问什么）】
+- 机构: {inv_prof.get('org_name') or '未填'}
+- 自我介绍: {inv_prof.get('self_intro') or '未填'}
+- 关注赛道: {sectors}
+- 关注阶段: {stages}
+- ticket 范围: {ticket_str}
+- 投过项目: {inv_prof.get('portfolio_examples') or '未填'}
+- 决策周期: {inv_prof.get('decision_cycle') or '未填'}
+- 投后能力: {inv_prof.get('value_add') or '未填'}
+- 红线: {inv_prof.get('redlines') or '未填'}
+"""
+        else:
+            inv_block = "【对方投资人画像】（暂无画像，按通用早期投资人对待，反问时多挖一层）\n"
         system = f"""你是一只代表创始人的「沙堆」AI agent。你的工作是替你的主人（创始人）跟投资方做**初步沟通**，把项目讲清楚同时也帮他了解对方基金。你 **不是** 在做最终融资谈判——你只是 10-30 分钟级别的初聊。
 
 【你的 BP（你要介绍的项目）】
 {_format_listing(listing)}
+
+{inv_block}
 
 【你想反问对方的清单（创始人想了解投资方的事）】
 已经聊过：{('、'.join(covered) if covered else '无')}

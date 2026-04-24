@@ -41,6 +41,7 @@ Hard limits keep the system bounded:
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -352,7 +353,11 @@ def conclude(session_id: str, match: bool, summary: str = "") -> dict:
             (final_status, summary, now, now, session_id),
         )
 
-    missing_contacts: list[str] = []
+    # Default-deny posture: if anything goes wrong below, we want
+    # `missing_contacts == [both]` so dispatch sends a:contact_missing nudges
+    # to both sides instead of a misleading "unlocked!" card with empty data.
+    missing_contacts: list[str] = ["investor", "founder"] if match else []
+    unlock_attempted = False
     if match:
         # Before unlocking, check both sides actually have a contact filled.
         # The route layer enforces this on PUT /my-contact + on the
@@ -383,6 +388,8 @@ def conclude(session_id: str, match: bool, summary: str = "") -> dict:
 
             inv_ok = _has_contact(inv_lob)
             fnd_ok = _has_contact(fnd_lob)
+            # Lookups succeeded — replace the default-deny with the real list
+            missing_contacts = []
             if not inv_ok:
                 missing_contacts.append("investor")
             if not fnd_ok:
@@ -393,18 +400,37 @@ def conclude(session_id: str, match: bool, summary: str = "") -> dict:
             # one direction with an empty peer would leak the asymmetry into
             # a confusing IM card.
             if inv_ok and fnd_ok:
-                request_meeting(str(row["intent_id"]), "investor")
-                request_meeting(str(row["intent_id"]), "founder")
-        except Exception:
-            # Best-effort. If contact exchange fails here, the human can
-            # still trigger '沙堆 约见 <intent>' manually.
-            pass
+                unlock_attempted = True
+                # If either request_meeting throws, we want the ASYMMETRIC
+                # state (one side unlocked, the other not) to surface — fall
+                # back to default-deny on either side rather than claim
+                # success. The route's GET /bp/intents/.../meeting-unlock
+                # remains the recovery path.
+                try:
+                    request_meeting(str(row["intent_id"]), "investor")
+                    request_meeting(str(row["intent_id"]), "founder")
+                except Exception as exc:
+                    _alog = logging.getLogger("a2a.conclude")
+                    _alog.error(
+                        f"[conclude] request_meeting failed for session={session_id} "
+                        f"intent={row['intent_id']}: {exc!r}"
+                    )
+                    # Re-mark both as missing so dispatch nudges both sides
+                    # to manually trigger '沙堆 约见 <intent>' as recovery.
+                    missing_contacts = ["investor", "founder"]
+        except Exception as exc:
+            _alog = logging.getLogger("a2a.conclude")
+            _alog.error(
+                f"[conclude] contact lookup failed for session={session_id}: {exc!r}"
+            )
+            # missing_contacts stays at default-deny ["investor", "founder"]
 
     return {
         "kind": "concluded",
         "match": match,
         "session": dict(row) | {"status": final_status, "summary": summary},
         "missing_contacts": missing_contacts,
+        "unlock_attempted": unlock_attempted,
     }
 
 
