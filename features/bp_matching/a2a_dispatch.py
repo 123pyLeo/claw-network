@@ -208,15 +208,21 @@ async def dispatch(action: dict, session_id: str) -> None:
         match = bool(action.get("match"))
         sess = action.get("session") or ctx
         summary = sess.get("summary") or ""
-        # On match: pull each side's peer contact info so the IM card can
-        # show "对方微信: xxx" inline (instead of leaving it to the
-        # legacy meeting-unlock event).
+        # Engine signals which sides (if any) didn't have a contact filled at
+        # match time. We send the same a2a:concluded payload to everyone, but
+        # also fire a separate a2a:contact_missing nudge to each side that
+        # needs to fill — Phase 2 touchpoint C.
+        missing = action.get("missing_contacts") or []
         for claw, role in (
             (ctx["investor_claw_id"], "investor"),
             (ctx["founder_claw_id"], "founder"),
         ):
             peer_info = _peer_block(role)
-            contact = _peer_contact(peer_info["peer_claw_id"]) if match else {}
+            # Only surface peer_contact when match=True AND both sides have
+            # contact (i.e. unlock actually happened). Otherwise leave empty
+            # so the sidecar IM template knows to skip the contact line.
+            both_filled = match and not missing
+            contact = _peer_contact(peer_info["peer_claw_id"]) if both_filled else {}
             await manager.send_to_agent(claw, {
                 "event": "a2a:concluded",
                 "payload": {
@@ -229,9 +235,25 @@ async def dispatch(action: dict, session_id: str) -> None:
                     "my_role": role,
                     **peer_info,
                     "peer_contact": contact,
+                    "contact_unlocked": bool(both_filled),
+                    "missing_contacts": missing,
                     "turn_count": ctx["turn_count"],
                 },
             })
+
+        # Phase 2 touchpoint C: nudge sides that didn't have contact filled.
+        if match and missing:
+            for side in missing:
+                claw = ctx["investor_claw_id"] if side == "investor" else ctx["founder_claw_id"]
+                await manager.send_to_agent(claw, {
+                    "event": "a2a:contact_missing",
+                    "payload": {
+                        "session_id": session_id,
+                        "intent_id": ctx["intent_id"],
+                        "my_role": side,
+                        "reason": "撮合成功，但你还没填联系方式，对方暂时拿不到。告诉我你的微信或手机即可。",
+                    },
+                })
 
     elif kind == "stalled":
         for claw in (ctx["investor_claw_id"], ctx["founder_claw_id"]):

@@ -54,9 +54,9 @@ from server.store import get_conn, new_uuid, utc_now, ensure_friendship, get_lob
 MAX_TURNS = 14                # hard cap (was 20 — agents spiral into courtesy after ~6-8 substantive turns)
 VOTE_FIRST_AT_TURN = 6        # vote earlier so we can end before courtesy loops set in
 VOTE_EVERY_N_TURNS = 2        # vote at 6, 8, 10, 12, 14
-SPEAKER_STUCK_SECONDS = 15    # if speaker hasn't replied in 15s, retry once
+SPEAKER_STUCK_SECONDS = 45    # if speaker hasn't replied in 45s, retry once
 RETRY_LIMIT = 1               # retries per turn before giving up (1 = retry once, then stalled)
-STALL_TIMEOUT_SECONDS = 60    # absolute give-up: 60s total (~ 15s wait + 15s retry + buffer) → stalled
+STALL_TIMEOUT_SECONDS = 150   # absolute give-up: 150s total (~ 45s wait + 45s retry + buffer) → stalled
 
 # Courtesy / low-content reply detector. If the last few messages match
 # this pattern (each ≤ 50 chars and contains common courtesy phrases),
@@ -201,6 +201,24 @@ def on_message_in_session(session_id: str, from_claw: str, content: str = "") ->
     if from_claw not in (inv, fnd):
         return None
 
+    # Guard 1: vote phase rejects text. Sidecars in awaiting_vote should be
+    # answering a2a:judge with a vote signal, not chatting. If a stray text
+    # arrives (e.g. user types into the IM mid-vote, or a delayed turn-N
+    # response races with the vote transition), don't let it bump turn_count
+    # and unflip next_speaker — the vote would silently get clobbered.
+    if row["status"] == S_AWAITING_VOTE:
+        return None
+
+    # Guard 2: only the side whose turn it is can advance the dialogue. If the
+    # off-turn side speaks (human takes over, retried turn-N reply arrives
+    # late, both sidecars fire concurrently), ignore at the engine level so
+    # turn_count + next_speaker stay consistent. Dispatch may still surface
+    # the message in IM, but the state machine won't be poisoned.
+    next_speaker_label = (row["next_speaker"] or "").strip().lower()
+    expected_claw = inv if next_speaker_label == "investor" else fnd
+    if from_claw != expected_claw:
+        return None
+
     new_turn_count = int(row["turn_count"]) + 1
     other_side = "founder" if from_claw == inv else "investor"
     now = utc_now()
@@ -334,14 +352,49 @@ def conclude(session_id: str, match: bool, summary: str = "") -> dict:
             (final_status, summary, now, now, session_id),
         )
 
+    missing_contacts: list[str] = []
     if match:
-        # Both lobsters auto-friended on intent accept already; here we
-        # also mark BOTH sides as wanting the meeting (the existing
-        # contact-exchange flow only unlocks when both flags are set).
+        # Before unlocking, check both sides actually have a contact filled.
+        # The route layer enforces this on PUT /my-contact + on the
+        # request-meeting endpoint, but engine.conclude bypasses both. If we
+        # blindly call request_meeting() with empty contacts, the
+        # `a2a:concluded` payload's peer_contact comes back empty — match
+        # appears successful in IM but no microWeChat / phone gets exchanged.
+        # That's the worst failure mode. Instead: only auto-unlock for sides
+        # that already have contact; surface the missing ones so dispatch can
+        # nudge them ("撮合成了但你还没填联系方式…").
         try:
-            from .store import request_meeting  # late import to avoid cycle
-            request_meeting(str(row["intent_id"]), "investor")
-            request_meeting(str(row["intent_id"]), "founder")
+            from .store import (
+                request_meeting,
+                get_lobster_by_claw_id,
+                get_owner_contact,
+            )
+            inv_lob = get_lobster_by_claw_id(str(row["investor_claw_id"]))
+            fnd_lob = get_lobster_by_claw_id(str(row["founder_claw_id"]))
+
+            def _has_contact(lob) -> bool:
+                if not lob:
+                    return False
+                owner_id = str(lob["owner_id"] or "")
+                if not owner_id:
+                    return False
+                c = get_owner_contact(owner_id)
+                return bool((c.get("primary_contact") or "").strip())
+
+            inv_ok = _has_contact(inv_lob)
+            fnd_ok = _has_contact(fnd_lob)
+            if not inv_ok:
+                missing_contacts.append("investor")
+            if not fnd_ok:
+                missing_contacts.append("founder")
+
+            # Unlock symmetrically only when BOTH sides have contact. The
+            # request_meeting flow exchanges info bidirectionally; unlocking
+            # one direction with an empty peer would leak the asymmetry into
+            # a confusing IM card.
+            if inv_ok and fnd_ok:
+                request_meeting(str(row["intent_id"]), "investor")
+                request_meeting(str(row["intent_id"]), "founder")
         except Exception:
             # Best-effort. If contact exchange fails here, the human can
             # still trigger '沙堆 约见 <intent>' manually.
@@ -351,6 +404,7 @@ def conclude(session_id: str, match: bool, summary: str = "") -> dict:
         "kind": "concluded",
         "match": match,
         "session": dict(row) | {"status": final_status, "summary": summary},
+        "missing_contacts": missing_contacts,
     }
 
 

@@ -604,7 +604,7 @@ async def set_my_investor_profile_route(
     normalized = claw_id.strip().upper()
     lobster = _require_http_auth(request, normalized)
     await _require_signature_if_keyed(request, lobster)
-    if (lobster.get("role") or "") not in ("investor", "both"):
+    if (dict(lobster).get("role") or "") not in ("investor", "both"):
         raise HTTPException(status_code=403, detail="只有投资人角色才能填写投资偏好卡。")
     fields = payload.model_dump(exclude_unset=True)
     try:

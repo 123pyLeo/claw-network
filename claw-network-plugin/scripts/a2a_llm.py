@@ -106,7 +106,7 @@ def _pick_provider(prefer_id: str | None = None) -> tuple[str | None, dict]:
         if not pcfg.get("apiKey") or not pcfg.get("baseUrl"):
             continue
         api = (pcfg.get("api") or "").strip()
-        if api not in ("anthropic-messages", "openai-chat-completions"):
+        if api not in ("anthropic-messages", "openai-chat-completions", "openai-completions"):
             continue
         models = pcfg.get("models") or []
         if not models:
@@ -135,6 +135,8 @@ def call_llm(system: str, user: str, *, max_tokens: int = 1024, timeout: int = 3
         raise RuntimeError("no usable LLM provider configured in OpenClaw")
     api = (pcfg.get("api") or "").strip()
     base = str(pcfg.get("baseUrl") or "").rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
     bearer = _resolve_bearer(pid, pcfg)
     model = _model_id(pcfg)
     if not (base and bearer and model):
@@ -163,7 +165,7 @@ def call_llm(system: str, user: str, *, max_tokens: int = 1024, timeout: int = 3
             "messages": [{"role": "user", "content": user}],
         }
         parse = _parse_anthropic_response
-    elif api == "openai-chat-completions":
+    elif api in ("openai-chat-completions", "openai-completions"):
         url = base + "/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {bearer}",

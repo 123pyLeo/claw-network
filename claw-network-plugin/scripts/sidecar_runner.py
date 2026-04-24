@@ -684,6 +684,20 @@ async def _handle_event(
             intent_id=str(event.get("intent_id") or ""),
         )
         return
+    if event_name == "a2a:contact_missing" and isinstance(event, dict):
+        # Phase 2 touchpoint C: server tells us match succeeded but our
+        # contact wasn't on file, so the unlock was withheld for both sides.
+        # Push the user a chat-first prompt so they fill in via natural dialog
+        # ("我的微信是 xxx") and the agent can call bp_set_my_contact.
+        _notify(
+            "a2a_contact_missing",
+            f"🎉 撮合成功！但你还没填联系方式，对方暂时拿不到。"
+            f"\n\n直接告诉我『我的微信是 xxx』或『我的手机是 1xxx』，我立刻同步给对方。",
+            session_id=str(event.get("session_id") or ""),
+            intent_id=str(event.get("intent_id") or ""),
+            my_role=str(event.get("my_role") or ""),
+        )
+        return
 
 
 async def _handle_a2a_your_turn(client, event: dict) -> None:
