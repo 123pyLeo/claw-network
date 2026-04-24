@@ -82,6 +82,7 @@ _EVENT_ROW_SELECT = """
         me.created_at,
         me.room_id,
         me.room_message_id,
+        me.a2a_session_id,
         r.slug AS room_slug,
         r.title AS room_title
     FROM message_events me
@@ -311,6 +312,12 @@ def init_db() -> None:
         )
         _ensure_column(conn, "message_events", "room_id", "TEXT")
         _ensure_column(conn, "message_events", "room_message_id", "TEXT")
+        # A2A session tag: when a sidecar sends a message in response to
+        # a:your_turn (turn N of session X), it stamps the outgoing message
+        # with X. The A2A engine hook in main.py prefers this column over
+        # the (claw_a, claw_b) pair lookup so parallel sessions between the
+        # same pair don't cross-contaminate.
+        _ensure_column(conn, "message_events", "a2a_session_id", "TEXT")
         _ensure_column(conn, "verification_codes", "attempts", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "bounties", "credit_amount", "INTEGER NOT NULL DEFAULT 0")
         # Escrow link: when a paid bounty is selected, an invocation row is
@@ -2160,6 +2167,7 @@ def record_event(
     *,
     room_id: str | None = None,
     room_message_id: str | None = None,
+    a2a_session_id: str | None = None,
 ) -> sqlite3.Row:
     event_id = new_uuid()
     created_at = utc_now()
@@ -2167,11 +2175,11 @@ def record_event(
         conn.execute(
             """
             INSERT INTO message_events (
-                id, event_type, from_lobster_id, to_lobster_id, content, status, created_at, room_id, room_message_id
+                id, event_type, from_lobster_id, to_lobster_id, content, status, created_at, room_id, room_message_id, a2a_session_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (event_id, event_type, from_lobster_id, to_lobster_id, content, status, created_at, room_id, room_message_id),
+            (event_id, event_type, from_lobster_id, to_lobster_id, content, status, created_at, room_id, room_message_id, a2a_session_id),
         )
         row = conn.execute(_EVENT_ROW_SELECT + " WHERE me.id = ?", (event_id,)).fetchone()
     return row
@@ -2493,7 +2501,14 @@ def acknowledge_event(event_id: str, claw_id: str, status: str) -> sqlite3.Row:
     return update_event_status(event_id, next_status)
 
 
-def create_message(from_claw_id: str, to_claw_id: str, content: str, message_type: str) -> sqlite3.Row:
+def create_message(
+    from_claw_id: str,
+    to_claw_id: str,
+    content: str,
+    message_type: str,
+    *,
+    a2a_session_id: str | None = None,
+) -> sqlite3.Row:
     from_lobster = get_lobster_by_claw_id(from_claw_id)
     to_lobster = get_lobster_by_claw_id(to_claw_id)
     if from_lobster is None or to_lobster is None:
@@ -2511,6 +2526,7 @@ def create_message(from_claw_id: str, to_claw_id: str, content: str, message_typ
         to_lobster_id=to_lobster["id"],
         content=content,
         status="queued",
+        a2a_session_id=a2a_session_id,
     )
 
 

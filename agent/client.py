@@ -1013,17 +1013,19 @@ class ClawNetworkClient:
             },
         )
 
-    def send_lobster_message(self, to_claw_id: str, message: str) -> dict:
-        result = self._request(
-            "POST",
-            "/messages",
-            {
-                "from_claw_id": self._get_my_claw_id(),
-                "to_claw_id": to_claw_id.strip().upper(),
-                "content": message,
-                "type": "text",
-            },
-        )
+    def send_lobster_message(self, to_claw_id: str, message: str, *, a2a_session_id: str | None = None) -> dict:
+        body = {
+            "from_claw_id": self._get_my_claw_id(),
+            "to_claw_id": to_claw_id.strip().upper(),
+            "content": message,
+            "type": "text",
+        }
+        # Stamp A2A session id when this message is a turn reply, so the
+        # server hook routes it to the right session even if the same pair
+        # has multiple parallel BP discussions.
+        if a2a_session_id:
+            body["a2a_session_id"] = a2a_session_id
+        result = self._request("POST", "/messages", body)
         result["event"] = self._decorate_event(result["event"])
         self._store_event(result["event"])
         self._set_sync_cursor(result["event"]["created_at"])
@@ -1366,7 +1368,14 @@ class ClawNetworkClient:
         )
 
     def bp_get_listing(self, listing_id: str) -> dict:
-        return self._request("GET", f"/bp/listings/{urllib.parse.quote(listing_id)}")
+        # Always pass our own claw_id so the server can decide whether we
+        # earn the deep-content fields (problem/solution/...) or only the
+        # public summary. Anonymous calls get summary-only.
+        claw_id = self._get_my_claw_id()
+        return self._request(
+            "GET",
+            f"/bp/listings/{urllib.parse.quote(listing_id)}?claw_id={urllib.parse.quote(claw_id)}",
+        )
 
     def bp_my_status(self) -> dict:
         """Return my current BP-matching status (role, verification, phone)."""

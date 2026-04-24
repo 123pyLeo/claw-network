@@ -9,6 +9,7 @@ from server.realtime import manager
 from .models import (
     BPListingCreateRequest,
     BPListingRow,
+    BPListingSummaryRow,
     BPListingUpdateRequest,
     BPIntentCreateRequest,
     BPIntentRow,
@@ -88,15 +89,19 @@ async def create_listing(payload: BPListingCreateRequest, request: Request, claw
     return BPListingRow(**result)
 
 
-@router.get("/listings", response_model=list[BPListingRow])
+@router.get("/listings", response_model=list[BPListingSummaryRow])
 def search_listings(
     request: Request,
     sector: str | None = None,
     stage: str | None = None,
     limit: int = 50,
     before_created_at: str | None = None,
-) -> list[BPListingRow]:
-    """Search active BP listings. Public endpoint.
+) -> list[BPListingSummaryRow]:
+    """Browse public BP summaries. Returns project_name / one_liner / sector
+    / stage / funding_ask only — the structured pitch fields (problem,
+    solution, team_intro, traction, business_model, ask_note) are gated
+    behind founder approval and only available via GET /listings/{id} when
+    the caller has an accepted intent (or is the founder).
 
     Pagination: pass the `created_at` of the last row from the previous
     page as `before_created_at` to fetch older listings. Omit on first call.
@@ -111,17 +116,60 @@ def search_listings(
         )
     except ValueError as exc:
         raise _http_error(exc) from exc
-    return [BPListingRow(**r) for r in results]
+    # BPListingSummaryRow ignores any extra keys in `r` (Pydantic default).
+    return [BPListingSummaryRow(**r) for r in results]
 
 
 @router.get("/listings/{listing_id}", response_model=BPListingRow)
-def get_listing(listing_id: str, request: Request) -> BPListingRow:
-    """Get a single BP listing. Public endpoint."""
+async def get_listing(listing_id: str, request: Request, claw_id: str | None = None) -> BPListingRow:
+    """Get a single BP listing.
+
+    Authz tiers:
+      - Caller is the listing's founder → full detail.
+      - Caller has an accepted/auto_accepted intent on this listing → full detail.
+      - Listing access_policy is 'open' → full detail (the founder explicitly
+        opted in to public deep-content).
+      - Otherwise → only the summary fields (deep-content fields are blanked).
+        The route still returns 200 so existing browse flows aren't broken,
+        just with redacted bodies.
+
+    `claw_id` is optional but required to get full detail. Anonymous /
+    summary-only callers don't need to pass it.
+    """
     _check_rate_limit(request)
     try:
         result = bp_store.get_listing(listing_id)
     except ValueError as exc:
         raise _http_error(exc) from exc
+
+    can_see_detail = result.get("access_policy") == "open"
+    if not can_see_detail and claw_id:
+        normalized = claw_id.strip().upper()
+        # Auth check (matches the rest of /bp/* — if claw_id passed, it must
+        # belong to the caller).
+        _require_http_auth(request, normalized)
+        if normalized == str(result.get("founder_claw_id") or "").upper():
+            can_see_detail = True
+        else:
+            from server.store import get_conn
+            with get_conn() as conn:
+                row = conn.execute(
+                    """
+                    SELECT bi.status FROM bp_intents bi
+                    JOIN lobsters inv ON inv.id = bi.investor_lobster_id
+                    WHERE bi.listing_id = ? AND inv.claw_id = ?
+                    LIMIT 1
+                    """,
+                    (str(result["id"]), normalized),
+                ).fetchone()
+            if row is not None and row["status"] in ("accepted", "auto_accepted"):
+                can_see_detail = True
+
+    if not can_see_detail:
+        # Strip the deep-content fields. Pydantic will fall back to defaults
+        # ("") so the response shape stays the same.
+        for k in ("problem", "solution", "team_intro", "traction", "business_model", "ask_note"):
+            result[k] = ""
     return BPListingRow(**result)
 
 
@@ -667,12 +715,43 @@ async def get_investor_profile_for_founder_route(
     viewer_claw_id: str,
 ) -> InvestorProfileRow:
     """Founder-side lookup: when a founder receives an intent, their agent
-    can fetch the investor's preference card to show in the IM card."""
+    can fetch the investor's preference card to show in the IM card.
+
+    Authz: viewer must be a founder who has at least one BP listing on
+    which the target investor has expressed an intent. Without this gate,
+    any verified lobster could mass-scrape every investor's thesis (org,
+    sectors, ticket range, decision cycle) — that's a privacy leak we
+    promised investors wouldn't happen ('preferences only shown to founders
+    you're already engaging with').
+    """
     _check_rate_limit(request)
     viewer_normalized = viewer_claw_id.strip().upper()
+    target_normalized = claw_id.strip().upper()
     lobster = _require_http_auth(request, viewer_normalized)
     await _require_signature_if_keyed(request, lobster)
-    result = bp_store.get_investor_profile(claw_id.strip().upper())
+
+    # Verify the viewer founder has a listing the target investor has
+    # acted on. EXISTS check is cheap; one row in either direction suffices.
+    from server.store import get_conn
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM bp_intents bi
+            JOIN bp_listings bl ON bl.id = bi.listing_id
+            JOIN lobsters fnd ON fnd.id = bl.founder_lobster_id
+            JOIN lobsters inv ON inv.id = bi.investor_lobster_id
+            WHERE fnd.claw_id = ? AND inv.claw_id = ?
+            LIMIT 1
+            """,
+            (viewer_normalized, target_normalized),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=403,
+            detail="只有该投资人在你 BP 上表达过意向后，才能查看其偏好卡。",
+        )
+
+    result = bp_store.get_investor_profile(target_normalized)
     return InvestorProfileRow(**result)
 
 

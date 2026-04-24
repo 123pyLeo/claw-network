@@ -238,6 +238,19 @@ def ensure_bp_tables() -> None:
             "ON bp_a2a_sessions(status, last_turn_at)"
         )
 
+        # One-shot migration ledger. Lets us run irreversible / opinionated
+        # backfills exactly once per deploy without having to remember on
+        # every server restart.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _bp_migrations (
+                key         TEXT PRIMARY KEY,
+                applied_at  TEXT NOT NULL,
+                note        TEXT
+            )
+            """
+        )
+
         # Per-lobster A2A mode preference. v1 default is 'auto' — full
         # autonomous AI conversation. 'manual' (AI drafts, human approves)
         # and 'off' (no A2A) are v2 features. Schema DEFAULT must match v1
@@ -245,10 +258,20 @@ def ensure_bp_tables() -> None:
         lob_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lobsters)").fetchall()}
         if "bp_a2a_mode" not in lob_cols:
             conn.execute("ALTER TABLE lobsters ADD COLUMN bp_a2a_mode TEXT NOT NULL DEFAULT 'auto'")
-        # Backfill: ALTER TABLE DEFAULT only applies to NEW inserts; rows
-        # added before the column existed have NULL/'manual'. Bring them
-        # forward so legacy lobsters can participate in A2A.
-        conn.execute("UPDATE lobsters SET bp_a2a_mode = 'auto' WHERE bp_a2a_mode IS NULL OR bp_a2a_mode = 'manual'")
+        # Backfill (one-shot, ledger-guarded): ALTER TABLE DEFAULT only
+        # applies to NEW inserts; rows added before the column existed have
+        # NULL/'manual'. Bring them forward exactly once. Without the ledger
+        # check, future v2 users who legitimately pick 'manual' would get
+        # silently overwritten back to 'auto' on every server restart.
+        already = conn.execute(
+            "SELECT 1 FROM _bp_migrations WHERE key = 'a2a_mode_backfill_v1'"
+        ).fetchone()
+        if not already:
+            conn.execute("UPDATE lobsters SET bp_a2a_mode = 'auto' WHERE bp_a2a_mode IS NULL OR bp_a2a_mode = 'manual'")
+            conn.execute(
+                "INSERT INTO _bp_migrations (key, applied_at, note) VALUES (?, ?, ?)",
+                ('a2a_mode_backfill_v1', utc_now(), 'force all legacy rows to auto for v1'),
+            )
 
         # retry_count: number of times the current turn has been re-pushed
         # by the driver. Resets when the turn actually advances. Caps at
@@ -407,9 +430,12 @@ def _log_a2a_event(
                     (new_uuid(), event_type, from_owner_id, to_owner_id,
                      source_type, source_id, payload_json, utc_now()),
                 )
-        except Exception:
-            # Best-effort observability — swallow
-            pass
+        except Exception as exc:
+            # Best-effort observability — log so daemon-thread failures
+            # don't disappear silently (used to make debugging missing
+            # bp_intent_created / _accepted events impossible).
+            import logging as _lg
+            _lg.getLogger("bp.a2a_event").warning(f"a2a_event log failed: {exc!r}")
 
     import threading
     threading.Thread(target=_write, daemon=True).start()
@@ -681,8 +707,14 @@ def create_intent(listing_id: str, investor_claw_id: str, personal_note: str = "
         try:
             from . import a2a_engine
             a2a_engine.start_session(intent_id)
-        except Exception:
-            pass  # best-effort; A2A is opt-in, never block intent on its failure
+        except Exception as exc:
+            # Don't block intent on A2A failure, but at least leave a trail
+            # so the operator can spot orphaned auto_accepted intents that
+            # never started a dialogue.
+            import logging as _lg
+            _lg.getLogger("bp.a2a_kickoff_open").warning(
+                f"start_session failed for open intent {intent_id}: {exc!r}"
+            )
 
     # Log as zero-amount invocation for network observability
     with get_conn() as conn:
@@ -838,8 +870,11 @@ def review_intent(intent_id: str, claw_id: str, decision: str, review_note: str 
         try:
             from . import a2a_engine
             a2a_engine.start_session(intent_id)
-        except Exception:
-            pass  # best-effort; A2A is opt-in, never block accept on its failure
+        except Exception as exc:
+            import logging as _lg
+            _lg.getLogger("bp.a2a_kickoff_review").warning(
+                f"start_session failed for accepted intent {intent_id}: {exc!r}"
+            )
 
     # Log the review as an a2a_events observability record (both accept and reject).
     investor_row = get_lobster_by_claw_id(investor_claw_id)
@@ -955,19 +990,31 @@ def redeem_invite_code(code: str, lobster_id: str) -> dict:
         if cursor.rowcount == 0:
             raise InviteCodeError("邀请码已被使用。")
 
-        # Grant role to lobster
+        # Grant role to lobster. If the lobster already has the OPPOSITE
+        # role (e.g. a founder redeeming an investor invite), merge to
+        # 'both' instead of overwriting — losing the founder status would
+        # silently strip their ability to publish BPs.
         role = row["role"]
         role_verified = int(row["role_verified"] or 0)
+        cur_lob = conn.execute(
+            "SELECT role FROM lobsters WHERE id = ?", (lobster_id,)
+        ).fetchone()
+        cur_role = (cur_lob["role"] if cur_lob else "") or ""
+        merged_role = role
+        if cur_role and cur_role != role and cur_role in ("investor", "founder", "both"):
+            # any cross-role addition collapses to 'both' (covers both
+            # founder->investor and investor->founder transitions)
+            merged_role = "both"
         conn.execute(
             """UPDATE lobsters
                SET role = ?, role_verified = ?, role_verification_method = 'invite_code'
                WHERE id = ?""",
-            (role, role_verified, lobster_id),
+            (merged_role, role_verified, lobster_id),
         )
 
     return {
         "code": code,
-        "role": role,
+        "role": merged_role,
         "role_verified": bool(role_verified),
         "granted_at": now,
     }
@@ -1075,13 +1122,22 @@ def review_role_application(
         )
 
         if decision == "approved":
-            # Investor: manual review grants verified=true
+            # Investor: manual review grants verified=true. Merge to 'both'
+            # if the lobster already has the opposite role (don't strip
+            # founder status when granting investor approval).
+            new_role = row["role"]
+            cur_lob = conn.execute(
+                "SELECT role FROM lobsters WHERE id = ?", (row["lobster_id"],)
+            ).fetchone()
+            cur_role = (cur_lob["role"] if cur_lob else "") or ""
+            if cur_role and cur_role != new_role and cur_role in ("investor", "founder", "both"):
+                new_role = "both"
             conn.execute(
                 """UPDATE lobsters
                    SET role = ?, role_verified = 1, role_verification_method = 'manual_review',
                        org_name = COALESCE(NULLIF(?, ''), org_name)
                    WHERE id = ?""",
-                (row["role"], row["org_name"], row["lobster_id"]),
+                (new_role, row["org_name"], row["lobster_id"]),
             )
 
     return {"id": app_id, "status": decision, "reviewed_at": now}

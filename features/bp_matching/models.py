@@ -27,7 +27,12 @@ class BPListingCreateRequest(BaseModel):
     ask_note: str = Field(default="", max_length=1000)
 
 
-class BPListingRow(BaseModel):
+class BPListingSummaryRow(BaseModel):
+    """Public-safe view of a BP. Returned by list endpoint and by detail
+    endpoint when caller is NOT yet approved on this listing. Excludes the
+    structured "deep" fields (problem/solution/team_intro/traction/
+    business_model/ask_note) — those are the actual pitch content, gated
+    behind founder approval."""
     id: str
     founder_claw_id: str
     founder_name: str
@@ -46,7 +51,12 @@ class BPListingRow(BaseModel):
     updated_at: datetime
     expires_at: datetime | None = None
 
-    # Structured fields (may be empty strings if not filled)
+
+class BPListingRow(BPListingSummaryRow):
+    """Full BP detail. Only returned to authorized callers: the founder
+    themselves, an investor whose intent on this listing is accepted /
+    auto_accepted, or any caller for an open-policy listing. The route
+    layer enforces the gate."""
     problem: str = ""
     solution: str = ""
     team_intro: str = ""

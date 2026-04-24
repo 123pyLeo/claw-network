@@ -943,20 +943,42 @@ async def _deliver_event(event: dict) -> dict:
     # A2A engine hook: if this is a text message between two lobsters with
     # an active A2A session, advance the state machine and push the next
     # WS signal (your_turn / vote / concluded). Best-effort — never blocks
-    # delivery on engine errors.
+    # delivery on engine errors. Logs failures (silent pass made debugging
+    # stuck sessions impossible).
     try:
         if event.get("event_type") == "text":
             from_claw = str(event.get("from_claw_id") or "").strip().upper()
             to_claw = str(to_claw_id).strip().upper()
             if from_claw and to_claw:
                 from features.bp_matching import a2a_engine, a2a_dispatch
-                sess = a2a_engine.get_active_session_for_pair(from_claw, to_claw)
+                # Prefer the explicit session_id stamped on the message
+                # (sidecar sets this when responding to a:your_turn).
+                # Fallback to pair lookup only when missing — that path is
+                # ambiguous if the same pair has parallel sessions on
+                # different BPs, so it's a last-resort.
+                explicit_sid = str(event.get("a2a_session_id") or "").strip()
+                sess = None
+                if explicit_sid:
+                    sess = a2a_engine.get_session(explicit_sid)
+                    # Cross-check: ensure the explicit session actually
+                    # involves this from/to pair. Reject mismatches so a
+                    # malicious sidecar can't poison another session.
+                    if sess and {from_claw, to_claw} != {
+                        str(sess.get("investor_claw_id", "")).upper(),
+                        str(sess.get("founder_claw_id", "")).upper(),
+                    }:
+                        sess = None
+                if sess is None:
+                    sess = a2a_engine.get_active_session_for_pair(from_claw, to_claw)
                 if sess:
                     action = a2a_engine.on_message_in_session(sess["id"], from_claw, str(event.get("content") or ""))
                     if action:
                         await a2a_dispatch.dispatch(action, sess["id"])
-    except Exception:
-        pass
+    except Exception as exc:
+        import logging
+        logging.getLogger("a2a.deliver_hook").error(
+            f"[deliver_hook] failed to advance A2A for event {event.get('id')}: {exc!r}"
+        )
     return _message_payload(event)
 
 
@@ -1061,6 +1083,7 @@ async def send_message(payload: SendMessageRequest, request: Request) -> SendMes
             to_claw_id=payload.to_claw_id.strip().upper(),
             content=payload.content.strip(),
             message_type=payload.type.strip(),
+            a2a_session_id=(payload.a2a_session_id.strip() if payload.a2a_session_id else None),
         )
     except store.CollaborationApprovalRequired as exc:
         request = exc.request_row

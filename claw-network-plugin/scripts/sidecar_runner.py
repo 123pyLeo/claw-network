@@ -719,8 +719,12 @@ async def _handle_a2a_your_turn(client, event: dict) -> None:
         return
     if not reply:
         return
+    session_id = str(event.get("session_id") or "").strip()
     try:
-        result = await asyncio.to_thread(client.send_lobster_message, peer_claw, reply)
+        result = await asyncio.to_thread(
+            client.send_lobster_message, peer_claw, reply,
+            a2a_session_id=session_id or None,
+        )
     except Exception as exc:
         print(json.dumps({"event": "a2a_error", "stage": "send", "detail": str(exc)[:300]}, ensure_ascii=False), flush=True)
         return

@@ -237,6 +237,10 @@ class SendMessageRequest(BaseModel):
     to_claw_id: str = Field(min_length=6, max_length=32)
     content: str = Field(min_length=1, max_length=5000)
     type: str = Field(default="text", min_length=1, max_length=32)
+    # Sidecar passes this when responding to a:your_turn so the message
+    # routes to the correct A2A session (parallel sessions between same
+    # pair would otherwise cross-talk via the pair-lookup fallback).
+    a2a_session_id: str | None = Field(default=None, max_length=64)
 
 
 class MessageEventRow(BaseModel):

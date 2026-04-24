@@ -324,10 +324,14 @@ def record_vote(session_id: str, claw_id: str, want_end: bool) -> dict:
         return conclude(session_id, match=True, summary="达到对话轮数上限。AI 判断已覆盖足够内容，建议见面继续。")
     # Resume: flip back to running, the other side speaks next (whichever
     # wasn't the most recent speaker — we use the existing next_speaker hint).
+    # Also reset last_turn_at + retry_count so the driver doesn't immediately
+    # consider the resumed turn 'stuck' just because the vote phase took 30s
+    # (or had its own retry, leaving retry_count at limit).
     with get_conn() as conn:
         conn.execute(
-            "UPDATE bp_a2a_sessions SET status = ?, updated_at = ? WHERE id = ?",
-            (S_RUNNING, now, session_id),
+            "UPDATE bp_a2a_sessions SET status = ?, last_turn_at = ?, "
+            "retry_count = 0, updated_at = ? WHERE id = ?",
+            (S_RUNNING, now, now, session_id),
         )
     next_speaker_claw = fnd if str(row["next_speaker"] or "") == "founder" else inv
     return {"kind": "speak", "speaker_claw_id": next_speaker_claw, "resumed": True}
